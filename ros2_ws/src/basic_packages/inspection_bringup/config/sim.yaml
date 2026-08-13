@@ -1,0 +1,23 @@
+/**:
+  ros__parameters:
+    profile: sim
+
+/inspection/master_node:
+  ros__parameters:
+    comm.master_heartbeat_period_ms: 500
+    system.expected_interface_version: "1.0.0"
+
+/inspection/control_node:
+  ros__parameters:
+    comm.node_heartbeat_period_ms: 500
+
+/inspection/vision_node:
+  ros__parameters:
+    comm.node_heartbeat_period_ms: 500
+
+/inspection/log_node:
+  ros__parameters:
+    comm.node_heartbeat_period_ms: 500
+
+# TODO(INITIAL_DEFAULT): timeout·재시도·큐 기본값은 상세설계 CFG 기준으로 후속 단계에 추가합니다.
+# sim 프로필은 실제 Mega·카메라·모터·액추에이터에 출력하지 않습니다.

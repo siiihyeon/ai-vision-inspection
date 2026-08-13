@@ -1,0 +1,8 @@
+string request_id
+string session_id
+---
+bool ready
+string node_id
+string health_state
+string interface_version
+string status_json
