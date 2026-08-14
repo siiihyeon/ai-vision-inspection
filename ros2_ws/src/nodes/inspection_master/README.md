@@ -28,6 +28,20 @@
 - 초기화 Goal 전송 순서와 재시도
 - 업무용 Topic·Service·Action
 
+## NodeBase 호환 계약
+
+- `MasterNode(InspectionNodeBase)` 상속을 유지합니다.
+- 부모 생성자는 `NodeId.MASTER, provides_initialize_action=False`로 호출합니다.
+- Master는 초기화 Action Server를 만들지 않고 Control·Vision·Log의 Action Client를 소유합니다.
+- 공통 Master Heartbeat와 `get_status` Service를 중복 생성하지 않습니다.
+- `system_state`, `command_epoch`, 제품 ID와 FIFO는 Master에서만 변경합니다.
+- 작업 노드 Heartbeat 수신 시 노드 ID, 세션, sequence, 인터페이스 버전과 수신 monotonic 시각을 검증하는 로직을 구현해야 합니다.
+- 실행 진입점의 `rclpy.init()` → `MasterNode()` → `spin_node(node)` 순서를 유지합니다.
+- 공통 패키지나 `inspection_interfaces`를 변경해야 하면 다른 노드 담당자와 먼저 합의합니다.
+
+Master는 초기화 요청의 주체이므로 `required_hardware_parameters()`와
+`initialize_node_resources()`를 구현하지 않습니다.
+
 ## 실행
 
 ```bash

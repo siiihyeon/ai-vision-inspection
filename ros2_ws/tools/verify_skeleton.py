@@ -61,6 +61,12 @@ INTERFACE_FIELDS = {
         "attempt",
     ],
 }
+NODE_CONTRACTS = {
+    "inspection_master": ("MasterNode", "MASTER", False, False),
+    "inspection_control": ("ControlNode", "CONTROL", True, True),
+    "inspection_vision": ("VisionNode", "VISION", True, True),
+    "inspection_log": ("LogNode", "LOG", True, True),
+}
 
 
 def require(condition: bool, message: str) -> None:
@@ -161,6 +167,114 @@ require(
     "bool(request.session_id) and request.session_id == self.session_id" in node_base,
     "GetNodeStatus must reject an empty or mismatched session",
 )
+require(
+    "await self.initialize_node_resources()" in node_base,
+    "shared initialization must call the node resource hook",
+)
+require(
+    'if self.profile == "hardware"' in node_base,
+    "unimplemented hardware resource initialization must be blocked",
+)
+
+for package_name, (
+    class_name,
+    expected_node_id,
+    expected_action_server,
+    requires_worker_hooks,
+) in NODE_CONTRACTS.items():
+    module_name = package_name.removeprefix("inspection_") + "_node.py"
+    node_file = SOURCE / "nodes" / package_name / package_name / module_name
+    tree = ast.parse(node_file.read_text(encoding="utf-8"), filename=str(node_file))
+    class_node = next(
+        (
+            item
+            for item in tree.body
+            if isinstance(item, ast.ClassDef) and item.name == class_name
+        ),
+        None,
+    )
+    require(class_node is not None, f"node class missing: {class_name}")
+    require(
+        any(
+            isinstance(base, ast.Name) and base.id == "InspectionNodeBase"
+            for base in class_node.bases
+        ),
+        f"{class_name} must inherit InspectionNodeBase",
+    )
+    methods = {
+        item.name: item
+        for item in class_node.body
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    require("__init__" in methods, f"{class_name} constructor is missing")
+    super_init = next(
+        (
+            call
+            for call in ast.walk(methods["__init__"])
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "__init__"
+            and isinstance(call.func.value, ast.Call)
+            and isinstance(call.func.value.func, ast.Name)
+            and call.func.value.func.id == "super"
+        ),
+        None,
+    )
+    require(super_init is not None, f"{class_name} must call super().__init__")
+    require(
+        bool(super_init.args)
+        and isinstance(super_init.args[0], ast.Attribute)
+        and isinstance(super_init.args[0].value, ast.Name)
+        and super_init.args[0].value.id == "NodeId"
+        and super_init.args[0].attr == expected_node_id,
+        f"{class_name} uses the wrong NodeId",
+    )
+    action_keyword = next(
+        (
+            keyword
+            for keyword in super_init.keywords
+            if keyword.arg == "provides_initialize_action"
+        ),
+        None,
+    )
+    require(
+        action_keyword is not None
+        and isinstance(action_keyword.value, ast.Constant)
+        and action_keyword.value.value is expected_action_server,
+        f"{class_name} has the wrong initialize Action ownership",
+    )
+    require(
+        "_execute_initialize" not in methods,
+        f"{class_name} must not override shared _execute_initialize",
+    )
+    if requires_worker_hooks:
+        require(
+            "required_hardware_parameters" in methods,
+            f"{class_name} hardware parameter hook is missing",
+        )
+        require(
+            "initialize_node_resources" in methods,
+            f"{class_name} resource initialization hook is missing",
+        )
+
+    main_function = next(
+        (
+            item
+            for item in tree.body
+            if isinstance(item, ast.FunctionDef) and item.name == "main"
+        ),
+        None,
+    )
+    require(main_function is not None, f"{package_name} main function is missing")
+    require(
+        any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "spin_node"
+            for call in ast.walk(main_function)
+        ),
+        f"{package_name} main must use spin_node",
+    )
 
 launch = (
     SOURCE

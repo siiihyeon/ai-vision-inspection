@@ -5,7 +5,12 @@
 
 import rclpy
 
-from inspection_common import InspectionNodeBase, NodeId, spin_node
+from inspection_common import (
+    InspectionNodeBase,
+    NodeId,
+    NodeInitializationOutcome,
+    spin_node,
+)
 
 
 class VisionNode(InspectionNodeBase):
@@ -14,6 +19,18 @@ class VisionNode(InspectionNodeBase):
     def __init__(self) -> None:
         super().__init__(NodeId.VISION, provides_initialize_action=True)
         self.get_logger().info("VisionNode skeleton started")
+
+    def required_hardware_parameters(self) -> tuple[str, ...]:
+        """실제 Vision 장비에 필요한 ROS 파라미터 키를 반환합니다."""
+
+        # TODO(HARDWARE_REQUIRED): 카메라·조명·모델·GPU 설정 키를 확정합니다.
+        return tuple(super().required_hardware_parameters())
+
+    async def initialize_node_resources(self) -> NodeInitializationOutcome:
+        """카메라·모델·추론 워커 초기화를 구현할 전용 확장 지점입니다."""
+
+        # TODO(IMPLEMENTATION): 카메라 연결·모델 로드·추론 큐 준비를 검증합니다.
+        return await super().initialize_node_resources()
 
 
 def main(args: list[str] | None = None) -> None:

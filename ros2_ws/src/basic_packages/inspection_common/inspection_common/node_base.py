@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 
 import rclpy
 from inspection_interfaces.action import InitializeNode
@@ -33,6 +34,17 @@ def heartbeat_qos() -> QoSProfile:
         reliability=ReliabilityPolicy.BEST_EFFORT,
         durability=DurabilityPolicy.VOLATILE,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class NodeInitializationOutcome:
+    """자식 노드의 자원 초기화 결과를 공통 Action 처리에 전달합니다."""
+
+    success: bool
+    reason: str
+    retryable: bool = False
+    error_code: str = ""
+    status_details: dict[str, object] = field(default_factory=dict)
 
 
 class InspectionNodeBase(Node):
@@ -156,6 +168,26 @@ class InspectionNodeBase(Node):
             if value is None or value == "":
                 missing.append(key)
         return missing
+
+    async def initialize_node_resources(self) -> NodeInitializationOutcome:
+        """자식 노드가 장비·모델·저장소 초기화를 구현하는 확장 지점입니다.
+
+        팀원은 ``_execute_initialize`` 전체를 오버라이딩하지 않고 이 메서드만
+        오버라이딩해야 합니다. 기본 구현은 sim 통신 골격만 허용하며, 실제
+        hardware 프로필은 구현되지 않은 초기화로 READY가 되는 것을 차단합니다.
+        """
+
+        if self.profile == "hardware":
+            return NodeInitializationOutcome(
+                success=False,
+                error_code=ErrorCode.NODE_INIT_FAILED.value,
+                reason=f"{self.node_id.value} resource initialization is not implemented",
+                retryable=True,
+            )
+        return NodeInitializationOutcome(
+            success=True,
+            reason="sim skeleton resource initialization completed",
+        )
 
     def _publish_heartbeat(self) -> None:
         self._heartbeat_sequence += 1
@@ -324,19 +356,46 @@ class InspectionNodeBase(Node):
                     "retryable": True,
                 }
             else:
-                self.session_id = request.session_id
-                self.config_version = request.config_version
-                self.config_digest = request.config_digest
-                self.set_health_state(NodeHealthState.READY)
-                feedback.stage = "READY"
-                goal_handle.publish_feedback(feedback)
-                values = {
-                    "success": True,
-                    "error_code": "",
-                    "reason": "sim skeleton initialization completed",
-                    "status_snapshot": self._status_snapshot(),
-                    "retryable": False,
-                }
+                try:
+                    outcome = await self.initialize_node_resources()
+                except Exception as exc:  # 실제 SDK 예외를 Action 실패로 변환합니다.
+                    self.get_logger().exception("node resource initialization failed")
+                    outcome = NodeInitializationOutcome(
+                        success=False,
+                        error_code=ErrorCode.NODE_INIT_FAILED.value,
+                        reason=f"resource initialization raised {type(exc).__name__}",
+                        retryable=True,
+                    )
+
+                if not outcome.success:
+                    self.set_health_state(NodeHealthState.INIT_BLOCKED)
+                    values = {
+                        "success": False,
+                        "error_code": (
+                            outcome.error_code or ErrorCode.NODE_INIT_FAILED.value
+                        ),
+                        "reason": outcome.reason,
+                        "status_snapshot": self._status_snapshot(
+                            resource_details=outcome.status_details
+                        ),
+                        "retryable": outcome.retryable,
+                    }
+                else:
+                    self.session_id = request.session_id
+                    self.config_version = request.config_version
+                    self.config_digest = request.config_digest
+                    self.set_health_state(NodeHealthState.READY)
+                    feedback.stage = "READY"
+                    goal_handle.publish_feedback(feedback)
+                    values = {
+                        "success": True,
+                        "error_code": "",
+                        "reason": outcome.reason,
+                        "status_snapshot": self._status_snapshot(
+                            resource_details=outcome.status_details
+                        ),
+                        "retryable": False,
+                    }
 
         self._initialize_requests[request.request_id] = (signature, values)
         self._fill_initialize_result(result, values)
