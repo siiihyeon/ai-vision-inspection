@@ -43,6 +43,7 @@ from inspection_master.product_flow import (  # noqa: E402
     SensorEventOutcome,
     SensorEventRegistry,
     StationDecision,
+    StationProcessState,
     StationResultConflict,
 )
 from inspection_master.system_fsm import (  # noqa: E402
@@ -262,6 +263,77 @@ class MasterContractTests(unittest.TestCase):
         )
         self.assertEqual(state.request_id, "request-2")
         self.assertEqual(state.retry_of_request_id, "request-1")
+
+    def test_worker_epoch_change_invalidates_only_stale_status_evidence(self) -> None:
+        now_ns = 10_000
+        state = WorkerRuntimeState(NodeId.VISION)
+        state.action_ready = True
+        state.active_session_id = "session-1"
+        state.record_status(
+            node_instance_id="instance-1",
+            interface_version="2.0.0",
+            software_version="0.2.0",
+            active_session_id="session-1",
+            command_epoch=0,
+            heartbeat_sequence=1,
+            health_state=NodeHealthState.READY,
+            ready=True,
+            master_heartbeat_alive=True,
+        )
+        state.accept_heartbeat(
+            node_instance_id="instance-1",
+            sequence=1,
+            health_state=NodeHealthState.READY,
+            interface_version="2.0.0",
+            session_id="session-1",
+            received_ns=now_ns,
+        )
+        state.mark_ready()
+
+        state.invalidate_epoch_evidence(now_ns=now_ns, interval_ns=500)
+        self.assertTrue(state.action_ready)
+        self.assertFalse(state.status_verified)
+        self.assertFalse(state.ready)
+        self.assertEqual(state.phase, WorkerInitPhase.WAITING_STATUS)
+        self.assertEqual(state.status_poll_due_ns, now_ns + 500)
+        self.assertFalse(
+            state.can_mark_ready(
+                session_id="session-1",
+                expected_interface_version="2.0.0",
+                command_epoch=1,
+                now_ns=now_ns,
+                heartbeat_timeout_ns=2_000,
+            )
+        )
+
+        state.record_status(
+            node_instance_id="instance-1",
+            interface_version="2.0.0",
+            software_version="0.2.0",
+            active_session_id="session-1",
+            command_epoch=1,
+            heartbeat_sequence=2,
+            health_state=NodeHealthState.READY,
+            ready=True,
+            master_heartbeat_alive=True,
+        )
+        state.accept_heartbeat(
+            node_instance_id="instance-1",
+            sequence=2,
+            health_state=NodeHealthState.READY,
+            interface_version="2.0.0",
+            session_id="session-1",
+            received_ns=now_ns + 1,
+        )
+        self.assertTrue(
+            state.can_mark_ready(
+                session_id="session-1",
+                expected_interface_version="2.0.0",
+                command_epoch=1,
+                now_ns=now_ns + 1,
+                heartbeat_timeout_ns=2_000,
+            )
+        )
 
     def test_system_fsm_normal_run_pause_and_resume(self) -> None:
         state = SystemState.BOOT
@@ -501,6 +573,32 @@ class MasterContractTests(unittest.TestCase):
         with self.assertRaises(StationResultConflict):
             context.apply_station_result(conflicting)
 
+    def test_duplicate_position_settled_does_not_rewind_capture_state(self) -> None:
+        context = ProductLedger().register("product", 1)
+        context.begin_station_cycle(
+            StationId.A,
+            position_command_id="position-a",
+            target_step=100,
+            capture_id="capture-a",
+        )
+        context.mark_position_action_succeeded(StationId.A, "position-a")
+        context.mark_position_settled(StationId.A, "position-a")
+        context.mark_capture_requested(
+            StationId.A,
+            capture_id="capture-a",
+            command_id="capture-command-a",
+        )
+        revision = context.revision
+
+        context.mark_position_settled(StationId.A, "position-a")
+
+        station = context.station(StationId.A)
+        self.assertEqual(
+            station.process_state,
+            StationProcessState.CAPTURE_REQUESTED,
+        )
+        self.assertEqual(context.revision, revision)
+
     def test_sensor_registry_rejects_duplicate_conflict_gap_and_out_of_order(self) -> None:
         registry = SensorEventRegistry()
         self.assertEqual(
@@ -521,6 +619,24 @@ class MasterContractTests(unittest.TestCase):
         )
         self.assertEqual(
             registry.accept("S1", "event-0", 0, "digest-0"),
+            SensorEventOutcome.OUT_OF_ORDER,
+        )
+
+    def test_sensor_registry_bounds_remembered_event_ids(self) -> None:
+        registry = SensorEventRegistry(event_capacity=2)
+        for sequence in range(1, 4):
+            self.assertEqual(
+                registry.accept(
+                    "S1",
+                    f"event-{sequence}",
+                    sequence,
+                    f"digest-{sequence}",
+                ),
+                SensorEventOutcome.ACCEPTED,
+            )
+        self.assertEqual(registry.remembered_event_count, 2)
+        self.assertEqual(
+            registry.accept("S1", "event-1", 1, "digest-1"),
             SensorEventOutcome.OUT_OF_ORDER,
         )
 

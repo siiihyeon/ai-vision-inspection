@@ -123,6 +123,23 @@ class WorkerRuntimeState:
         self.status_request_id = ""
         self.status_poll_due_ns = now_ns + interval_ns
 
+    def invalidate_epoch_evidence(
+        self, *, now_ns: int, interval_ns: int
+    ) -> None:
+        """Master epoch 변경 전의 status 증거를 버리고 재조회를 예약합니다.
+
+        InitializeNode Action 성공 자체는 현재 프로세스에 계속 유효하므로
+        ``action_ready``는 유지합니다. 반면 GetNodeStatus에서 확인한 epoch는
+        오래된 값이므로 READY 판단에 다시 사용하지 않습니다.
+        """
+
+        self.status_verified = False
+        self.ready = False
+        self.status_request_id = ""
+        self.deadline_ns = 0
+        if self.action_ready:
+            self.schedule_status_poll(now_ns=now_ns, interval_ns=interval_ns)
+
     def record_status(
         self,
         *,
