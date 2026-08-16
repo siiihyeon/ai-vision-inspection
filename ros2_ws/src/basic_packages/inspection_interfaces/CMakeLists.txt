@@ -27,6 +27,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/LogEvent.msg"
   "msg/LogPersistedAck.msg"
   "srv/GetNodeStatus.srv"
+  "srv/OperatorCommand.srv"
   "action/InitializeNode.action"
   "action/PositionProduct.action"
   "action/CaptureProduct.action"

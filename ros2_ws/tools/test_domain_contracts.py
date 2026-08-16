@@ -23,18 +23,37 @@ for package_path in (
     sys.path.insert(0, str(package_path))
 
 from inspection_common import (  # noqa: E402
+    ConveyorId,
     IdempotencyStore,
+    NodeHealthState,
+    NodeId,
+    ProductPhysicalState,
     ReplayKind,
     StationId,
+    SystemState,
     Verdict,
     payload_digest,
 )
 from inspection_common.log_spool import DurableLogSpool, SpoolRecord  # noqa: E402
 from inspection_log.storage import LogRepository, StoredLogEvent  # noqa: E402
+from inspection_master.operation_runtime import EquipmentSnapshot  # noqa: E402
 from inspection_master.product_flow import (  # noqa: E402
     ProductLedger,
     ProductResultReorderBuffer,
+    SensorEventOutcome,
+    SensorEventRegistry,
     StationDecision,
+    StationResultConflict,
+)
+from inspection_master.system_fsm import (  # noqa: E402
+    InvalidSystemTransition,
+    SystemEvent,
+    allowed_system_events,
+    decide_system_transition,
+)
+from inspection_master.worker_supervision import (  # noqa: E402
+    WorkerInitPhase,
+    WorkerRuntimeState,
 )
 from inspection_vision.capture_contract import CaptureBatch, ImageArtifact  # noqa: E402
 from inspection_vision.inference_queue import (  # noqa: E402
@@ -73,45 +92,405 @@ class CommonContractTests(unittest.TestCase):
 
 
 class MasterContractTests(unittest.TestCase):
+    def _complete_station(
+        self,
+        context,
+        station_id: StationId,
+        *,
+        verdict: Verdict | None,
+        capture_failed: bool = False,
+    ) -> None:
+        """ROS 없이 station의 위치→촬영→재가동 규칙을 진행합니다."""
+
+        suffix = station_id.name.lower()
+        position_command_id = f"position-{suffix}"
+        capture_id = f"capture-{suffix}-{context.product_id}"
+        context.begin_station_cycle(
+            station_id,
+            position_command_id=position_command_id,
+            target_step=100 * int(station_id),
+            capture_id=capture_id,
+        )
+        context.mark_position_action_succeeded(station_id, position_command_id)
+        context.mark_position_settled(station_id, position_command_id)
+        context.mark_capture_requested(
+            station_id,
+            capture_id=capture_id,
+            command_id=f"capture-command-{suffix}",
+        )
+        if capture_failed:
+            context.mark_capture_failed(
+                station_id,
+                capture_id=capture_id,
+                reason=f"station {suffix} final capture failed",
+            )
+        else:
+            context.mark_capture_succeeded(
+                station_id,
+                capture_id=capture_id,
+                frame_batch_id=f"batch-{suffix}",
+                inference_job_id=f"job-{suffix}",
+            )
+            if verdict is not None:
+                context.apply_station_result(
+                    StationDecision(
+                        station_id,
+                        verdict,
+                        1,
+                        capture_id,
+                        f"job-{suffix}",
+                        f"batch-{suffix}",
+                    )
+                )
+        context.mark_conveyor_resumed_after_capture(station_id)
+
+    def _move_to_station_b(self, context) -> None:
+        context.accept_sensor2(f"sensor2-{context.product_id}", 200)
+
+    def test_worker_ready_requires_action_status_and_fresh_heartbeat(self) -> None:
+        now_ns = 10_000_000_000
+        state = WorkerRuntimeState(NodeId.VISION)
+        state.begin_attempt(
+            request_id="request-1",
+            attempt=1,
+            now_ns=now_ns,
+            timeout_ns=10_000_000_000,
+        )
+        state.mark_goal_accepted()
+        state.mark_action_ready(
+            interface_version="2.0.0",
+            software_version="0.2.0",
+            active_session_id="session-1",
+            reason="ready",
+            now_ns=now_ns,
+            timeout_ns=10_000_000_000,
+        )
+        self.assertFalse(
+            state.can_mark_ready(
+                session_id="session-1",
+                expected_interface_version="2.0.0",
+                command_epoch=0,
+                now_ns=now_ns,
+                heartbeat_timeout_ns=2_000_000_000,
+            )
+        )
+
+        state.record_status(
+            node_instance_id="instance-1",
+            interface_version="2.0.0",
+            software_version="0.2.0",
+            active_session_id="session-1",
+            command_epoch=0,
+            heartbeat_sequence=1,
+            health_state=NodeHealthState.READY,
+            ready=True,
+            master_heartbeat_alive=True,
+        )
+        state.accept_heartbeat(
+            node_instance_id="instance-1",
+            sequence=1,
+            health_state=NodeHealthState.READY,
+            interface_version="2.0.0",
+            session_id="session-1",
+            received_ns=now_ns,
+        )
+        self.assertTrue(
+            state.can_mark_ready(
+                session_id="session-1",
+                expected_interface_version="2.0.0",
+                command_epoch=0,
+                now_ns=now_ns,
+                heartbeat_timeout_ns=2_000_000_000,
+            )
+        )
+
+    def test_worker_heartbeat_is_latest_only_and_detects_restart(self) -> None:
+        state = WorkerRuntimeState(NodeId.CONTROL)
+        first = state.accept_heartbeat(
+            node_instance_id="instance-1",
+            sequence=10,
+            health_state=NodeHealthState.READY,
+            interface_version="2.0.0",
+            session_id="session-1",
+            received_ns=1_000,
+        )
+        self.assertTrue(first.accepted)
+        self.assertFalse(first.restarted)
+
+        duplicate = state.accept_heartbeat(
+            node_instance_id="instance-1",
+            sequence=10,
+            health_state=NodeHealthState.READY,
+            interface_version="2.0.0",
+            session_id="session-1",
+            received_ns=2_000,
+        )
+        self.assertFalse(duplicate.accepted)
+
+        restarted = state.accept_heartbeat(
+            node_instance_id="instance-2",
+            sequence=1,
+            health_state=NodeHealthState.STARTING,
+            interface_version="2.0.0",
+            session_id="",
+            received_ns=3_000,
+        )
+        self.assertTrue(restarted.accepted)
+        self.assertTrue(restarted.restarted)
+
+    def test_worker_retry_uses_new_request_and_links_previous_request(self) -> None:
+        state = WorkerRuntimeState(NodeId.LOG)
+        state.begin_attempt(
+            request_id="request-1",
+            attempt=1,
+            now_ns=1_000,
+            timeout_ns=10_000,
+        )
+        state.schedule_retry(
+            now_ns=2_000,
+            interval_ns=1_000,
+            error_code=9002,
+            reason="temporary failure",
+            manual_intervention_required=False,
+        )
+        self.assertEqual(state.phase, WorkerInitPhase.RETRY_WAIT)
+        state.begin_attempt(
+            request_id="request-2",
+            attempt=2,
+            now_ns=3_000,
+            timeout_ns=10_000,
+        )
+        self.assertEqual(state.request_id, "request-2")
+        self.assertEqual(state.retry_of_request_id, "request-1")
+
+    def test_system_fsm_normal_run_pause_and_resume(self) -> None:
+        state = SystemState.BOOT
+
+        transition = decide_system_transition(
+            state, SystemEvent.APP_STARTED, "application started"
+        )
+        self.assertEqual(transition.rule_id, "SYS-01")
+        state = transition.current
+        self.assertEqual(state, SystemState.INITIALIZING)
+
+        state = decide_system_transition(
+            state, SystemEvent.INIT_DONE, "workers ready"
+        ).current
+        self.assertEqual(state, SystemState.READY)
+
+        # START 요청만으로 RUN_SYS가 되지 않습니다.
+        start = decide_system_transition(
+            state, SystemEvent.START_REQUEST, "operator start"
+        )
+        self.assertFalse(start.changed)
+        self.assertEqual(start.current, SystemState.READY)
+        state = decide_system_transition(
+            state,
+            SystemEvent.ALL_CONVEYORS_RUNNING,
+            "both conveyors running",
+        ).current
+        self.assertEqual(state, SystemState.RUN_SYS)
+
+        state = decide_system_transition(
+            state, SystemEvent.PAUSE_REQUEST, "operator pause"
+        ).current
+        self.assertEqual(state, SystemState.PAUSING)
+        state = decide_system_transition(
+            state,
+            SystemEvent.ALL_CONVEYORS_STOPPED,
+            "both conveyors stopped",
+        ).current
+        self.assertEqual(state, SystemState.PAUSED)
+
+        # RESUME 요청도 실제 RUN 확인 전까지 PAUSED를 유지합니다.
+        resume = decide_system_transition(
+            state, SystemEvent.RESUME_REQUEST, "operator resume"
+        )
+        self.assertFalse(resume.changed)
+        state = decide_system_transition(
+            resume.current,
+            SystemEvent.ALL_CONVEYORS_RUNNING,
+            "both conveyors running",
+        ).current
+        self.assertEqual(state, SystemState.RUN_SYS)
+
+    def test_system_fsm_retries_safe_failures_without_fault_stop(self) -> None:
+        initializing = decide_system_transition(
+            SystemState.INITIALIZING,
+            SystemEvent.INIT_TIMEOUT,
+            "worker initialization timeout",
+        )
+        self.assertEqual(initializing.rule_id, "SYS-03")
+        self.assertEqual(initializing.current, SystemState.INITIALIZING)
+
+        start_failed = decide_system_transition(
+            SystemState.READY,
+            SystemEvent.START_FAILED,
+            "conveyor did not start",
+        )
+        self.assertEqual(start_failed.current, SystemState.READY)
+
+        resume_failed = decide_system_transition(
+            SystemState.PAUSED,
+            SystemEvent.RESUME_FAILED,
+            "resume command failed",
+        )
+        self.assertEqual(resume_failed.current, SystemState.PAUSED)
+
+        reset_failed = decide_system_transition(
+            SystemState.RESETTING,
+            SystemEvent.RESET_FAILED,
+            "equipment check failed",
+        )
+        self.assertEqual(reset_failed.current, SystemState.RESETTING)
+
+    def test_system_fsm_fault_and_reset_paths(self) -> None:
+        pause_failed = decide_system_transition(
+            SystemState.PAUSING,
+            SystemEvent.PAUSE_TIMEOUT,
+            "stop could not be confirmed",
+        )
+        self.assertEqual(pause_failed.rule_id, "SYS-07")
+        self.assertEqual(pause_failed.current, SystemState.FAULT_STOP)
+
+        critical = decide_system_transition(
+            SystemState.RUN_SYS,
+            SystemEvent.CRITICAL_FAULT,
+            "FIFO identity lost",
+        )
+        self.assertEqual(critical.rule_id, "SYS-10")
+        self.assertEqual(critical.current, SystemState.FAULT_STOP)
+
+        resetting = decide_system_transition(
+            critical.current,
+            SystemEvent.RESET_REQUEST,
+            "operator confirmed recovery guard",
+        ).current
+        self.assertEqual(resetting, SystemState.RESETTING)
+        self.assertEqual(
+            decide_system_transition(
+                resetting,
+                SystemEvent.RESET_SUCCEEDED_EMPTY_LINE,
+                "line clear completed",
+            ).current,
+            SystemState.READY,
+        )
+        self.assertEqual(
+            decide_system_transition(
+                resetting,
+                SystemEvent.RESET_SUCCEEDED_IN_PLACE,
+                "equipment recovered with product context",
+            ).current,
+            SystemState.PAUSED,
+        )
+
+    def test_system_fsm_rejects_unlisted_transition_and_accepts_estop_anywhere(self) -> None:
+        with self.assertRaises(InvalidSystemTransition):
+            decide_system_transition(
+                SystemState.BOOT,
+                SystemEvent.START_REQUEST,
+                "invalid direct start",
+            )
+        self.assertIn(SystemEvent.ESTOP_ASSERTED, allowed_system_events(SystemState.BOOT))
+        estop = decide_system_transition(
+            SystemState.BOOT,
+            SystemEvent.ESTOP_ASSERTED,
+            "physical E-stop",
+        )
+        self.assertEqual(estop.rule_id, "SYS-15")
+        self.assertEqual(estop.current, SystemState.FAULT_STOP)
+
     def test_station_aggregation_sensor3_and_fifo_reorder(self) -> None:
         ledger = ProductLedger()
         first = ledger.register("product-1", 1)
-        self.assertTrue(
-            first.apply_station_result(
-                StationDecision(StationId.A, Verdict.PASS, 1, "capture-a", "job-a")
-            )
-        )
-        self.assertIsNone(first.lock_if_complete())
-        self.assertTrue(
-            first.apply_station_result(
-                StationDecision(StationId.B, Verdict.PASS, 1, "capture-b", "job-b")
-            )
-        )
-        first_locked = first.lock_if_complete()
-        self.assertIsNotNone(first_locked)
+        first.record_sensor(1, "sensor1-product-1", 100)
+        self._complete_station(first, StationId.A, verdict=Verdict.PASS)
+        self._move_to_station_b(first)
+        self._complete_station(first, StationId.B, verdict=Verdict.PASS)
+        self.assertIsNone(first.locked)
+        first_locked = first.lock_at_sensor3("sensor3-product-1", 300)
         self.assertEqual(first_locked.verdict, Verdict.PASS)
         self.assertFalse(
             first.apply_station_result(
-                StationDecision(StationId.B, Verdict.NG, 2, "late", "late")
+                StationDecision(
+                    StationId.B,
+                    Verdict.NG,
+                    2,
+                    "capture-b-product-1",
+                    "job-b",
+                    "batch-b",
+                )
             )
         )
 
         second = ledger.register("product-2", 2)
-        second_locked = second.lock_at_sensor3("sensor3-event")
+        second.record_sensor(1, "sensor1-product-2", 400)
+        self._complete_station(second, StationId.A, verdict=None)
+        self._move_to_station_b(second)
+        self._complete_station(second, StationId.B, verdict=Verdict.PASS)
+        second_locked = second.lock_at_sensor3("sensor3-product-2", 600)
         self.assertEqual(second_locked.verdict, Verdict.FORCED_NG)
         self.assertFalse(second_locked.station_a_completed)
-        self.assertFalse(second_locked.station_b_completed)
+        self.assertTrue(second_locked.station_b_completed)
 
         reorder = ProductResultReorderBuffer()
         self.assertEqual(reorder.add(second_locked), [])
         emitted = reorder.add(first_locked)
         self.assertEqual([item.fifo_sequence for item in emitted], [1, 2])
 
-    def test_explicit_station_failure_locks_immediately(self) -> None:
+    def test_capture_failure_becomes_forced_ng_only_at_sensor3(self) -> None:
         context = ProductLedger().register("product", 1)
-        locked = context.lock_explicit_failure(StationId.A, "camera offline")
+        context.record_sensor(1, "sensor1-product", 100)
+        self._complete_station(
+            context,
+            StationId.A,
+            verdict=None,
+            capture_failed=True,
+        )
+        self.assertIsNone(context.locked)
+        self._move_to_station_b(context)
+        self._complete_station(context, StationId.B, verdict=Verdict.PASS)
+        locked = context.lock_at_sensor3("sensor3-product", 300)
         self.assertEqual(locked.verdict, Verdict.FORCED_NG)
-        self.assertIn("camera offline", locked.reason)
+        self.assertIn("final capture failed", locked.reason)
+
+    def test_vision_result_can_precede_capture_action_result(self) -> None:
+        context = ProductLedger().register("race-product", 1)
+        context.record_sensor(1, "sensor1-race", 100)
+        context.begin_station_cycle(
+            StationId.A,
+            position_command_id="position-a",
+            target_step=100,
+            capture_id="capture-race",
+        )
+        context.mark_position_action_succeeded(StationId.A, "position-a")
+        context.mark_position_settled(StationId.A, "position-a")
+        context.mark_capture_requested(
+            StationId.A,
+            capture_id="capture-race",
+            command_id="capture-command-race",
+        )
+        context.apply_station_result(
+            StationDecision(
+                StationId.A,
+                Verdict.PASS,
+                1,
+                "capture-race",
+                "job-race",
+                "batch-race",
+            )
+        )
+        context.promote_capture_completion_from_vision(StationId.A)
+        self.assertEqual(
+            context.physical_state,
+            ProductPhysicalState.STATION_A_DONE,
+        )
+        self.assertEqual(
+            context.station(StationId.A).frame_batch_id,
+            "batch-race",
+        )
+        context.mark_conveyor_resumed_after_capture(StationId.A)
+        self.assertEqual(context.physical_state, ProductPhysicalState.FLIPPING)
 
     def test_same_station_revision_with_other_content_is_conflict(self) -> None:
         context = ProductLedger().register("product", 1)
@@ -119,8 +498,73 @@ class MasterContractTests(unittest.TestCase):
         conflicting = replace(first, verdict=Verdict.NG)
         self.assertTrue(context.apply_station_result(first))
         self.assertFalse(context.apply_station_result(first))
-        with self.assertRaises(ValueError):
+        with self.assertRaises(StationResultConflict):
             context.apply_station_result(conflicting)
+
+    def test_sensor_registry_rejects_duplicate_conflict_gap_and_out_of_order(self) -> None:
+        registry = SensorEventRegistry()
+        self.assertEqual(
+            registry.accept("S1", "event-1", 1, "digest-1"),
+            SensorEventOutcome.ACCEPTED,
+        )
+        self.assertEqual(
+            registry.accept("S1", "event-1", 1, "digest-1"),
+            SensorEventOutcome.DUPLICATE,
+        )
+        self.assertEqual(
+            registry.accept("S1", "event-1", 1, "other"),
+            SensorEventOutcome.CONFLICT,
+        )
+        self.assertEqual(
+            registry.accept("S1", "event-3", 3, "digest-3"),
+            SensorEventOutcome.SEQUENCE_GAP,
+        )
+        self.assertEqual(
+            registry.accept("S1", "event-0", 0, "digest-0"),
+            SensorEventOutcome.OUT_OF_ORDER,
+        )
+
+    def test_fifo_removes_only_contiguous_completed_prefix(self) -> None:
+        ledger = ProductLedger()
+        first = ledger.register("first", 1)
+        second = ledger.register("second", 2)
+        first.physical_state = ProductPhysicalState.DONE
+        second.physical_state = ProductPhysicalState.DONE
+        second.completed = True
+        self.assertEqual(ledger.remove_completed_prefix(), [])
+        first.completed = True
+        self.assertEqual(
+            [item.product_id for item in ledger.remove_completed_prefix()],
+            ["first", "second"],
+        )
+
+    def test_completed_context_is_pruned_after_retention_with_tombstone(self) -> None:
+        ledger = ProductLedger()
+        context = ledger.register("retained", 1)
+        ledger.register_capture("capture-retained", "retained", StationId.A)
+        context.completed = True
+        context.physical_state = ProductPhysicalState.DONE
+        ledger.remove_completed_prefix(now_ns=1_000)
+        self.assertEqual(ledger.prune_removed(cutoff_ns=999), [])
+        self.assertEqual(ledger.prune_removed(cutoff_ns=1_000), ["retained"])
+        self.assertIsNone(ledger.get("retained", 1))
+        self.assertTrue(ledger.is_retired_product("retained", 1))
+        self.assertTrue(ledger.is_retired_capture("capture-retained"))
+
+    def test_equipment_guards_require_explicit_physical_confirmation(self) -> None:
+        snapshot = EquipmentSnapshot()
+        self.assertFalse(snapshot.in_place_guards_satisfied())
+        snapshot.mark_all_stopped()
+        snapshot.actuator_safe = True
+        self.assertTrue(snapshot.in_place_guards_satisfied())
+        snapshot.sensor_clear = {1: True, 2: True, 3: True}
+        snapshot.actuator_area_clear = True
+        snapshot.line_clear_confirmed = True
+        snapshot.operator_id = "operator"
+        self.assertTrue(snapshot.line_clear_guards_satisfied())
+        snapshot.conveyor_running[ConveyorId.UPPER] = True
+        snapshot.conveyor_stopped[ConveyorId.UPPER] = False
+        self.assertFalse(snapshot.line_clear_guards_satisfied())
 
 
 class VisionContractTests(unittest.TestCase):

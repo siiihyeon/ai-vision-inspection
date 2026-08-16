@@ -7,7 +7,13 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 import rclpy
-from inspection_common import ErrorCode, IdempotencyStore, NodeId, new_uuid
+from inspection_common import (
+    ErrorCode,
+    IdempotencyStore,
+    NodeId,
+    SystemState,
+    new_uuid,
+)
 from inspection_common.node_base import (
     InspectionNodeBase,
     NodeInitializationOutcome,
@@ -193,7 +199,14 @@ class VisionNode(InspectionNodeBase):
             0.0,
             "validating capture identity and command envelope",
         )
-        valid, code, reason = self.validate_command_header(request.command)
+        valid, code, reason = self.validate_command_header(
+            request.command,
+            allowed_system_states={
+                SystemState.RUN_SYS,
+                SystemState.PAUSING,
+                SystemState.PAUSED,
+            },
+        )
         if not valid:
             return self._terminal_capture(goal_handle, result, code, reason)
 

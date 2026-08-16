@@ -1,0 +1,16 @@
+uint8 INITIALIZE=1
+uint8 START=2
+uint8 PAUSE=3
+uint8 RESUME=4
+uint8 RESET=5
+uint8 CONFIRM_LINE_CLEAR=6
+string request_id
+uint8 command_type
+string reason
+string operator_id
+---
+string request_id
+bool accepted
+uint8 system_state
+string system_state_name
+string message

@@ -5,7 +5,7 @@
 ## 계약 분류
 
 - 공통: `CommonHeader`, `CommandHeader`, `ErrorCode`, `NodeHealth`, `SystemState`, `StationId`, `ConveyorId`, `NodeRuntimeEnvironment`
-- 생존/운영: `MasterHeartbeat`, `NodeHeartbeat`, `SystemCommand`, `GetNodeStatus`, `InitializeNode`
+- 생존/운영: `MasterHeartbeat`, `NodeHeartbeat`, `SystemCommand`, `GetNodeStatus`, `InitializeNode`, `OperatorCommand`
 - Control: `SensorEvent`, `PositionSettled`, `PositionProduct`, `ActuateProduct`
 - Vision: `ImageReference`, `CaptureProduct`, `VisionQueueState`, `StationResult`, `StationInferenceFailed`
 - Master: `ProductResultLocked`

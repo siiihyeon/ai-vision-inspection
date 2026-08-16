@@ -1,38 +1,81 @@
 # inspection_master
 
-Master는 시스템 상태, `product_id`, `fifo_sequence`, 물리 제품 추적, A/B 결과 결합과 최종 잠금의 유일한 소유자입니다.
+`MasterNode`는 전체 시스템 상태, 제품 ID, 단일 활성 FIFO, 제품의 물리 위치,
+Station A/B 결과 결합, Sensor3 최종 판정 잠금과 액추에이터 분류를
+단독 소유합니다.
 
-## 골격에 구현된 경계
+## 구현 상태
 
-- worker Heartbeat/interface/process restart 감시, restart 시 epoch 증가·PAUSE
-- Control/Vision/Log Initialize clients
-- Position/Capture/Actuate Action clients
-- `ProductLedger`, station revision, A+B 결합
-- 명시적 station 실패 즉시 FORCED_NG
-- Sensor3 미완료 FORCED_NG용 `lock_product_at_sensor3()` 확장점
-- 병렬 완료를 `fifo_sequence`로 내보내는 `ProductResultReorderBuffer`
-- Vision `ENQUEUE_BLOCKED` PAUSE와 queue recovery RESUME
+마스터 노드의 8개 블록이 연결되어 있습니다.
 
-## 반드시 결정 후 구현할 사항
+| 블록 | 책임 | 구현 상태 |
+|---|---|---|
+| 1 | 전체 시스템 FSM과 운전 명령 | 완료 |
+| 2 | Control·Vision·Log 초기화와 heartbeat 감시 | 완료 |
+| 3 | 단일 물리 FIFO와 Sensor1/2/3 매핑 | 완료 |
+| 4 | Station A/B 위치 이동·정지 확인·촬영·재가동 | 완료 |
+| 5 | 비동기 비전 결과, 재시도 결과, 늦은 결과 처리 | 완료 |
+| 6 | Sensor3 판정 잠금, 액추에이터 명령, FIFO 제거 | 완료 |
+| 7 | PAUSE·RESET·FAULT_STOP·LINE_CLEAR 복구 guard | 완료 |
+| 8 | 판정 발행, SQLite log spool/ACK, 안전 종료 | 완료 |
 
-| 항목 | 정확히 필요한 정보 |
-|---|---|
-| 제품 생성 | Sensor1 event와 product 생성 조건, ID 형식, 재시작 시 counter/UUID 복구 |
-| FIFO | `fifo_sequence` 영속화 위치, 재시작 후 첫 sequence, 물리 이탈/중복 센서 처리 |
-| 물리 매핑 | Sensor1/2/3와 station A/B, 상·하 컨베이어, actuator의 순서·거리·예상 제품 매핑 |
-| 전체 FSM | `BOOT/INITIALIZING/READY/RUN_SYS/PAUSING/PAUSED/FAULT_STOP/RESETTING` guard와 명령 허용표 |
-| 초기화 | worker 순서, 각 timeout/retry, 일부 실패 시 rollback, 운영자 승인 |
-| Sensor3 | 어떤 대기 제품에 event를 배정하는지, bounce/중복/예상 없음 처리 |
-| Actuation | PASS/NG/FORCED_NG별 명령, deadline, 통과확인과 실패 복구 |
-| restart | Vision 저장 batch 존재/제품 station 잔류 판별, Control/Log restart별 epoch·복구 sequence |
-| 로그 | Master가 반드시 spool해야 하는 event type과 revision 규칙 |
+`완료`는 Master 책임 범위의 코드와 ROS 연결점이 구현되었다는 뜻입니다.
+Control·Vision의 실장비 adapter, Mega/TB6600 신호, MVS 카메라, 액추에이터
+feedback은 각 노드 담당 구현과 통합 시험이 필요합니다.
 
-## 금지
+## 핵심 운전 규칙
 
-- Vision 결과가 Master를 거치지 않고 actuator를 직접 움직이게 하지 않습니다.
-- Sensor3 이후 late result로 `ProductResultLocked`를 수정하지 않습니다.
-- `_handle_sensor_event()` TODO에 단순히 “가장 오래된 제품” 같은 추정 규칙을 넣지 않습니다.
+- Station A는 카메라 3대, Station B는 1대를 사용합니다.
+- 촬영은 소프트웨어 트리거 `GIGE_ACTION_COMMAND`, LED는 외부 상시 점등입니다.
+- 제품 흐름은 Master의 `ProductLedger` 하나가 소유합니다.
+- Station A 촬영 후 추론을 기다리지 않고 FLIPPING으로 이동합니다.
+- A/B 추론은 비동기로 진행되며 Sensor3 수락 시점에 최종 판정을 한 번만 잠금합니다.
+- Sensor3에서 결과가 없거나 촬영·추론이 최종 실패한 제품은 `FORCED_NG`입니다.
+- 제품/센서/FIFO 식별 정합성을 잃으면 `FAULT_STOP + LINE_CLEAR_REQUIRED`입니다.
+- 카메라·Vision 통신 단절과 같은 복구 가능 장비 오류는 `PAUSED` 후 재시도합니다.
+- 액추에이터 Goal이 수락된 뒤 완료 여부를 알 수 없으면 물리 상태가 불명하므로 `FAULT_STOP`입니다.
+- 완료 제품은 활성 FIFO에서 즉시 빠지지만 late result 진단을 위해 Context를 10분 보존한 뒤 bounded tombstone으로 전환합니다.
+- Ctrl+C는 즉시 종료가 아니라 양쪽 컨베이어 정지·로그 보존 확인 후 종료합니다.
 
-## 인수 시험
+## 개발용 터미널 명령
 
-정상 2 station PASS, station NG, 명시적 실패, Sensor3 미완료, out-of-order result, duplicate/revision, worker restart, queue full/recovery를 모두 deterministic test로 추가해야 합니다.
+HMI를 붙이기 전에는 `/inspection/master/operator_command` Service로 Master FSM을
+조작합니다. `request_id: ''`를 보내면 Master가 UUID를 발급합니다.
+
+```bash
+# 1=INITIALIZE
+ros2 service call /inspection/master/operator_command inspection_interfaces/srv/OperatorCommand "{request_id: '', command_type: 1, reason: 'developer initialize', operator_id: ''}"
+
+# 2=START, 3=PAUSE, 4=RESUME, 5=RESET
+ros2 service call /inspection/master/operator_command inspection_interfaces/srv/OperatorCommand "{request_id: '', command_type: 2, reason: 'developer start', operator_id: ''}"
+
+# 6=CONFIRM_LINE_CLEAR; 신규 RUN 전/FAULT 복구 시 작업자 ID 필수
+ros2 service call /inspection/master/operator_command inspection_interfaces/srv/OperatorCommand "{request_id: '', command_type: 6, reason: 'line physically cleared', operator_id: 'operator-01'}"
+```
+
+종료는 터미널에서 Ctrl+C로 요청합니다. Master가 안전 정지 확인을
+마치기 전에 두 번째 Ctrl+C를 누르면 강제 종료되므로 실장비에서는
+긴급한 경우가 아니면 사용하지 않습니다.
+
+## 파일
+
+- `inspection_master/master_node.py`: 8개 블록의 ROS 연결과 전체 조율
+- `inspection_master/system_fsm.py`: 전체 시스템 상태 전이표
+- `inspection_master/worker_supervision.py`: 작업 노드 초기화·heartbeat 상태
+- `inspection_master/product_flow.py`: 제품 Context, 단일 FIFO, Sensor3 판정 규칙
+- `inspection_master/operation_runtime.py`: 진행 중인 Action과 장비 안전 guard
+- `마스터노드_읽기가이드.md`: 코드 읽기 순서와 필수/보조 함수 분류
+
+코드를 처음 읽을 때는 `마스터노드_읽기가이드.md`부터 보시면 됩니다.
+
+## 검증
+
+ROS 2가 없는 환경에서 순수 도메인 계약을 검사합니다.
+
+```bash
+python3 ros2_ws/tools/verify_skeleton.py
+python3 ros2_ws/tools/test_domain_contracts.py
+```
+
+Ubuntu 24.04 + ROS 2 Jazzy에서는 추가로 `colcon build`과 sim/hardware 통합 시험을
+수행해야 합니다.
