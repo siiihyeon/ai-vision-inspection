@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
+from pathlib import Path
 
 import rclpy
 from inspection_common import ErrorCode, IdempotencyStore, NodeId, new_uuid
@@ -56,6 +58,11 @@ class VisionNode(InspectionNodeBase):
         self.declare_parameter("vision.data_root", "")
         self.declare_parameter("vision.model.path", "")
 
+        if str(self.get_parameter("vision.trigger.mode").value) != "GIGE_ACTION_COMMAND":
+            raise ValueError("vision.trigger.mode must be GIGE_ACTION_COMMAND")
+        if int(self.get_parameter("vision.capture.max_attempts").value) != 2:
+            raise ValueError("vision.capture.max_attempts is fixed at 2")
+
         capacity = int(self.get_parameter("vision.queue.capacity").value)
         self.inference_queue = InferenceQueue(max(capacity, 1))
         self.capture_backend = capture_backend or UnimplementedCaptureBackend()
@@ -65,6 +72,12 @@ class VisionNode(InspectionNodeBase):
             tuple[str, int, str], dict[str, object]
         ] = {}
         self._station_locks = {1: asyncio.Lock(), 2: asyncio.Lock()}
+        configured_camera_ids = set(
+            self.get_parameter("vision.camera_ids.station_a").value
+        ) | set(self.get_parameter("vision.camera_ids.station_b").value)
+        self._camera_locks = {
+            camera_id: asyncio.Lock() for camera_id in configured_camera_ids
+        }
         self._capture_action_group = ReentrantCallbackGroup()
         self._capture_server = ActionServer(
             self,
@@ -105,6 +118,7 @@ class VisionNode(InspectionNodeBase):
             "vision.frame_arrival_skew_limit_us",
             "vision.queue.capacity",
             "vision.worker_count",
+            "vision.inference_queue_total_timeout_ms",
             "vision.data_root",
             "vision.model.path",
         )
@@ -117,12 +131,22 @@ class VisionNode(InspectionNodeBase):
             "vision.frame_arrival_skew_limit_us",
             "vision.queue.capacity",
             "vision.worker_count",
+            "vision.inference_queue_total_timeout_ms",
         )
         for key in positive_keys:
             if self.has_parameter(key) and int(self.get_parameter(key).value) <= 0:
                 missing.append(key)
-        if str(self.get_parameter("vision.trigger.mode").value) != "GIGE_ACTION_COMMAND":
-            missing.append("vision.trigger.mode=GIGE_ACTION_COMMAND")
+        station_a = tuple(self.get_parameter("vision.camera_ids.station_a").value)
+        station_b = tuple(self.get_parameter("vision.camera_ids.station_b").value)
+        if len(station_a) != 3:
+            missing.append("vision.camera_ids.station_a must contain 3 cameras")
+        if len(station_b) != 1:
+            missing.append("vision.camera_ids.station_b must contain 1 camera")
+        if set(station_a) & set(station_b):
+            missing.append("station camera sets must be disjoint")
+        data_root = str(self.get_parameter("vision.data_root").value)
+        if data_root and not Path(data_root).is_absolute():
+            missing.append("vision.data_root must be absolute")
         return list(dict.fromkeys(missing))
 
     async def initialize_node_resources(self) -> NodeInitializationOutcome:
@@ -148,7 +172,7 @@ class VisionNode(InspectionNodeBase):
             and goal_request.station_id in self._station_locks
             and bool(cameras)
             and len(cameras) == len(set(cameras))
-            and set(cameras) == set(configured)
+            and cameras == configured
             and bool(goal_request.command.command_id)
         )
         return GoalResponse.ACCEPT if valid else GoalResponse.REJECT
@@ -159,6 +183,16 @@ class VisionNode(InspectionNodeBase):
     async def _execute_capture(self, goal_handle) -> CaptureProduct.Result:
         request = goal_handle.request
         result = CaptureProduct.Result()
+        self._publish_capture_feedback(
+            goal_handle,
+            CaptureProduct.Feedback.VALIDATING,
+            0,
+            (),
+            tuple(request.required_camera_ids),
+            "",
+            0.0,
+            "validating capture identity and command envelope",
+        )
         valid, code, reason = self.validate_command_header(request.command)
         if not valid:
             return self._terminal_capture(goal_handle, result, code, reason)
@@ -200,7 +234,20 @@ class VisionNode(InspectionNodeBase):
                 self._apply_capture_values(result, completed)
                 goal_handle.succeed()
                 return result
-            batch = await self._capture_required_batch(goal_handle)
+            async with AsyncExitStack() as camera_stack:
+                for camera_id in sorted(request.required_camera_ids):
+                    camera_lock = self._camera_locks.get(camera_id)
+                    if camera_lock is None:
+                        return self._terminal_capture(
+                            goal_handle,
+                            result,
+                            ErrorCode.COMMAND_CONFLICT,
+                            f"camera is not configured: {camera_id}",
+                        )
+                    await camera_stack.enter_async_context(camera_lock)
+                batch, capture_error, capture_reason = await self._capture_required_batch(
+                    goal_handle
+                )
             if batch is None:
                 if goal_handle.is_cancel_requested:
                     return self._terminal_capture(
@@ -213,8 +260,8 @@ class VisionNode(InspectionNodeBase):
                 return self._terminal_capture(
                     goal_handle,
                     result,
-                    ErrorCode.CAPTURE_FAILED,
-                    "all station capture attempts failed; see LogEvent",
+                    capture_error,
+                    capture_reason,
                 )
 
             inference_job_id = new_uuid()
@@ -233,7 +280,24 @@ class VisionNode(InspectionNodeBase):
                 enqueued_monotonic_ns=0,
                 queue_total_timeout_ms=timeout_ms if timeout_ms > 0 else None,
             )
+            self._publish_capture_feedback(
+                goal_handle,
+                CaptureProduct.Feedback.ENQUEUEING_INFERENCE,
+                batch.attempt,
+                tuple(image.camera_id for image in batch.images),
+                (),
+                batch.frame_batch_id,
+                0.95,
+                "enqueueing path-only FrameBatch inference job",
+            )
             while not self.inference_queue.try_enqueue(job):
+                if self.inference_queue.closed:
+                    return self._terminal_capture(
+                        goal_handle,
+                        result,
+                        ErrorCode.INFERENCE_FAILED,
+                        "inference queue is closed",
+                    )
                 if self.inference_queue.is_product_locked(request.product_id):
                     return self._terminal_capture(
                         goal_handle,
@@ -253,9 +317,10 @@ class VisionNode(InspectionNodeBase):
                     goal_handle,
                     CaptureProduct.Feedback.ENQUEUE_BLOCKED,
                     batch.attempt,
-                    len(batch.images),
-                    len(request.required_camera_ids),
+                    tuple(image.camera_id for image in batch.images),
+                    (),
                     batch.frame_batch_id,
+                    0.95,
                     "queue full; preserving saved FrameBatch",
                 )
                 self._publish_queue_state(
@@ -275,23 +340,39 @@ class VisionNode(InspectionNodeBase):
             goal_handle.succeed()
             return result
 
-    async def _capture_required_batch(self, goal_handle) -> CaptureBatch | None:
+    async def _capture_required_batch(
+        self, goal_handle
+    ) -> tuple[CaptureBatch | None, ErrorCode, str]:
         request = goal_handle.request
         required = tuple(request.required_camera_ids)
         max_attempts = int(self.get_parameter("vision.capture.max_attempts").value)
         skew_limit = int(
             self.get_parameter("vision.frame_arrival_skew_limit_us").value
         )
+        last_error = ErrorCode.CAPTURE_FAILED
+        last_reason = "capture did not start"
         for attempt in range(1, max_attempts + 1):
+            attempt_error = ErrorCode.CAPTURE_FAILED
             if goal_handle.is_cancel_requested:
-                return None
+                return None, ErrorCode.CAPTURE_CANCELED, "capture canceled"
+            self._publish_capture_feedback(
+                goal_handle,
+                CaptureProduct.Feedback.CAMERAS_READY,
+                attempt,
+                (),
+                required,
+                "",
+                0.1,
+                "required cameras reserved and ready",
+            )
             self._publish_capture_feedback(
                 goal_handle,
                 CaptureProduct.Feedback.TRIGGERING,
                 attempt,
-                0,
-                len(required),
+                (),
+                required,
                 "",
+                0.2,
                 "broadcasting GigE Vision Action Command",
             )
             try:
@@ -309,16 +390,52 @@ class VisionNode(InspectionNodeBase):
                     or batch.attempt != attempt
                 ):
                     raise ValueError("capture backend returned mismatched identity")
+                self._publish_capture_feedback(
+                    goal_handle,
+                    CaptureProduct.Feedback.VALIDATING_SKEW,
+                    attempt,
+                    tuple(image.camera_id for image in batch.images),
+                    tuple(
+                        camera_id
+                        for camera_id in required
+                        if camera_id not in {image.camera_id for image in batch.images}
+                    ),
+                    batch.frame_batch_id,
+                    0.75,
+                    "validating host-arrival skew and saved RGB PNG files",
+                )
                 await asyncio.to_thread(batch.validate, required)
                 if skew_limit > 0 and batch.frame_arrival_skew_us > skew_limit:
+                    attempt_error = ErrorCode.CAPTURE_SKEW_EXCEEDED
                     raise ValueError("frame_arrival_skew_us exceeded configured limit")
-                return batch
+                return batch, ErrorCode.NONE, ""
             except Exception as exc:
+                if attempt_error != ErrorCode.CAPTURE_SKEW_EXCEEDED:
+                    attempt_error = (
+                        ErrorCode.IMPLEMENTATION_PENDING
+                        if isinstance(exc, NotImplementedError)
+                        else ErrorCode.CAPTURE_SAVE_FAILED
+                        if isinstance(exc, ValueError)
+                        else ErrorCode.CAPTURE_FAILED
+                    )
+                last_error = attempt_error
+                last_reason = f"attempt {attempt}/{max_attempts} failed: {exc}"
                 self.get_logger().error(
                     f"capture_id={request.capture_id} attempt={attempt} failed: {exc}"
                 )
                 # 같은 capture_id로 station 필수 카메라 전체를 다음 attempt에 재촬영합니다.
-        return None
+                if attempt < max_attempts:
+                    self._publish_capture_feedback(
+                        goal_handle,
+                        CaptureProduct.Feedback.RETRYING,
+                        attempt,
+                        (),
+                        required,
+                        "",
+                        0.0,
+                        "retrying all required cameras with the same capture_id",
+                    )
+        return None, last_error, last_reason
 
     def _capture_success_values(
         self, batch: CaptureBatch, inference_job_id: str
@@ -334,7 +451,7 @@ class VisionNode(InspectionNodeBase):
             "frame_arrival_skew_us": batch.frame_arrival_skew_us,
             "inference_job_id": inference_job_id,
             "error_code": int(ErrorCode.NONE),
-            "reason": "OK",
+            "reason": "",
         }
 
     def _terminal_capture(
@@ -378,13 +495,13 @@ class VisionNode(InspectionNodeBase):
             image.pixel_format = artifact.pixel_format
             image.camera_timestamp_raw = artifact.camera_timestamp_raw
             image.camera_timestamp_domain = artifact.camera_timestamp_domain
-            image.camera_timestamp.sec = artifact.camera_timestamp_ns // 1_000_000_000
-            image.camera_timestamp.nanosec = artifact.camera_timestamp_ns % 1_000_000_000
+            image.camera_timestamp_ns = artifact.camera_timestamp_ns
+            image.camera_timestamp_synchronized = artifact.camera_timestamp_synchronized
             image.host_arrival_monotonic_ns = artifact.host_arrival_monotonic_ns
-            image.host_arrival_timestamp.sec = (
+            image.host_arrival_wall_time.sec = (
                 artifact.host_arrival_timestamp_ns // 1_000_000_000
             )
-            image.host_arrival_timestamp.nanosec = (
+            image.host_arrival_wall_time.nanosec = (
                 artifact.host_arrival_timestamp_ns % 1_000_000_000
             )
             result.images.append(image)
@@ -394,17 +511,19 @@ class VisionNode(InspectionNodeBase):
         goal_handle,
         stage: int,
         attempt: int,
-        received: int,
-        required: int,
+        completed_camera_ids: tuple[str, ...],
+        pending_camera_ids: tuple[str, ...],
         frame_batch_id: str,
+        progress: float,
         reason: str,
     ) -> None:
         feedback = CaptureProduct.Feedback()
         feedback.stage = stage
         feedback.attempt = attempt
-        feedback.received_camera_count = received
-        feedback.required_camera_count = required
         feedback.frame_batch_id = frame_batch_id
+        feedback.completed_camera_ids = list(completed_camera_ids)
+        feedback.pending_camera_ids = list(pending_camera_ids)
+        feedback.progress = min(max(progress, 0.0), 1.0)
         feedback.reason = reason
         goal_handle.publish_feedback(feedback)
 

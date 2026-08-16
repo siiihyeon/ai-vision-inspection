@@ -57,7 +57,8 @@ EXPECTED_FIELDS = {
     "msg/CommandHeader.msg": [["header", "command_epoch", "command_id", "payload_digest", "issued_at"]],
     "msg/MasterHeartbeat.msg": [["header", "master_instance_id", "interface_version", "command_epoch", "sequence", "system_state"]],
     "msg/NodeHeartbeat.msg": [["header", "node_id", "node_instance_id", "sequence", "health_state", "interface_version"]],
-    "msg/PositionSettled.msg": [["header", "product_id", "station_id", "position_command_id", "conveyor_id", "target_step", "estimated_step", "position_error_steps", "position_source", "settled_at"]],
+    "msg/PositionSettled.msg": [["header", "product_id", "station_id", "position_command_id", "conveyor_id", "target_step", "estimated_step", "position_error_steps", "position_source", "position_verified", "settled_at"]],
+    "msg/ImageReference.msg": [["camera_id", "file_path", "sha256", "file_size_bytes", "width", "height", "pixel_format", "camera_timestamp_raw", "camera_timestamp_domain", "camera_timestamp_ns", "camera_timestamp_synchronized", "host_arrival_monotonic_ns", "host_arrival_wall_time"]],
     "msg/ProductResultLocked.msg": [["header", "product_id", "fifo_sequence", "final_verdict", "station_a_completed", "station_b_completed", "lock_reason", "sensor3_event_id", "locked_at"]],
     "msg/LogPersistedAck.msg": [["header", "producer_node", "producer_instance_id", "acked_log_ids", "acked_revisions", "committed_at"]],
     "srv/GetNodeStatus.srv": [
@@ -65,9 +66,9 @@ EXPECTED_FIELDS = {
         ["ready", "node_id", "node_instance_id", "health_state", "interface_version", "software_version", "active_session_id", "command_epoch", "heartbeat_sequence", "master_heartbeat_alive", "uptime_ms", "status_json"],
     ],
     "action/CaptureProduct.action": [
-        ["command", "product_id", "fifo_sequence", "station_id", "capture_id", "required_camera_ids"],
+        ["command", "product_id", "fifo_sequence", "station_id", "capture_id", "required_camera_ids", "requested_at"],
         ["success", "product_id", "station_id", "capture_id", "frame_batch_id", "attempt_count", "images", "frame_arrival_skew_us", "inference_job_id", "error_code", "reason"],
-        ["stage", "attempt", "received_camera_count", "required_camera_count", "frame_batch_id", "reason"],
+        ["stage", "attempt", "frame_batch_id", "completed_camera_ids", "pending_camera_ids", "progress", "reason"],
     ],
 }
 ERROR_CODES = {
@@ -93,10 +94,11 @@ ENUM_CATALOGS = {
         "BOOT": 0,
         "INITIALIZING": 1,
         "READY": 2,
-        "RUNNING": 3,
-        "PAUSED": 4,
-        "RECOVERING": 5,
-        "FAULT": 6,
+        "RUN_SYS": 3,
+        "PAUSING": 4,
+        "PAUSED": 5,
+        "FAULT_STOP": 6,
+        "RESETTING": 7,
     },
     "StationId.msg": {"UNKNOWN": 0, "A": 1, "B": 2},
     "ConveyorId.msg": {"UNKNOWN": 0, "UPPER": 1, "LOWER": 2},
@@ -259,7 +261,6 @@ for forbidden in (
     "trigger_capture",
     "LightRuntime",
     "warning_codes",
-    "position_verified",
     "control.light",
     "control.trigger",
     "led_brightness",
@@ -287,14 +288,19 @@ queue = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "inferen
 log_storage = (SOURCE / "nodes" / "inspection_log" / "inspection_log" / "storage.py").read_text(encoding="utf-8")
 for token in ("ProductResultReorderBuffer", "lock_product_at_sensor3", "StationInferenceFailed", "ENQUEUE_BLOCKED"):
     require(token in master + product_flow, f"Master ownership contract missing: {token}")
-for token in ("capture_id=request.capture_id", "vision.capture.max_attempts", "inference_queue.try_enqueue", "ENQUEUE_BLOCKED", "frame_arrival_skew_us"):
+for token in ("capture_id=request.capture_id", "vision.capture.max_attempts", "inference_queue.try_enqueue", "ENQUEUE_BLOCKED", "frame_arrival_skew_us", '"reason": ""'):
     require(token in vision, f"Vision capture contract missing: {token}")
-for token in ("deque", "queue_total_timeout_ms", "_load_with_one_retry", "_infer_with_one_retry", "_model_lock"):
+for token in ("deque", "queue_total_timeout_ms", "discard_expired", "_sweep_expired", "_load_with_one_retry", "_infer_with_one_retry", "_model_lock"):
     require(token in queue, f"Inference worker contract missing: {token}")
 for table in ("products_latest", "frame_batch_attempts", "inference_jobs_latest", "camera_result_revisions", "station_result_revisions", "faults", "pending_projections"):
     require(table in log_storage, f"Log schema table missing: {table}")
 
 launch = (SOURCE / "basic_packages" / "inspection_bringup" / "launch" / "inspection_system.launch.py").read_text(encoding="utf-8")
 require(launch.count('namespace="inspection"') == 4, "four node namespaces are required")
+require(not (ROOT / "vision-inspection").exists(), "nested previous skeleton must not be shipped")
+require(
+    (WORKSPACE / "ROS2_핵심개념_코드읽기가이드.md").is_file(),
+    "updated ROS 2 code-reading guide is missing",
+)
 
-print("inspection v2 skeleton verification: PASS")
+print("inspection modified v2 skeleton verification: PASS")

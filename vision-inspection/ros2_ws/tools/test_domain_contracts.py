@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
+import struct
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import zlib
 from dataclasses import replace
 from pathlib import Path
 
@@ -35,7 +37,26 @@ from inspection_master.product_flow import (  # noqa: E402
     StationDecision,
 )
 from inspection_vision.capture_contract import CaptureBatch, ImageArtifact  # noqa: E402
-from inspection_vision.inference_queue import InferenceJob, InferenceQueue  # noqa: E402
+from inspection_vision.inference_queue import (  # noqa: E402
+    InferenceJob,
+    InferenceQueue,
+    WorkerPool,
+)
+
+
+def make_rgb8_png(width: int = 1, height: int = 1) -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    scanlines = b"".join(b"\x00" + b"\x00\x00\x00" * width for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(scanlines))
+        + chunk(b"IEND", b"")
+    )
 
 
 class CommonContractTests(unittest.TestCase):
@@ -92,6 +113,15 @@ class MasterContractTests(unittest.TestCase):
         self.assertEqual(locked.verdict, Verdict.FORCED_NG)
         self.assertIn("camera offline", locked.reason)
 
+    def test_same_station_revision_with_other_content_is_conflict(self) -> None:
+        context = ProductLedger().register("product", 1)
+        first = StationDecision(StationId.A, Verdict.PASS, 1, "capture", "job")
+        conflicting = replace(first, verdict=Verdict.NG)
+        self.assertTrue(context.apply_station_result(first))
+        self.assertFalse(context.apply_station_result(first))
+        with self.assertRaises(ValueError):
+            context.apply_station_result(conflicting)
+
 
 class VisionContractTests(unittest.TestCase):
     def _job(self, number: int, product: str | None = None) -> InferenceJob:
@@ -142,10 +172,62 @@ class VisionContractTests(unittest.TestCase):
         self.assertGreater(actual.enqueued_monotonic_ns, 0)
         queue.close()
 
-    def test_capture_batch_validates_rgb_png_digest_and_host_skew(self) -> None:
-        png = base64.b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+    def test_queue_force_removes_jobs_after_total_deadline(self) -> None:
+        queue = InferenceQueue(capacity=2)
+        expired = replace(
+            self._job(1),
+            enqueued_monotonic_ns=time.monotonic_ns() - 10_000_000,
+            queue_total_timeout_ms=1,
         )
+        active = self._job(2)
+        self.assertTrue(queue.try_enqueue(expired))
+        self.assertTrue(queue.try_enqueue(active))
+        removed = queue.discard_expired()
+        self.assertEqual([job.inference_job_id for job in removed], ["job-1"])
+        self.assertEqual(queue.get(), active)
+        queue.close()
+
+    def test_worker_does_not_publish_success_after_total_deadline(self) -> None:
+        queue = InferenceQueue(capacity=1)
+        shared_model = object()
+        successes: list[str] = []
+        failures: list[tuple[str, str]] = []
+        completed = threading.Event()
+
+        def infer(model: object, _images: tuple[bytes, ...]) -> str:
+            self.assertIs(model, shared_model)
+            time.sleep(0.02)
+            return "PASS"
+
+        pool: WorkerPool[object, bytes, str] = WorkerPool(
+            queue=queue,
+            model=shared_model,
+            worker_count=1,
+            load_image=lambda _path: b"rgb",
+            infer=infer,
+            on_success=lambda job, _result: (
+                successes.append(job.inference_job_id),
+                completed.set(),
+            ),
+            on_failure=lambda job, reason: (
+                failures.append((job.inference_job_id, reason)),
+                completed.set(),
+            ),
+        )
+        job = replace(
+            self._job(1),
+            enqueued_monotonic_ns=0,
+            queue_total_timeout_ms=5,
+        )
+        self.assertTrue(queue.try_enqueue(job))
+        pool.start()
+        self.assertTrue(completed.wait(1.0))
+        pool.stop()
+        self.assertEqual(successes, [])
+        self.assertEqual(failures, [("job-1", "queue total inference timeout")])
+
+    def test_capture_batch_validates_rgb_png_digest_and_host_skew(self) -> None:
+        png = make_rgb8_png()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "image.png"
             path.write_bytes(png)
@@ -156,18 +238,30 @@ class VisionContractTests(unittest.TestCase):
                     file_path=str(path.resolve()),
                     sha256=digest,
                     file_size_bytes=len(png),
-                    width=2448,
-                    height=2048,
+                    width=1,
+                    height=1,
                     pixel_format="RGB8_PNG",
                     camera_timestamp_raw=index,
                     camera_timestamp_domain="DEVICE_TICKS_UNSYNCED",
                     camera_timestamp_ns=index,
+                    camera_timestamp_synchronized=False,
                     host_arrival_monotonic_ns=1_000_000 + index * 5_000,
                     host_arrival_timestamp_ns=1_000_000 + index * 5_000,
                 )
                 for index, camera in enumerate(("camera-a", "camera-b"))
             )
-            batch = CaptureBatch("product", 1, "capture", "batch", 1, artifacts)
+            batch = CaptureBatch(
+                product_id="product",
+                station_id=1,
+                capture_id="capture",
+                frame_batch_id="batch",
+                attempt=1,
+                trigger_requested_monotonic_ns=900_000,
+                trigger_returned_monotonic_ns=950_000,
+                trigger_requested_wall_time_ns=900_000,
+                trigger_returned_wall_time_ns=950_000,
+                images=artifacts,
+            )
             batch.validate(("camera-a", "camera-b"))
             self.assertEqual(batch.frame_arrival_skew_us, 5)
 

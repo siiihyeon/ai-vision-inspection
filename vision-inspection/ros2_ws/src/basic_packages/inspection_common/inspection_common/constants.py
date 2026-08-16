@@ -23,10 +23,38 @@ class SystemState(IntEnum):
     BOOT = 0
     INITIALIZING = 1
     READY = 2
-    RUNNING = 3
-    PAUSED = 4
-    RECOVERING = 5
-    FAULT = 6
+    RUN_SYS = 3
+    PAUSING = 4
+    PAUSED = 5
+    FAULT_STOP = 6
+    RESETTING = 7
+
+
+class PauseReason(IntEnum):
+    OPERATOR = 1
+    DEVICE_RECOVERY_AUTO = 2
+    DEVICE_RECOVERY_MANUAL = 3
+    FAULT_RECOVERY = 4
+    STORAGE_RECOVERY = 5
+
+
+class ProductPhysicalState(IntEnum):
+    STATION_A_WAIT = 1
+    STATION_A_DONE = 2
+    FLIPPING = 3
+    STATION_B_WAIT = 4
+    STATION_B_DONE = 5
+    SENSOR3_WAIT = 6
+    AT_SENSOR3 = 7
+    ACTUATING = 8
+    DONE = 9
+
+
+class PhysicalZone(IntEnum):
+    UPPER_INSPECTION = 1
+    FLIP_TRANSFER = 2
+    LOWER_INSPECTION = 3
+    LOWER_TO_SENSOR3 = 4
 
 
 class StationId(IntEnum):

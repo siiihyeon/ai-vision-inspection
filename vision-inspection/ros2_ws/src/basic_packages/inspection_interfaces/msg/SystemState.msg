@@ -1,8 +1,9 @@
 uint8 BOOT=0
 uint8 INITIALIZING=1
 uint8 READY=2
-uint8 RUNNING=3
-uint8 PAUSED=4
-uint8 RECOVERING=5
-uint8 FAULT=6
+uint8 RUN_SYS=3
+uint8 PAUSING=4
+uint8 PAUSED=5
+uint8 FAULT_STOP=6
+uint8 RESETTING=7
 uint8 value

@@ -9,6 +9,7 @@ string pixel_format
 # camera_timestamp_raw/domain은 PTP 동기화 가능 여부와 무관하게 보존합니다.
 uint64 camera_timestamp_raw
 string camera_timestamp_domain
-builtin_interfaces/Time camera_timestamp
+uint64 camera_timestamp_ns
+bool camera_timestamp_synchronized
 uint64 host_arrival_monotonic_ns
-builtin_interfaces/Time host_arrival_timestamp
+builtin_interfaces/Time host_arrival_wall_time

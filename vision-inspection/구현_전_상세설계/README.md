@@ -1,6 +1,14 @@
 # 상세설계 현재 상태
 
-이 폴더의 표와 문서는 구현 근거입니다. 다만 `06_코드_골격_완성을_위한_필수_결정사항.md`는 질의 과정의 상세 기록이며, 서로 다른 시점의 미결정 표기가 남아 있을 수 있습니다. **현재 코드 baseline과 아래 승인사항이 우선**하고, 충돌 시 Pull Request에서 설계 문서까지 함께 정정합니다.
+이 폴더의 표와 문서는 구현 근거입니다. 다만 XLSX 원본과 `legacy_reference` PDF에는 수정 전 하드웨어 트리거·조명 제어 표현이 남아 있습니다. 해당 표현은 폐기되었으며 **현재 코드 baseline, 이 README, v2로 정정된 `노드별_책임과_상태_소유권.md`가 우선**합니다. `06_코드_골격_완성을_위한_필수_결정사항.md`는 질의 과정의 상세 기록이라 서로 다른 시점의 미결정 표기가 남아 있을 수 있습니다.
+
+## 문서 우선순위
+
+1. 현재 `inspection_interfaces 2.0.0`과 실행 코드
+2. 이 README의 승인사항 및 폴더별 결정표
+3. `노드별_책임과_상태_소유권.md`의 v2 촬영 정책
+4. `06_코드_골격_완성을_위한_필수_결정사항.md`의 상세 배경
+5. XLSX와 `legacy_reference` PDF는 영향받지 않은 물리 흐름 참고용
 
 ## 승인되어 v2 골격에 반영된 사항
 
@@ -18,6 +26,8 @@
 - `warning_codes` 없음; warning은 `LogEvent`
 - UUIDv4 session/command/node instance, SHA-256 digest, epoch invalidation, 500/2000 ms Heartbeat
 - SQLite commit 후 Log ACK, producer local SQLite spool, approved v2 table families/QoS
+- Capture 성공 응답은 `error_code=0`, `reason=""`; 실패만 구체 error와 사람이 읽을 수 있는 reason 사용
+- 수정 레퍼런스의 `RUN_SYS/PAUSING/FAULT_STOP/RESETTING`, pause reason, physical zone 명칭 반영
 
 ## 최종 구현 전에 반드시 받을 결정 묶음
 

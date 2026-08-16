@@ -4,6 +4,7 @@ uint64 fifo_sequence
 uint8 station_id
 string capture_id
 string[] required_camera_ids
+builtin_interfaces/Time requested_at
 ---
 bool success
 string product_id
@@ -18,14 +19,18 @@ uint16 error_code
 string reason
 ---
 uint8 VALIDATING=1
-uint8 TRIGGERING=2
-uint8 RECEIVING=3
-uint8 SAVING=4
-uint8 ENQUEUEING=5
-uint8 ENQUEUE_BLOCKED=6
+uint8 CAMERAS_READY=2
+uint8 TRIGGERING=3
+uint8 WAITING_FRAMES=4
+uint8 VALIDATING_SKEW=5
+uint8 SAVING_FILES=6
+uint8 ENQUEUEING_INFERENCE=7
+uint8 RETRYING=8
+uint8 ENQUEUE_BLOCKED=9
 uint8 stage
 uint32 attempt
-uint32 received_camera_count
-uint32 required_camera_count
 string frame_batch_id
+string[] completed_camera_ids
+string[] pending_camera_ids
+float32 progress
 string reason

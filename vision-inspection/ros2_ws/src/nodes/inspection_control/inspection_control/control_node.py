@@ -67,6 +67,13 @@ class ControlNode(InspectionNodeBase):
             "control.actuator_config",
         )
 
+    def validate_hardware_profile(self) -> list[str]:
+        missing = super().validate_hardware_profile()
+        if self.profile == "hardware":
+            if int(self.get_parameter("control.mega.baud_rate").value) <= 0:
+                missing.append("control.mega.baud_rate")
+        return list(dict.fromkeys(missing))
+
     async def initialize_node_resources(self) -> NodeInitializationOutcome:
         # TODO(IMPLEMENTATION): Mega handshake, safe outputs, sensors and TB6600 self-test.
         return await super().initialize_node_resources()
@@ -154,6 +161,7 @@ class ControlNode(InspectionNodeBase):
         settled.estimated_step = request.target_step
         settled.position_error_steps = 0
         settled.position_source = PositionSettled.OPEN_LOOP_ESTIMATE
+        settled.position_verified = False
         settled.settled_at = settled.header.stamp
         self._position_settled_publisher.publish(settled)
         goal_handle.succeed()

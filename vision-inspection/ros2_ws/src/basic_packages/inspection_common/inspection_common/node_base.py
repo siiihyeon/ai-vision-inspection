@@ -208,8 +208,12 @@ class InspectionNodeBase(Node):
             return False, ErrorCode.COMMAND_CONFLICT, "command_id must be UUIDv4"
         if not is_sha256_hex(command.payload_digest):
             return False, ErrorCode.COMMAND_CONFLICT, "payload_digest must be SHA-256"
-        if self.system_state == SystemState.PAUSED:
-            return False, ErrorCode.COMMAND_CONFLICT, "system is PAUSED"
+        if self.system_state != SystemState.RUN_SYS:
+            return (
+                False,
+                ErrorCode.COMMAND_CONFLICT,
+                f"equipment command is not allowed in {self.system_state.name}",
+            )
         return True, ErrorCode.NONE, ""
 
     def required_hardware_parameters(self) -> Sequence[str]:
@@ -275,6 +279,12 @@ class InspectionNodeBase(Node):
             return
         self.command_epoch = message.command_epoch
         self.last_master_instance_id = message.master_instance_id
+        try:
+            self.system_state = SystemState(message.system_state)
+        except ValueError:
+            self.health_state = NodeHealthState.FAULT
+            self.get_logger().error("Master heartbeat contains an invalid system_state")
+            return
         self.last_master_heartbeat_monotonic_ns = time.monotonic_ns()
 
     def _handle_system_command(self, message: SystemCommand) -> None:
@@ -293,11 +303,11 @@ class InspectionNodeBase(Node):
         self._seen_system_commands[command.command_id] = command.payload_digest
         self.command_epoch = command.command_epoch
         if message.command_type == SystemCommand.PAUSE:
-            self.system_state = SystemState.PAUSED
+            self.system_state = SystemState.PAUSING
         elif message.command_type == SystemCommand.RESUME:
-            self.system_state = SystemState.RUNNING
+            self.system_state = SystemState.RUN_SYS
         elif message.command_type == SystemCommand.RESET:
-            self.system_state = SystemState.RECOVERING
+            self.system_state = SystemState.RESETTING
             self.health_state = NodeHealthState.RECOVERING
 
     def _master_heartbeat_alive(self) -> bool:

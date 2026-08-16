@@ -17,10 +17,10 @@
 - `payload_digest`는 canonical payload의 lowercase SHA-256 hex입니다.
 - `ErrorCode`: 1000 capture, 2000 inference, 3000 control, 4000 actuator, 5000 log, 9000 common.
 - 상태·station·conveyor·verdict는 ROS 숫자 상수와 Python `IntEnum`의 값을 일치시킵니다.
-- 성공 결과는 `error_code=0`, `reason="OK"` 또는 구체적인 성공 설명을 사용합니다.
+- Capture 성공 결과는 `error_code=0`, `reason=""`입니다. 실패 결과만 구체 error와 사람이 읽을 수 있는 reason을 사용합니다.
 - `CaptureProduct.Result`에는 `warning_codes`가 없습니다. 경고는 `LogEvent`입니다.
 - `ImageReference.file_path`는 한 PC의 공유 `data_root` 아래 절대 경로이며 파일 소유자는 Vision입니다.
-- camera timestamp는 raw/domain까지 보존하지만 skew에는 사용하지 않습니다. skew는 host monotonic arrival max-min입니다.
+- camera timestamp는 raw/domain/정규화 ns/동기화 여부까지 보존하지만, 동기화 사용 가능성이 확정되기 전에는 skew에 사용하지 않습니다. skew는 host monotonic arrival max-min입니다.
 
 ## 변경 절차
 

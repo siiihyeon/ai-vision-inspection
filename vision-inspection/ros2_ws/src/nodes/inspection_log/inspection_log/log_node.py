@@ -51,6 +51,19 @@ class LogNode(InspectionNodeBase):
             "log.retention_policy",
         )
 
+    def validate_hardware_profile(self) -> list[str]:
+        missing = super().validate_hardware_profile()
+        if self.profile == "hardware":
+            for key in (
+                "log.database_path",
+                "log.producer_spool_root",
+                "log.data_root",
+            ):
+                value = str(self.get_parameter(key).value)
+                if value and not Path(value).is_absolute():
+                    missing.append(f"{key} must be absolute")
+        return list(dict.fromkeys(missing))
+
     async def initialize_node_resources(self) -> NodeInitializationOutcome:
         if self.profile == "hardware":
             # 저장소 자체는 구현되어 있으나 최종 경로/보존정책 확정 전 hardware READY 금지.

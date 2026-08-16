@@ -16,7 +16,7 @@ Log는 이벤트 영구 저장과 조회 projection을 소유합니다. 이미�
 | 항목 | 정확히 필요한 정보 |
 |---|---|
 | 경로 | DB 절대 경로, node별 spool root, shared data_root, filesystem/mount |
-| 용량 | free-space warning/PAUSE/FAULT 임계치, DB/spool/image별 quota |
+| 용량 | free-space warning/PAUSED/FAULT_STOP 임계치, DB/spool/image별 quota |
 | 보존 | PASS/NG/failure/late image 및 event table별 기간, 삭제 주기, archive 방식 |
 | projection | 각 `event_type` payload schema→products/captures/jobs/results/faults mapping |
 | 조회 | 필요한 검색 조건, pagination/order, performance/인덱스 목표 |

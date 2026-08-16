@@ -14,6 +14,10 @@ LoadedT = TypeVar("LoadedT")
 ResultT = TypeVar("ResultT")
 
 
+class InferenceDeadlineExceeded(RuntimeError):
+    """enqueue부터 결과 확정까지의 Queue 총시간이 만료되었습니다."""
+
+
 @dataclass(frozen=True, slots=True)
 class InferenceJob:
     inference_job_id: str
@@ -50,6 +54,11 @@ class InferenceQueue:
         with self._condition:
             return len(self._items)
 
+    @property
+    def closed(self) -> bool:
+        with self._condition:
+            return self._closed
+
     def try_enqueue(self, job: InferenceJob) -> bool:
         with self._condition:
             if self._closed or job.product_id in self._locked_products:
@@ -77,10 +86,28 @@ class InferenceQueue:
 
     def wait_for_space(self, timeout_seconds: float) -> bool:
         with self._condition:
+            if self._closed:
+                return False
             if len(self._items) < self.capacity:
                 return True
             self._condition.wait(timeout_seconds)
-            return len(self._items) < self.capacity
+            return not self._closed and len(self._items) < self.capacity
+
+    def discard_expired(self, now_ns: int | None = None) -> tuple[InferenceJob, ...]:
+        """deadline이 지난 대기 job을 FIFO에서 강제로 제거합니다."""
+
+        current = time.monotonic_ns() if now_ns is None else now_ns
+        with self._condition:
+            expired = tuple(job for job in self._items if job.expired(current))
+            if expired:
+                expired_ids = {job.inference_job_id for job in expired}
+                self._items = deque(
+                    job
+                    for job in self._items
+                    if job.inference_job_id not in expired_ids
+                )
+                self._condition.notify_all()
+            return expired
 
     def get(self) -> InferenceJob | None:
         with self._condition:
@@ -139,22 +166,40 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
         self._on_failure = on_failure
         self._model_lock = threading.Lock() if serialize_model_access else None
         self._threads: list[threading.Thread] = []
+        self._sweeper_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
 
     def start(self) -> None:
         if self._threads:
             raise RuntimeError("worker pool already started")
+        self._stop_event.clear()
         self._threads = [
             threading.Thread(target=self._run, name=f"inference-worker-{index}", daemon=True)
             for index in range(self._worker_count)
         ]
         for thread in self._threads:
             thread.start()
+        self._sweeper_thread = threading.Thread(
+            target=self._sweep_expired,
+            name="inference-deadline-sweeper",
+            daemon=True,
+        )
+        self._sweeper_thread.start()
 
     def stop(self) -> None:
+        self._stop_event.set()
         self._queue.close()
         for thread in self._threads:
             thread.join(timeout=5.0)
         self._threads.clear()
+        if self._sweeper_thread is not None:
+            self._sweeper_thread.join(timeout=5.0)
+            self._sweeper_thread = None
+
+    def _sweep_expired(self) -> None:
+        while not self._stop_event.wait(0.05):
+            for job in self._queue.discard_expired():
+                self._on_failure(job, "queue total inference timeout")
 
     def _run(self) -> None:
         while True:
@@ -167,25 +212,43 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
                 self._on_failure(job, "queue total inference timeout")
                 continue
             try:
-                loaded = tuple(self._load_with_one_retry(Path(path)) for path in job.image_paths)
+                loaded = tuple(
+                    self._load_with_one_retry(job, Path(path))
+                    for path in job.image_paths
+                )
+            except InferenceDeadlineExceeded:
+                self._on_failure(job, "queue total inference timeout")
+                continue
             except Exception as exc:
                 self._on_failure(job, f"image read failed after retry: {type(exc).__name__}")
                 continue
+            if job.expired():
+                self._on_failure(job, "queue total inference timeout")
+                continue
             try:
-                result = self._infer_with_one_retry(loaded)
+                result = self._infer_with_one_retry(job, loaded)
+            except InferenceDeadlineExceeded:
+                self._on_failure(job, "queue total inference timeout")
+                continue
             except Exception as exc:
                 self._on_failure(job, f"inference failed after retry: {type(exc).__name__}")
                 continue
-            if not self._queue.is_product_locked(job.product_id):
+            if job.expired():
+                self._on_failure(job, "queue total inference timeout")
+            elif not self._queue.is_product_locked(job.product_id):
                 self._on_success(job, result)
 
-    def _load_with_one_retry(self, path: Path) -> LoadedT:
+    def _load_with_one_retry(self, job: InferenceJob, path: Path) -> LoadedT:
         try:
             return self._load_image(path)
         except Exception:
+            if job.expired():
+                raise InferenceDeadlineExceeded
             return self._load_image(path)
 
-    def _infer_with_one_retry(self, images: tuple[LoadedT, ...]) -> ResultT:
+    def _infer_with_one_retry(
+        self, job: InferenceJob, images: tuple[LoadedT, ...]
+    ) -> ResultT:
         def execute() -> ResultT:
             if self._model_lock is None:
                 return self._infer(self._model, images)
@@ -195,4 +258,6 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
         try:
             return execute()
         except Exception:
+            if job.expired():
+                raise InferenceDeadlineExceeded
             return execute()

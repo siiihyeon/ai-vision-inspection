@@ -9,4 +9,5 @@ int64 target_step
 int64 estimated_step
 int64 position_error_steps
 uint8 position_source
+bool position_verified
 builtin_interfaces/Time settled_at

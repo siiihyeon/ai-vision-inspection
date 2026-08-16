@@ -48,4 +48,4 @@ Vision은 camera capture, RGB PNG 파일, station-level FrameBatch, bounded FIFO
 5. restart recovery: 저장 완료 batch를 재사용하지 않고 제품 잔류 시 재촬영, 이탈 시 FORCED_NG 보고
 6. station camera recovery test capture
 
-Action 정상 결과는 `error_code=0`, `reason="OK"`; warning은 `LogEvent`입니다.
+Action 정상 결과는 `error_code=0`, `reason=""`; warning은 `LogEvent`입니다.

@@ -40,8 +40,13 @@ class ProductContext:
         if self.locked is not None:
             return False
         previous = self.stations.get(decision.station_id)
-        if previous is not None and decision.revision <= previous.revision:
-            return False
+        if previous is not None:
+            if decision.revision < previous.revision:
+                return False
+            if decision.revision == previous.revision:
+                if decision != previous:
+                    raise ValueError("same station revision has conflicting content")
+                return False
         self.stations[decision.station_id] = decision
         return True
 

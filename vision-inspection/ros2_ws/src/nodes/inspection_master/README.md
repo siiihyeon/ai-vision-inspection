@@ -20,7 +20,7 @@ Master는 시스템 상태, `product_id`, `fifo_sequence`, 물리 제품 추적,
 | 제품 생성 | Sensor1 event와 product 생성 조건, ID 형식, 재시작 시 counter/UUID 복구 |
 | FIFO | `fifo_sequence` 영속화 위치, 재시작 후 첫 sequence, 물리 이탈/중복 센서 처리 |
 | 물리 매핑 | Sensor1/2/3와 station A/B, 상·하 컨베이어, actuator의 순서·거리·예상 제품 매핑 |
-| 전체 FSM | BOOT/INITIALIZING/READY/RUNNING/PAUSED/RECOVERING/FAULT 전이와 명령 허용표 |
+| 전체 FSM | `BOOT/INITIALIZING/READY/RUN_SYS/PAUSING/PAUSED/FAULT_STOP/RESETTING` guard와 명령 허용표 |
 | 초기화 | worker 순서, 각 timeout/retry, 일부 실패 시 rollback, 운영자 승인 |
 | Sensor3 | 어떤 대기 제품에 event를 배정하는지, bounce/중복/예상 없음 처리 |
 | Actuation | PASS/NG/FORCED_NG별 명령, deadline, 통과확인과 실패 복구 |

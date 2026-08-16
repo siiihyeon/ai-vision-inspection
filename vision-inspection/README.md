@@ -4,7 +4,7 @@
 
 ## 현재 산출물의 성격
 
-이 저장소는 **v2 팀 협업용 통신·객체 골격**입니다. Message/Service/Action, 상태 소유권, 멱등성, 파일경로 FIFO, SQLite commit/ACK 경계와 구현 확장점은 들어 있습니다. 실제 MVS SDK, Mega serial protocol, 제품 물리 FSM, 추론 모델은 의도적으로 placeholder입니다. 따라서 지금 상태를 생산 장비에 연결하면 안 됩니다.
+이 저장소는 수정 레퍼런스를 반영한 **modified v2 팀 협업용 통신·객체 골격**입니다. Message/Service/Action, 상태 소유권, 멱등성, 파일경로 FIFO, SQLite commit/ACK 경계와 구현 확장점은 들어 있습니다. 실제 MVS SDK, Mega serial protocol, 제품 물리 FSM, 추론 모델은 의도적으로 placeholder입니다. 따라서 지금 상태를 생산 장비에 연결하면 안 됩니다.
 
 남은 값을 각 폴더 README의 `결정 필요` 표대로 확정해 전달하면, placeholder를 실제 adapter/FSM/알고리즘으로 교체하는 최종 코드 단계로 진행할 수 있습니다.
 
@@ -34,6 +34,9 @@ Control PositionSettled
 - 제품 결과 적용 deadline은 Sensor3입니다. 명시적 station 실패는 즉시 FORCED_NG, Sensor3 시 미완료도 FORCED_NG입니다.
 - RGB PNG가 canonical 파일입니다. OpenCV adapter는 로딩 직후 BGR→RGB 변환 후 모델에 전달해야 합니다.
 - LED는 외부 controller로 상시점등합니다. ROS/Arduino에는 밝기나 ON/OFF 제어 계약이 없습니다.
+- trigger 요청 직전·반환 직후의 host monotonic/wall 시각과 각 camera raw/domain timestamp를 보존합니다. 동기화 여부가 미정인 camera timestamp는 skew 계산에 사용하지 않습니다.
+- 성공한 Capture Result는 `error_code=0`, `reason=""`입니다. 경고는 `warning_codes`가 아니라 `LogEvent`로 보냅니다.
+- 시스템 상태명은 수정 레퍼런스와 동일하게 `BOOT/INITIALIZING/READY/RUN_SYS/PAUSING/PAUSED/FAULT_STOP/RESETTING`을 사용합니다.
 
 ## 폴더와 소유권
 
@@ -72,3 +75,4 @@ ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 - Vision은 이미지 파일을 소유하고 Log는 메타데이터·digest를 저장합니다. 삭제는 확정된 Log 보존정책만 수행합니다.
 - 미결정 값에 임의의 생산 기본값을 넣지 않습니다. `hardware.yaml`의 빈 값/0은 의도적인 fail-closed 표시입니다.
 - `_backup_20260813`, `build`, `install`, `log`, runtime data는 배포 ZIP에서 제외합니다.
+- `구현_전_상세설계/legacy_reference`는 변경 전 하드웨어 트리거 도식의 출처 보존용이며 구현 근거로 사용하지 않습니다.

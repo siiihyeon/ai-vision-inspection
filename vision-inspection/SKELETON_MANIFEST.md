@@ -1,6 +1,6 @@
 # v2 Skeleton Release Manifest
 
-- Release: `Vision-Inspection-v2-skeleton`
+- Release: `vision-inspection-modifed-skeleton` (modified v2)
 - Interface baseline: `inspection_interfaces 2.0.0`
 - Python packages: `0.2.0`
 - Target: Ubuntu 24.04 / ROS 2 Jazzy / Python 3.12
@@ -20,10 +20,19 @@
 ## 현재 검증 결과
 
 - `python -B ros2_ws/tools/verify_skeleton.py`: PASS
-- `python -B ros2_ws/tools/test_domain_contracts.py`: PASS (7 tests)
+- `python -B ros2_ws/tools/test_domain_contracts.py`: PASS (10 tests)
 - Python source AST parse: PASS (정적 검사에 포함)
-- ZIP wrapper/115 entries/exclusion/full decompression/SHA-256: PASS
-- ROS 2 Jazzy `colcon build`: **이 Windows host에 ROS 2/Docker가 없어 실행하지 못함**
+- Runtime source의 legacy hardware-trigger/LED 계약 제거 검사: PASS
+- 중첩 `.git`, `build/`, `install/`, `log/` 제외 검사: PASS
+- ROS 2 Jazzy `colcon build`: **현재 Codex 실행 계정에서는 WSL/ROS 2에 접근할 수 없어 실행하지 못함**
+
+- ZIP wrapper/117 files/전체 압축 해제/원본 대비 SHA-256: PASS
+
+## 수정 레퍼런스 반영
+
+- `ai-vision-inspection-final`의 최신 설계 문서와 11개 XLSX 원본을 반영했습니다.
+- 과거 hardware global trigger와 조명 제어를 설명하는 PDF는 `구현_전_상세설계/legacy_reference/`로 격리하고 v2 비적용 경고를 추가했습니다.
+- 현재 계약은 HIKROBOT MVS `GIGE_ACTION_COMMAND` software trigger, 외부 LED controller 상시점등, path-only FrameBatch FIFO 추론을 기준으로 합니다.
 
 ## 병합 전 필수 Gate
 
