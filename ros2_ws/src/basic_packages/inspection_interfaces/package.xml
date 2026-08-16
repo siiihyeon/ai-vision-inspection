@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>inspection_interfaces</name>
-  <version>1.0.0</version>
-  <description>Shared ROS 2 interface definitions for the inspection system.</description>
+  <version>2.0.0</version>
+  <description>Versioned ROS 2 communication contracts for the inspection system.</description>
   <maintainer email="team@example.com">Vision Inspection Team</maintainer>
   <license>Proprietary</license>
   <buildtool_depend>ament_cmake</buildtool_depend>

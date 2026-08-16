@@ -1,5 +1,6 @@
 CommonHeader header
 string node_id
+string node_instance_id
 uint64 sequence
-string health_state
+uint8 health_state
 string interface_version
