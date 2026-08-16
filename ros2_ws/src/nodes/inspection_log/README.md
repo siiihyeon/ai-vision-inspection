@@ -1,46 +1,33 @@
 # inspection_log
 
-`LogNode` 패키지이며 Log 담당자 작업 영역입니다.
+Log는 이벤트 영구 저장과 조회 projection을 소유합니다. 이미지 파일은 Vision 소유이며 Log는 절대 경로, digest와 metadata를 기록합니다.
 
-## 소유 책임
+## 골격에 구현된 경계
 
-- 제품·촬영·추론·시스템·오류 기록
-- SQLite 원본
-- 이미지 상대 경로와 제품 로그 연결
-- 저장소 health와 spool 상태
-- 과거 로그 조회
+- WAL SQLite `LogRepository`
+- `(log_id, revision)` 멱등 insert와 digest conflict 차단
+- JSON/digest 검증
+- transaction commit 이후에만 `LogPersistedAck` 발행
+- products/inference jobs latest, FrameBatch attempts, camera/station revisions, faults, pending projection table family
+- producer용 `inspection_common.DurableLogSpool`
 
-## 소유하지 않는 것
+## 반드시 결정할 운영값
 
-- 시스템 운전 상태 결정
-- 제품 FIFO와 최종 판정 변경
-- 장비·카메라 제어
-- 운전 명령 중계
+| 항목 | 정확히 필요한 정보 |
+|---|---|
+| 경로 | DB 절대 경로, node별 spool root, shared data_root, filesystem/mount |
+| 용량 | free-space warning/PAUSED/FAULT_STOP 임계치, DB/spool/image별 quota |
+| 보존 | PASS/NG/failure/late image 및 event table별 기간, 삭제 주기, archive 방식 |
+| projection | 각 `event_type` payload schema→products/captures/jobs/results/faults mapping |
+| 조회 | 필요한 검색 조건, pagination/order, performance/인덱스 목표 |
+| spool | 노드별 max size, resend interval/batch, ACK timeout, 오래된 session 처리 |
+| backup | SQLite online backup 주기, 보관 위치, 복구/RPO/RTO 시험 |
+| FK pending | dependency 대기시간, retry 횟수, 끝내 미해결일 때 경고/격리 |
 
-## 현재 단계
+## 구현 인수 조건
 
-`log_node` 실행 진입점, Heartbeat, 상태조회 Service, 초기화 Action 골격이 있습니다. 파일이나 데이터베이스를 생성하지 않습니다.
-
-## NodeBase 호환 계약
-
-- `LogNode(InspectionNodeBase)` 상속을 유지합니다.
-- 부모 생성자는 `NodeId.LOG, provides_initialize_action=True`로 호출합니다.
-- `_execute_initialize()`는 오버라이딩하지 않습니다.
-- `required_hardware_parameters()`에 DB·이미지·spool 경로와 저장 용량의 필수 ROS 파라미터 키를 반환합니다.
-- `initialize_node_resources()`에서 SQLite 연결, 스키마, 저장 경로와 용량을 검증합니다.
-- Heartbeat Publisher, `get_status` Service와 초기화 Action Server를 중복 생성하지 않습니다.
-- 노드 Health 상태는 `set_health_state()`로 변경하며, 시스템 상태와 제품 판정을 직접 변경하지 않습니다.
-- 실행 진입점의 `rclpy.init()` → `LogNode()` → `spin_node(node)` 순서를 유지합니다.
-
-현재 두 확장 메서드는 TODO 골격입니다. `sim`은 통신 시험을 허용하지만,
-`hardware`는 필수 설정과 실제 초기화가 구현되기 전까지 `INIT_BLOCKED`가 정상입니다.
-
-## 담당자 구현 체크리스트
-
-- [ ] ROS 파라미터 선언과 `required_hardware_parameters()` 목록 일치
-- [ ] SQLite 연결·스키마 버전과 마이그레이션 구현
-- [ ] 제품·촬영·추론·시스템·오류 기록 구현
-- [ ] 이미지 상대 경로와 제품·Capture 연결
-- [ ] 저장소 health, 경고·한계 용량과 spool 재전송 구현
-- [ ] 중복 로그의 멱등 저장과 과거 로그 조회 구현
-- [ ] 실패 시 `NodeInitializationOutcome`의 오류 코드·이유·재시도 가능 여부 반환
+- ACK 전에 process kill하면 producer spool에 event가 남아 재전송됩니다.
+- 같은 identity/같은 digest는 멱등 ACK, 다른 digest는 conflict fault입니다.
+- projection 실패가 원본 `log_events` commit을 손상시키지 않습니다.
+- 보존 삭제는 Vision 파일 소유권 handshake 없이 경로를 직접 지우지 않습니다.
+- schema migration/backup/복구 test를 추가합니다.

@@ -15,3 +15,5 @@ jobs:
           python-version: "3.12"
       - name: Verify package structure and interface contract
         run: python3 ros2_ws/tools/verify_skeleton.py
+      - name: Test pure domain contracts
+        run: python3 ros2_ws/tools/test_domain_contracts.py

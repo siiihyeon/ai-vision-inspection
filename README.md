@@ -1,88 +1,77 @@
-# AI 비전검수 소프트웨어
+# AI 비전검수 통합 제어 시스템
 
-2층·1층 컨베이어에서 제품의 앞뒷면을 검사하고, 최종 판정에 따라 제품을 분류하는 ROS 2 기반 소프트웨어 프로젝트입니다.
+컨베이어 제품을 두 Vision Station에서 촬영·추론하고, Master가 A/B 결과를 결합해 선별하는 ROS 2 프로젝트입니다. 기준 환경은 Ubuntu 24.04, ROS 2 Jazzy, Python 3.12, Arduino Mega + TB6600입니다.
 
-현재 저장소는 **3단계 협업 골격** 상태입니다. 패키지·빈 노드 실행 구조와 초기화·상태조회·Heartbeat 최소 계약, Launch와 `sim/hardware` 실행 프로필까지 있으며 상태머신, 제품 흐름, 센서·모터·카메라·추론·저장 기능은 아직 구현하지 않았습니다.
+## 현재 산출물의 성격
 
-## 개발 단계 기준
+이 저장소는 수정 레퍼런스를 반영한 **modified v2 팀 협업용 통신·객체 골격**입니다. Message/Service/Action, 상태 소유권, 멱등성, 파일경로 FIFO, SQLite commit/ACK 경계와 구현 확장점은 들어 있습니다. 실제 MVS SDK, Mega serial protocol, 제품 물리 FSM, 추론 모델은 의도적으로 placeholder입니다. 따라서 지금 상태를 생산 장비에 연결하면 안 됩니다.
 
-| 단계 | 범위 | 현재 상태 |
-|---|---|---|
-| 1단계 | 7개 ROS 2 패키지와 담당 영역 구성 | 완료 |
-| 2단계 | 공통 Message·Service·Action 계약 | 완료 |
-| 3단계 | 네 노드 최소 통신, Launch, sim/hardware 프로필 | 완료 |
-| 후속 단계 | FSM, FIFO, 장비, 촬영·추론, 영구 저장 | 미구현 |
+남은 값을 각 폴더 README의 `결정 필요` 표대로 확정해 전달하면, placeholder를 실제 adapter/FSM/알고리즘으로 교체하는 최종 코드 단계로 진행할 수 있습니다.
 
-## 실행 노드와 담당
-
-| 실행 노드 | 패키지 | 핵심 책임 | 담당 |
-|---|---|---|---|
-| `master_node` | `inspection_master` | 전체 시스템 FSM, 제품 ID·FIFO, 제품 진행, 최종 판정 | 사용자 |
-| `control_node` | `inspection_control` | Mega, 센서, 컨베이어, 액추에이터 실제 상태·제어 | 팀원 1 |
-| `vision_node` | `inspection_vision` | 카메라 촬영, 이미지, 추론, 스테이션 결과 | 팀원 2 |
-| `log_node` | `inspection_log` | SQLite, 이미지 연결 정보, 운전·오류 로그 | 팀원 3 |
-
-## 지원 패키지
-
-지원 패키지는 실행 노드가 아닙니다.
-
-| 패키지 | 역할 | 변경 규칙 |
-|---|---|---|
-| `inspection_interfaces` | Topic·Service·Action 통신 계약 | 단독 변경 금지, 관련 노드 담당자와 협의 |
-| `inspection_common` | 모든 노드가 공유하는 최소 Python 코드 | 노드 전용 상태·로직 추가 금지 |
-| `inspection_bringup` | 전체 Launch와 공통 실행 설정 | 통합 담당자 검토 필요 |
-
-## 폴더 구조
+## 확정된 핵심 Workflow
 
 ```text
-SW/
-├─ .github/                  Pull Request 템플릿과 정적 CI
-├─ .gitignore               빌드·실행 데이터 제외 규칙
-├─ 구현_전_상세설계/          설계 원본
-├─ README_비전검수_워크플로우.pdf  전체 Workflow 도표
-├─ ros2_ws/                  ROS 2 워크스페이스
-│  ├─ tools/                ROS 없는 환경용 정적 검증
-│  └─ src/
-│     ├─ basic_packages/
-│     │  ├─ inspection_interfaces/
-│     │  ├─ inspection_common/
-│     │  └─ inspection_bringup/
-│     └─ nodes/
-│        ├─ inspection_master/
-│        ├─ inspection_control/
-│        ├─ inspection_vision/
-│        └─ inspection_log/
-├─ CONTRIBUTING.md          공동 작업 규칙
-└─ README.md                프로젝트 입구 문서
+Control PositionSettled
+  → Master CaptureProduct 요청
+  → Vision GIGE_ACTION_COMMAND broadcast
+  → station 필수 camera frame 전체 수신
+  → host arrival monotonic 기준 frame_arrival_skew_us 검증
+  → demosaic RGB PNG atomic 저장 + SHA-256
+  → FrameBatch(image file paths) bounded FIFO enqueue
+  → CaptureProduct 성공
+  → 공유 모델 worker 병렬 추론
+  → Vision StationResult / StationInferenceFailed
+  → Master A/B 결합
+  → Sensor3에서 미완료 FORCED_NG 및 ProductResultLocked
+  → Control 선별
+  → Log SQLite commit 후 ACK
 ```
 
-## 기준 환경
+- 촬영 재시도는 같은 `capture_id`, 증가한 attempt로 station 필수 카메라 전체를 다시 촬영하며 최대 2 attempts입니다.
+- Queue가 차면 Capture Action은 실패하지 않고 저장된 같은 FrameBatch를 보존한 채 `ENQUEUE_BLOCKED`로 유지됩니다. Master는 `PAUSED`, 공간 복구 후 enqueue 성공과 함께 재개합니다.
+- Queue에는 raw frame이 아닌 `frame_batch_id`와 절대 이미지 파일 경로만 들어갑니다.
+- FIFO는 worker가 꺼내는 순서까지 보장합니다. 병렬 완료 순서는 Master의 `fifo_sequence` reorder buffer가 정렬합니다.
+- 제품 결과 적용 deadline은 Sensor3입니다. 명시적 station 실패는 즉시 FORCED_NG, Sensor3 시 미완료도 FORCED_NG입니다.
+- RGB PNG가 canonical 파일입니다. OpenCV adapter는 로딩 직후 BGR→RGB 변환 후 모델에 전달해야 합니다.
+- LED는 외부 controller로 상시점등합니다. ROS/Arduino에는 밝기나 ON/OFF 제어 계약이 없습니다.
+- trigger 요청 직전·반환 직후의 host monotonic/wall 시각과 각 camera raw/domain timestamp를 보존합니다. 동기화 여부가 미정인 camera timestamp는 skew 계산에 사용하지 않습니다.
+- 성공한 Capture Result는 `error_code=0`, `reason=""`입니다. 경고는 `warning_codes`가 아니라 `LogEvent`로 보냅니다.
+- 시스템 상태명은 수정 레퍼런스와 동일하게 `BOOT/INITIALIZING/READY/RUN_SYS/PAUSING/PAUSED/FAULT_STOP/RESETTING`을 사용합니다.
 
-- Ubuntu 24.04
-- ROS 2 Jazzy
-- Python 3.12
-- Arduino Mega + TB6600
+## 폴더와 소유권
 
-현재 Windows 폴더는 설계·Git 작업에도 사용할 수 있지만 ROS 2 빌드와 실행은 Ubuntu 24.04/Jazzy 환경을 기준으로 합니다.
+| 폴더 | 소유 책임 | 남은 결정표 |
+|---|---|---|
+| `inspection_master` | 시스템 FSM, 제품 ID/FIFO, A/B 결합, 최종 잠금 | 해당 패키지 README |
+| `inspection_control` | Mega, 센서, TB6600, 액추에이터 | 해당 패키지 README |
+| `inspection_vision` | MVS capture, RGB 파일, queue/worker, station 결과 | 해당 패키지 README |
+| `inspection_log` | SQLite, ACK, projection, 보존정책 | 해당 패키지 README |
+| `inspection_interfaces` | v2 노드 간 계약 | 해당 패키지와 msg/action/srv README |
+| `inspection_common` | ID/digest/QoS/초기화/spool | 해당 패키지 README |
+| `inspection_bringup` | sim/hardware 설정과 launch | config README |
+| `firmware/arduino_mega` | Mega firmware placeholder | firmware README |
+| `구현_전_상세설계` | 승인사항과 미결정사항 단일 목록 | 설계 README |
 
-## 3단계 골격 확인 방법
+## 빌드와 검사
 
-Ubuntu 24.04/Jazzy에서 다음 명령을 사용합니다.
+Ubuntu 24.04 / ROS 2 Jazzy:
 
 ```bash
 cd ros2_ws
 source /opt/ros/jazzy/setup.bash
+python3 tools/verify_skeleton.py
+python3 tools/test_domain_contracts.py
 colcon build --symlink-install
 source install/setup.bash
 ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 ```
 
-현재 단계에서는 네 노드의 시작 로그와 Heartbeat·상태조회·초기화 통신 골격만 동작하는 것이 정상입니다. 실제 장비와 검사 동작은 수행하지 않습니다.
+`sim`도 카메라 fake adapter를 자동 생성하지 않습니다. 실제 capture 성공 시나리오는 Vision 담당자가 fake adapter test를 추가한 뒤 활성화합니다. `hardware`는 필수 설정과 adapter가 완성될 때까지 `INIT_BLOCKED`가 정상입니다.
 
-## 설계 단일 원본
+## 변경 금지 원칙
 
-기능을 구현할 때는 `구현_전_상세설계/` 문서를 기준으로 합니다. 코드와 설계가 충돌하면 임의로 둘 중 하나를 바꾸지 않고 Pull Request에서 변경 이유와 영향 노드를 확인합니다.
-
-전체 흐름을 빠르게 확인할 때는 [`README_비전검수_워크플로우.pdf`](README_비전검수_워크플로우.pdf)를 먼저 보고, 세부 계약은 `구현_전_상세설계/`의 원본 문서를 확인합니다.
-
-`hardware` 프로필은 각 작업 노드가 필수 장비 설정 검증을 구현하기 전까지 초기화가 차단됩니다. 설정 검증을 우회하는 단일 수동 플래그는 사용하지 않습니다.
+- `inspection_interfaces` 2.0.0의 필드나 enum을 한 노드 담당자가 단독 변경하지 않습니다.
+- `product_id`, `fifo_sequence`, A/B 결합과 최종 판정은 Master만 소유합니다.
+- Vision은 이미지 파일을 소유하고 Log는 메타데이터·digest를 저장합니다. 삭제는 확정된 Log 보존정책만 수행합니다.
+- 미결정 값에 임의의 생산 기본값을 넣지 않습니다. `hardware.yaml`의 빈 값/0은 의도적인 fail-closed 표시입니다.
+- `build`, `install`, `log`, runtime data는 배포 ZIP에서 제외합니다.

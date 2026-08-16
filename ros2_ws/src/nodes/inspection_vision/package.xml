@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>inspection_vision</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>VisionNode package for camera acquisition and inference.</description>
   <maintainer email="team@example.com">Vision Inspection Team</maintainer>
   <license>Proprietary</license>

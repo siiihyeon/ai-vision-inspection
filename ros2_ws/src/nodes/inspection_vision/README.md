@@ -1,46 +1,51 @@
 # inspection_vision
 
-`VisionNode` 패키지이며 Vision 담당자 작업 영역입니다.
+Vision은 camera capture, RGB PNG 파일, station-level FrameBatch, bounded FIFO, shared model worker와 station 결과를 소유합니다. 제품 최종 판정은 소유하지 않습니다.
 
-## 소유 책임
+## 골격에 구현된 경계
 
-- 카메라 연결·설정·ARM·프레임 수집
-- 제품×스테이션 촬영 작업
-- 이미지 ID와 이미지 파일 생성
-- 추론 작업 큐와 모델 실행
-- 카메라별 점수와 스테이션 결과
+- station A/B 각각의 async lock: 같은 station 직렬, 서로 다른 camera set이면 A/B 동시 가능
+- `CaptureBackend` Protocol과 fail-closed placeholder
+- 같은 `capture_id`로 필수 camera 전체 최대 2 attempts
+- `CaptureBatch` identity, 필수 camera, 절대경로, RGB8 PNG, digest/size 검증
+- host arrival monotonic max-min `frame_arrival_skew_us`
+- queue full 시 saved batch 유지, Action `ENQUEUE_BLOCKED`, 복구 후 같은 job enqueue
+- path-only bounded FIFO와 Sensor3 lock 제거
+- shared model `WorkerPool`, model lock 기본 활성, file read 1 retry, inference 1 retry
 
-## 소유하지 않는 것
+## 반드시 결정할 Camera/MVS 값
 
-- 제품 ID 생성과 물리 FIFO
-- 컨베이어·액추에이터 직접 제어
-- 제품 최종 판정 잠금
-- 전체 `FAULT_STOP` 결정
+| 항목 | 정확히 필요한 정보 |
+|---|---|
+| 장치 | MV-CS050-10GC 각 serial, station/role, NIC와 IP topology |
+| SDK | Ubuntu 24용 MVS SDK 정확한 version, Python binding/API, camera firmware |
+| Action | 장치별 Action1 지원, `TriggerSource=Action1`, device key, group key/mask, scheduled action 사용 여부 |
+| Network | NIC MTU/jumbo frame, packet size/delay, bandwidth reserve, firewall, reconnect |
+| Pixel | camera Bayer format, exposure/gain, white balance, demosaic algorithm, 출력 2448×2048 RGB8 PNG 확인 |
+| Timing | acquisition timeout, callback의 host arrival 기록 지점, camera raw timestamp unit/wrap/domain |
+| PTP | IEEE1588 지원·동기화 시험 결과와 camera timestamp 사용 가능 여부 |
+| Skew | `frame_arrival_skew_limit_us` production 값과 시험 분포 |
+| Recovery | camera별 장애 판정, 해당 station 시험촬영 성공 조건, late frame 보존 경로 |
 
-## 현재 단계
+## 반드시 결정할 Queue/Model/파일 값
 
-`vision_node` 실행 진입점, Heartbeat, 상태조회 Service, 초기화 Action 골격이 있습니다. 카메라와 GPU를 사용하지 않습니다.
+| 항목 | 정확히 필요한 정보 |
+|---|---|
+| Queue | capacity, enqueue→결과 총 timeout ms, 메모리/디스크 포화 기준 |
+| Worker | production 수, 공유 model thread safety, lock 유지/해제 근거, CPU/GPU affinity |
+| Model | artifact path/version/SHA-256, runtime, device, warmup, 입력 shape/batch |
+| 전처리 | OpenCV load BGR→RGB, resize/crop, scale/normalize, camera order |
+| 판정 | 수학식, score 범위, camera 결과 결합, station threshold, 불확실/오류 처리 |
+| 파일 | `data_root`, attempt/frame naming, temp suffix+fsync+atomic rename, permission |
+| 보존 | 성공/NG/실패/late image 보존 기간, disk warning/stop, Log 삭제 요청 handshake |
 
-## NodeBase 호환 계약
+## 필수 구현 순서
 
-- `VisionNode(InspectionNodeBase)` 상속을 유지합니다.
-- 부모 생성자는 `NodeId.VISION, provides_initialize_action=True`로 호출합니다.
-- `_execute_initialize()`는 오버라이딩하지 않습니다.
-- `required_hardware_parameters()`에 카메라·조명·모델·GPU의 필수 ROS 파라미터 키를 반환합니다.
-- `initialize_node_resources()`에서 카메라 연결, 모델 로드와 추론 워커·큐 준비를 검증합니다.
-- Heartbeat Publisher, `get_status` Service와 초기화 Action Server를 중복 생성하지 않습니다.
-- 노드 Health 상태는 `set_health_state()`로 변경하며, 제품 FIFO와 최종 판정을 직접 변경하지 않습니다.
-- 실행 진입점의 `rclpy.init()` → `VisionNode()` → `spin_node(node)` 순서를 유지합니다.
+1. fake `CaptureBackend` 통합 test
+2. MVS device enumeration/config/ARM과 GIGE Action adapter
+3. atomic RGB PNG writer + digest/readback
+4. model loader/worker callbacks → `StationResult`/`StationInferenceFailed`
+5. restart recovery: 저장 완료 batch를 재사용하지 않고 제품 잔류 시 재촬영, 이탈 시 FORCED_NG 보고
+6. station camera recovery test capture
 
-현재 두 확장 메서드는 TODO 골격입니다. `sim`은 통신 시험을 허용하지만,
-`hardware`는 필수 설정과 실제 초기화가 구현되기 전까지 `INIT_BLOCKED`가 정상입니다.
-
-## 담당자 구현 체크리스트
-
-- [ ] ROS 파라미터 선언과 `required_hardware_parameters()` 목록 일치
-- [ ] 카메라별 연결·설정·ARM과 프레임 수집 구현
-- [ ] `product_id`·`station_id`·`capture_id` 기준 촬영 멱등 처리
-- [ ] 스테이션별 필수 이미지 수집 후 비동기 추론 작업 생성
-- [ ] 모델·임계값 버전과 카메라별 점수 보고
-- [ ] 촬영·추론 실패와 재시도 결과 보고
-- [ ] 실패 시 `NodeInitializationOutcome`의 오류 코드·이유·재시도 가능 여부 반환
+Action 정상 결과는 `error_code=0`, `reason=""`; warning은 `LogEvent`입니다.

@@ -1,19 +1,45 @@
-"""공통 코드 패키지입니다. 노드 전용 상태와 로직은 이곳에 넣지 않습니다."""
+"""ROS 없이도 검사 가능한 순수 공통 계약만 package root에서 노출합니다.
 
-from .constants import ErrorCode, NodeHealthState, NodeId
-from .node_base import (
-    InspectionNodeBase,
-    NodeInitializationOutcome,
-    heartbeat_qos,
-    spin_node,
+ROS 노드는 ``inspection_common.node_base``를 명시적으로 import합니다.
+"""
+
+from .constants import (
+    ConveyorId,
+    ErrorCode,
+    NodeHealthState,
+    NodeId,
+    PauseReason,
+    PhysicalZone,
+    ProductPhysicalState,
+    StationId,
+    SystemState,
+    Verdict,
 )
+from .digest import canonical_json, is_sha256_hex, payload_digest, sha256_text
+from .identifiers import is_uuid4, new_uuid
+from .idempotency import IdempotencyStore, ReplayDecision, ReplayKind
+from .log_spool import DurableLogSpool, SpoolRecord
 
 __all__ = [
+    "ConveyorId",
+    "DurableLogSpool",
     "ErrorCode",
-    "InspectionNodeBase",
-    "NodeInitializationOutcome",
+    "IdempotencyStore",
     "NodeHealthState",
     "NodeId",
-    "heartbeat_qos",
-    "spin_node",
+    "PauseReason",
+    "PhysicalZone",
+    "ProductPhysicalState",
+    "ReplayDecision",
+    "ReplayKind",
+    "StationId",
+    "SpoolRecord",
+    "SystemState",
+    "Verdict",
+    "canonical_json",
+    "is_sha256_hex",
+    "is_uuid4",
+    "new_uuid",
+    "payload_digest",
+    "sha256_text",
 ]

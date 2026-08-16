@@ -1,5 +1,6 @@
 CommonHeader header
+string master_instance_id
+string interface_version
 uint64 command_epoch
 uint64 sequence
-string system_state
-
+uint8 system_state

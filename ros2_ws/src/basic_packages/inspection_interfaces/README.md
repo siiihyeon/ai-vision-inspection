@@ -1,29 +1,33 @@
-# inspection_interfaces
+# inspection_interfaces 2.0.0
 
-네 실행 노드가 공유하는 ROS 2 통신 계약 패키지입니다.
+노드 간 통신의 breaking baseline입니다. 숫자 enum 값과 필드명은 DB·로그·firmware adapter까지 공유되므로 단독 변경하지 않습니다.
 
-현재는 네 노드의 기동·상태 확인에 필요한 최소 계약만 제공합니다.
+## 계약 분류
 
-| 인터페이스 | 종류 | 용도 |
-|---|---|---|
-| `CommonHeader` | Message | 세션·메시지·연관 요청 식별 |
-| `MasterHeartbeat` | Message | Master 세션·명령 세대·시스템 상태 보고 |
-| `NodeHeartbeat` | Message | 노드 생존·health·인터페이스 버전 보고 |
-| `GetNodeStatus` | Service | 노드 현재 상태의 짧은 조회 |
-| `InitializeNode` | Action | Control·Vision·Log 초기화와 진행 단계 보고 |
+- 공통: `CommonHeader`, `CommandHeader`, `ErrorCode`, `NodeHealth`, `SystemState`, `StationId`, `ConveyorId`, `NodeRuntimeEnvironment`
+- 생존/운영: `MasterHeartbeat`, `NodeHeartbeat`, `SystemCommand`, `GetNodeStatus`, `InitializeNode`
+- Control: `SensorEvent`, `PositionSettled`, `PositionProduct`, `ActuateProduct`
+- Vision: `ImageReference`, `CaptureProduct`, `VisionQueueState`, `StationResult`, `StationInferenceFailed`
+- Master: `ProductResultLocked`
+- Log: `LogEvent`, `LogPersistedAck`
 
-센서, 컨베이어, 촬영, 추론, 액추에이터 인터페이스는 각 기능을 구현할 때 설계 문서에서 추가합니다.
+## 불변 규칙
 
-## 변경 규칙
+- `session_id`, `command_id`, process instance는 UUIDv4 문자열입니다.
+- `payload_digest`는 canonical payload의 lowercase SHA-256 hex입니다.
+- `ErrorCode`: 1000 capture, 2000 inference, 3000 control, 4000 actuator, 5000 log, 9000 common.
+- 상태·station·conveyor·verdict는 ROS 숫자 상수와 Python `IntEnum`의 값을 일치시킵니다.
+- Capture 성공 결과는 `error_code=0`, `reason=""`입니다. 실패 결과만 구체 error와 사람이 읽을 수 있는 reason을 사용합니다.
+- `CaptureProduct.Result`에는 `warning_codes`가 없습니다. 경고는 `LogEvent`입니다.
+- `ImageReference.file_path`는 한 PC의 공유 `data_root` 아래 절대 경로이며 파일 소유자는 Vision입니다.
+- camera timestamp는 raw/domain/정규화 ns/동기화 여부까지 보존하지만, 동기화 사용 가능성이 확정되기 전에는 skew에 사용하지 않습니다. skew는 host monotonic arrival max-min입니다.
 
-- 특정 노드 담당자가 단독으로 필드를 변경하지 않습니다.
-- 송신 노드와 수신 노드 담당자가 함께 영향을 검토합니다.
-- 필드 삭제·이름 변경은 관련 코드와 같은 Pull Request 묶음으로 처리합니다.
+## 변경 절차
 
-## 설계 연결
+1. 송신/수신/Log 담당자가 필드와 멱등·timeout 영향을 함께 검토합니다.
+2. breaking 변경이면 package major version과 `hardware.yaml` 기대 버전을 올립니다.
+3. `tools/verify_skeleton.py`, Jazzy `colcon build`, endpoint 통합 test를 같은 PR에서 통과시킵니다.
 
-- `CommonHeader`: 01 문서 공통 Payload 정의
-- `MasterHeartbeat`: COM-03
-- `NodeHeartbeat`: COM-04
-- `GetNodeStatus`: COM-02
-- `InitializeNode`: COM-01·COM-05·COM-06
+## 결정 필요
+
+Message 구조 자체는 골격에 충분합니다. 다만 실제 값으로는 station별 camera ID, sensor ID, conveyor와 station mapping, timestamp domain, model score schema가 남았습니다. 값이 기존 필드로 표현 불가능한 경우에만 v2 계약 변경을 제안합니다.

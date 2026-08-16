@@ -1,27 +1,48 @@
 /**:
   ros__parameters:
     profile: hardware
+    comm.master_heartbeat_timeout_ms: 2000
 
 /inspection/master_node:
   ros__parameters:
     comm.master_heartbeat_period_ms: 500
-    system.expected_interface_version: "1.0.0"
+    system.expected_interface_version: "2.0.0"
 
 /inspection/control_node:
   ros__parameters:
     comm.node_heartbeat_period_ms: 500
+    control.mega.port: ""
+    control.mega.baud_rate: 0
+    control.tb6600.upper_config: ""
+    control.tb6600.lower_config: ""
+    control.sensor_config: ""
+    control.actuator_config: ""
 
 /inspection/vision_node:
   ros__parameters:
     comm.node_heartbeat_period_ms: 500
+    vision.trigger.mode: "GIGE_ACTION_COMMAND"
+    vision.camera_ids.station_a: []
+    vision.camera_ids.station_b: []
+    vision.gige_action.device_key: 0
+    vision.gige_action.group_key: 0
+    vision.gige_action.group_mask: 0
+    vision.frame_arrival_skew_limit_us: 0
+    vision.capture.max_attempts: 2
+    vision.queue.capacity: 0
+    vision.worker_count: 0
+    vision.inference_queue_total_timeout_ms: 0
+    vision.data_root: ""
+    vision.model.path: ""
 
 /inspection/log_node:
   ros__parameters:
     comm.node_heartbeat_period_ms: 500
+    log.database_path: ""
+    log.producer_spool_root: ""
+    log.data_root: ""
+    log.retention_policy: ""
 
-# TODO(HARDWARE_REQUIRED): Mega serial port와 safe output 핀
-# TODO(HARDWARE_REQUIRED): TB6600 steps/mm, 속도, 촬영 위치 offset
-# TODO(HARDWARE_REQUIRED): 센서 디바운스·CLEAR·재무장·stuck 기준
-# TODO(HARDWARE_REQUIRED): 카메라 ID·역할·트리거·조명·임계값
-# TODO(HARDWARE_REQUIRED): 액추에이터 거리·전환·통과 확인 기준
-# 각 작업 노드가 required_hardware_parameters()를 구현하기 전에는 초기화가 INIT_BLOCKED 됩니다.
+# TODO(HARDWARE_REQUIRED): 빈 값과 0을 각 폴더 README의 결정표에 따라 채웁니다.
+# 미확정 상태에서는 worker node 초기화가 INIT_BLOCKED 되어야 정상입니다.
+# LED 제어 설정은 의도적으로 존재하지 않습니다(외부 controller 상시점등).

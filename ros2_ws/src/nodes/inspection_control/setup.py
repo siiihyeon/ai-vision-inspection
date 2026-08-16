@@ -4,7 +4,7 @@ package_name = "inspection_control"
 
 setup(
     name=package_name,
-    version="0.1.0",
+    version="0.2.0",
     packages=find_packages(exclude=["test"]),
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
@@ -18,4 +18,3 @@ setup(
     license="Proprietary",
     entry_points={"console_scripts": ["control_node = inspection_control.control_node:main"]},
 )
-

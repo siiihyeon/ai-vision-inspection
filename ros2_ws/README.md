@@ -1,18 +1,34 @@
-# ROS 2 워크스페이스
+# ROS 2 Jazzy Workspace
 
-이 폴더는 Ubuntu 24.04 / ROS 2 Jazzy에서 `colcon`으로 빌드하는 워크스페이스입니다.
+`src/basic_packages`는 공통 계약, `src/nodes`는 네 실행 노드입니다. 인터페이스 2.0.0은 breaking baseline입니다.
 
-현재 통신 골격 단계에서는 네 노드 실행과 초기화·상태조회·Heartbeat 최소 계약을 확인합니다. 프로젝트의 1~3단계 정의는 저장소 루트 `README.md`에 있으며, 제품·센서·촬영·추론·액추에이터 업무 인터페이스는 각 기능 구현 단계에서 추가합니다.
+## 검증 순서
 
 ```bash
 source /opt/ros/jazzy/setup.bash
+python3 tools/verify_skeleton.py
+python3 tools/test_domain_contracts.py
 colcon build --symlink-install
 source install/setup.bash
 ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 ```
 
-ROS 2가 없는 PC에서는 다음 정적 검사를 실행할 수 있습니다.
+정적 검사만 통과했다고 ROS type support 생성이나 런타임 호환이 증명되는 것은 아닙니다. Pull Request의 필수 인수 조건은 Jazzy에서 `colcon build`와 관련 package test를 통과하는 것입니다.
 
-```bash
-python3 tools/verify_skeleton.py
-```
+## 주요 endpoint
+
+| Endpoint | 형식 | 방향 |
+|---|---|---|
+| `/inspection/master/heartbeat` | `MasterHeartbeat` | Master → workers |
+| `/inspection/{node}/heartbeat` | `NodeHeartbeat` | workers → Master |
+| `/inspection/{node}/get_status` | `GetNodeStatus` | Master → all |
+| `/inspection/{worker}/initialize` | `InitializeNode` Action | Master → workers |
+| `/inspection/control/position_product` | `PositionProduct` Action | Master → Control |
+| `/inspection/vision/capture_product` | `CaptureProduct` Action | Master → Vision |
+| `/inspection/vision/station_result` | `StationResult` | Vision → Master |
+| `/inspection/master/product_result_locked` | `ProductResultLocked` | Master → Vision/Control/Log |
+| `/inspection/control/actuate_product` | `ActuateProduct` Action | Master → Control |
+| `/inspection/log/event` | `LogEvent` | all → Log |
+| `/inspection/log/persisted_ack` | `LogPersistedAck` | Log → producers |
+
+QoS 기준은 Heartbeat Best Effort/last 1, 업무 이벤트 Reliable, 최신 상태 Reliable/transient-local/last 1입니다. Reliable만으로 process restart 유실이 해결되지 않으므로 중요 결과와 로그는 애플리케이션 보존·재전송을 병행합니다.

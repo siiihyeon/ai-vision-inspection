@@ -1,4 +1,5 @@
 string request_id
+string retry_of_request_id
 string session_id
 string config_version
 string config_digest
@@ -6,10 +7,13 @@ string expected_interface_version
 ---
 bool success
 string node_id
-string error_code
+uint16 error_code
 string reason
 string interface_version
 string software_version
+string request_id
+string active_session_id
+NodeRuntimeEnvironment runtime_environment
 string status_snapshot
 bool retryable
 ---

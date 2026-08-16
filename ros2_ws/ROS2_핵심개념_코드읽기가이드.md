@@ -1,5 +1,7 @@
 # ROS 2 코드 개념 사전
 
+> **modified v2 적용 안내:** 이 문서는 수정 레퍼런스의 공통 ROS 2 개념 설명을 보존한 학습 자료입니다. 실제 필드와 상태 상수는 `inspection_interfaces 2.0.0`을 정본으로 사용하십시오. 특히 시스템 상태는 `RUN_SYS/PAUSING/PAUSED/FAULT_STOP/RESETTING`이고, Capture Action에는 경로 기반 FrameBatch·GigE Action Command·비동기 Queue 계약이 추가되어 있습니다.
+
 > AI 비전 검사 시스템의 ROS 2 코드를 읽다가 모르는 용어·함수·구조가 나왔을 때 찾아보는 사전형 문서
 
 ## 이 문서를 사용하는 방법
