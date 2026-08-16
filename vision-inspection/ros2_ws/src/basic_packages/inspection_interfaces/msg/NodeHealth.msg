@@ -1,0 +1,7 @@
+uint8 STARTING=0
+uint8 READY=1
+uint8 DEGRADED=2
+uint8 RECOVERING=3
+uint8 INIT_BLOCKED=4
+uint8 FAULT=5
+uint8 value

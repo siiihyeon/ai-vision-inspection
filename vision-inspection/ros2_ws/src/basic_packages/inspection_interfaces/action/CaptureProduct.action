@@ -1,0 +1,31 @@
+CommandHeader command
+string product_id
+uint64 fifo_sequence
+uint8 station_id
+string capture_id
+string[] required_camera_ids
+---
+bool success
+string product_id
+uint8 station_id
+string capture_id
+string frame_batch_id
+uint32 attempt_count
+ImageReference[] images
+int64 frame_arrival_skew_us
+string inference_job_id
+uint16 error_code
+string reason
+---
+uint8 VALIDATING=1
+uint8 TRIGGERING=2
+uint8 RECEIVING=3
+uint8 SAVING=4
+uint8 ENQUEUEING=5
+uint8 ENQUEUE_BLOCKED=6
+uint8 stage
+uint32 attempt
+uint32 received_camera_count
+uint32 required_camera_count
+string frame_batch_id
+string reason

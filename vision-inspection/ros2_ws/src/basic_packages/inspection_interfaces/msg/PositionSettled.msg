@@ -1,0 +1,12 @@
+uint8 OPEN_LOOP_ESTIMATE=1
+uint8 ENCODER_ESTIMATE=2
+CommonHeader header
+string product_id
+uint8 station_id
+string position_command_id
+uint8 conveyor_id
+int64 target_step
+int64 estimated_step
+int64 position_error_steps
+uint8 position_source
+builtin_interfaces/Time settled_at

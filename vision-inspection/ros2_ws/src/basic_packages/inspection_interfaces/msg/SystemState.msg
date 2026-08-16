@@ -1,0 +1,8 @@
+uint8 BOOT=0
+uint8 INITIALIZING=1
+uint8 READY=2
+uint8 RUNNING=3
+uint8 PAUSED=4
+uint8 RECOVERING=5
+uint8 FAULT=6
+uint8 value

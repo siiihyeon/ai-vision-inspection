@@ -1,0 +1,2 @@
+"""LogNode package."""
+

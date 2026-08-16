@@ -1,0 +1,10 @@
+uint8 ACCEPTING=1
+uint8 ENQUEUE_BLOCKED=2
+uint8 DRAINING=3
+uint8 FAULT=4
+CommonHeader header
+uint8 state
+uint32 depth
+uint32 capacity
+string blocked_frame_batch_id
+string reason

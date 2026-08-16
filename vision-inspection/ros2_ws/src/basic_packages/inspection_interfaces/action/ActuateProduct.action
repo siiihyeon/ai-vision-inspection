@@ -1,0 +1,15 @@
+uint8 DIVERT_NG=1
+uint8 PASS_THROUGH=2
+CommandHeader command
+string product_id
+uint64 fifo_sequence
+string sensor3_event_id
+uint8 actuator_command
+---
+bool success
+string product_id
+string actuation_id
+uint16 error_code
+string reason
+---
+string stage

@@ -1,0 +1,38 @@
+/**:
+  ros__parameters:
+    profile: sim
+    comm.master_heartbeat_timeout_ms: 2000
+
+/inspection/master_node:
+  ros__parameters:
+    comm.master_heartbeat_period_ms: 500
+    system.expected_interface_version: "2.0.0"
+
+/inspection/control_node:
+  ros__parameters:
+    comm.node_heartbeat_period_ms: 500
+
+/inspection/vision_node:
+  ros__parameters:
+    comm.node_heartbeat_period_ms: 500
+    vision.trigger.mode: "GIGE_ACTION_COMMAND"
+    vision.camera_ids.station_a: ["sim_station_a_camera"]
+    vision.camera_ids.station_b: ["sim_station_b_camera"]
+    vision.frame_arrival_skew_limit_us: 0  # 0=미확정/검사 비활성(sim 전용)
+    vision.capture.max_attempts: 2
+    vision.queue.capacity: 16             # sim 기본값; 생산값 아님
+    vision.worker_count: 1                # 승인된 sim 기본값
+    vision.inference_queue_total_timeout_ms: 0
+    vision.data_root: "/tmp/inspection"
+    vision.model.path: ""
+
+/inspection/log_node:
+  ros__parameters:
+    comm.node_heartbeat_period_ms: 500
+    log.database_path: "/tmp/inspection/log/inspection.sqlite3"
+    log.producer_spool_root: "/tmp/inspection/spool"
+    log.data_root: "/tmp/inspection"
+    log.retention_policy: "sim_keep_all"
+
+# sim은 실제 Mega/TB6600/카메라/액추에이터에 출력하지 않습니다.
+# Vision capture backend/model adapter는 의도적으로 placeholder이므로 별도 fake adapter가 필요합니다.

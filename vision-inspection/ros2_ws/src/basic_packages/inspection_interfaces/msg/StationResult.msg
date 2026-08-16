@@ -1,0 +1,14 @@
+uint8 PASS=1
+uint8 NG=2
+CommonHeader header
+string product_id
+uint64 fifo_sequence
+uint8 station_id
+string capture_id
+string frame_batch_id
+string inference_job_id
+uint32 result_revision
+uint8 verdict
+float32 score
+string model_version
+builtin_interfaces/Time completed_at

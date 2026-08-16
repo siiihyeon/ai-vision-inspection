@@ -1,0 +1,12 @@
+uint8 PASS=1
+uint8 NG=2
+uint8 FORCED_NG=3
+CommonHeader header
+string product_id
+uint64 fifo_sequence
+uint8 final_verdict
+bool station_a_completed
+bool station_b_completed
+string lock_reason
+string sensor3_event_id
+builtin_interfaces/Time locked_at

@@ -1,0 +1,9 @@
+uint8 RISING=1
+uint8 FALLING=2
+CommonHeader header
+string event_id
+string sensor_id
+uint8 edge
+uint64 sensor_sequence
+int64 estimated_step
+builtin_interfaces/Time observed_at

@@ -1,0 +1,16 @@
+uint8 DEBUG=10
+uint8 INFO=20
+uint8 WARNING=30
+uint8 ERROR=40
+uint8 CRITICAL=50
+CommonHeader header
+string log_id
+uint32 revision
+uint8 severity
+string event_type
+string source_node
+string producer_instance_id
+string product_id
+string payload_json
+string payload_digest
+builtin_interfaces/Time occurred_at

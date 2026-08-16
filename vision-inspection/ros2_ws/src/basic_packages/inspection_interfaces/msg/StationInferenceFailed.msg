@@ -1,0 +1,11 @@
+CommonHeader header
+string product_id
+uint64 fifo_sequence
+uint8 station_id
+string capture_id
+string frame_batch_id
+string inference_job_id
+uint32 result_revision
+uint16 error_code
+string reason
+builtin_interfaces/Time failed_at
