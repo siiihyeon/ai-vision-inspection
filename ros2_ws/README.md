@@ -22,7 +22,9 @@ ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 | `/inspection/master/heartbeat` | `MasterHeartbeat` | Master → workers |
 | `/inspection/{node}/heartbeat` | `NodeHeartbeat` | workers → Master |
 | `/inspection/{node}/get_status` | `GetNodeStatus` | Master → all |
+| `/inspection/master/operator_command` | `OperatorCommand` Service | CLI/HMI → Master |
 | `/inspection/{worker}/initialize` | `InitializeNode` Action | Master → workers |
+| `/inspection/master/system_command` | `SystemCommand` | Master → workers |
 | `/inspection/control/position_product` | `PositionProduct` Action | Master → Control |
 | `/inspection/vision/capture_product` | `CaptureProduct` Action | Master → Vision |
 | `/inspection/vision/station_result` | `StationResult` | Vision → Master |

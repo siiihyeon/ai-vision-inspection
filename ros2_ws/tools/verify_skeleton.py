@@ -44,7 +44,7 @@ REQUIRED_INTERFACES = {
         "LogEvent.msg",
         "LogPersistedAck.msg",
     },
-    "srv": {"GetNodeStatus.srv"},
+    "srv": {"GetNodeStatus.srv", "OperatorCommand.srv"},
     "action": {
         "InitializeNode.action",
         "PositionProduct.action",
@@ -55,6 +55,7 @@ REQUIRED_INTERFACES = {
 EXPECTED_FIELDS = {
     "msg/CommonHeader.msg": [["stamp", "session_id", "message_id", "correlation_id"]],
     "msg/CommandHeader.msg": [["header", "command_epoch", "command_id", "payload_digest", "issued_at"]],
+    "msg/SystemCommand.msg": [["command", "command_type", "target_conveyor_id", "reason"]],
     "msg/MasterHeartbeat.msg": [["header", "master_instance_id", "interface_version", "command_epoch", "sequence", "system_state"]],
     "msg/NodeHeartbeat.msg": [["header", "node_id", "node_instance_id", "sequence", "health_state", "interface_version"]],
     "msg/PositionSettled.msg": [["header", "product_id", "station_id", "position_command_id", "conveyor_id", "target_step", "estimated_step", "position_error_steps", "position_source", "position_verified", "settled_at"]],
@@ -64,6 +65,10 @@ EXPECTED_FIELDS = {
     "srv/GetNodeStatus.srv": [
         ["request_id", "session_id"],
         ["ready", "node_id", "node_instance_id", "health_state", "interface_version", "software_version", "active_session_id", "command_epoch", "heartbeat_sequence", "master_heartbeat_alive", "uptime_ms", "status_json"],
+    ],
+    "srv/OperatorCommand.srv": [
+        ["request_id", "command_type", "reason", "operator_id"],
+        ["request_id", "accepted", "system_state", "system_state_name", "message"],
     ],
     "action/CaptureProduct.action": [
         ["command", "product_id", "fifo_sequence", "station_id", "capture_id", "required_camera_ids", "requested_at"],
@@ -117,6 +122,7 @@ REQUIRED_READMES = [
     SOURCE / "basic_packages" / "inspection_bringup" / "README.md",
     SOURCE / "basic_packages" / "inspection_bringup" / "config" / "README.md",
     SOURCE / "nodes" / "inspection_master" / "README.md",
+    SOURCE / "nodes" / "inspection_master" / "마스터노드_읽기가이드.md",
     SOURCE / "nodes" / "inspection_control" / "README.md",
     SOURCE / "nodes" / "inspection_vision" / "README.md",
     SOURCE / "nodes" / "inspection_log" / "README.md",
@@ -246,6 +252,17 @@ for config in (sim, hardware):
     require("comm.master_heartbeat_period_ms: 500" in config, "Master heartbeat period mismatch")
     require(config.count("comm.node_heartbeat_period_ms: 500") == 3, "worker heartbeat period mismatch")
     require("comm.master_heartbeat_timeout_ms: 2000" in config, "heartbeat timeout mismatch")
+    require("comm.node_heartbeat_timeout_ms: 2000" in config, "worker heartbeat timeout mismatch")
+    require("system.init_timeout_ms: 10000" in config, "worker init timeout mismatch")
+    require("retry.init_interval_ms: 1000" in config, "worker init retry interval mismatch")
+    require(
+        "master.action.conveyor_resume_timeout_ms: 10000" in config,
+        "target conveyor resume timeout missing",
+    )
+    require(
+        "master.completed_context_retention_ms: 600000" in config,
+        "completed product context retention mismatch",
+    )
     require("GIGE_ACTION_COMMAND" in config, "GigE Action trigger mode missing")
     require("warning_codes" not in config, "warning_codes must not return")
 require("TODO(HARDWARE_REQUIRED)" in hardware, "hardware fail-closed marker missing")
@@ -283,11 +300,67 @@ for token in (
 
 master = (SOURCE / "nodes" / "inspection_master" / "inspection_master" / "master_node.py").read_text(encoding="utf-8")
 product_flow = (SOURCE / "nodes" / "inspection_master" / "inspection_master" / "product_flow.py").read_text(encoding="utf-8")
+system_fsm = (SOURCE / "nodes" / "inspection_master" / "inspection_master" / "system_fsm.py").read_text(encoding="utf-8")
+worker_supervision = (SOURCE / "nodes" / "inspection_master" / "inspection_master" / "worker_supervision.py").read_text(encoding="utf-8")
+operation_runtime = (SOURCE / "nodes" / "inspection_master" / "inspection_master" / "operation_runtime.py").read_text(encoding="utf-8")
 vision = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "vision_node.py").read_text(encoding="utf-8")
 queue = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "inference_queue.py").read_text(encoding="utf-8")
 log_storage = (SOURCE / "nodes" / "inspection_log" / "inspection_log" / "storage.py").read_text(encoding="utf-8")
 for token in ("ProductResultReorderBuffer", "lock_product_at_sensor3", "StationInferenceFailed", "ENQUEUE_BLOCKED"):
     require(token in master + product_flow, f"Master ownership contract missing: {token}")
+for token in (
+    "START_REQUEST",
+    "ALL_CONVEYORS_RUNNING",
+    "PAUSE_REQUEST",
+    "ALL_CONVEYORS_STOPPED",
+    "CRITICAL_FAULT",
+    "RESET_SUCCEEDED_EMPTY_LINE",
+    "RESET_SUCCEEDED_IN_PLACE",
+    "ESTOP_ASSERTED",
+    "InvalidSystemTransition",
+):
+    require(token in system_fsm, f"Master system FSM contract missing: {token}")
+for token in (
+    "WorkerRuntimeState",
+    "WorkerInitPhase",
+    "accept_heartbeat",
+    "can_mark_ready",
+    "retry_of_request_id",
+):
+    require(token in worker_supervision, f"Master worker supervision contract missing: {token}")
+for token in (
+    "StationCycle",
+    "ActuationCycle",
+    "EquipmentSnapshot",
+    "line_clear_guards_satisfied",
+    "in_place_guards_satisfied",
+):
+    require(token in operation_runtime, f"Master operation runtime missing: {token}")
+for token in (
+    "request_initialize",
+    "_handle_operator_command",
+    "_start_worker_initialization",
+    "_handle_sensor1_entry",
+    "_handle_sensor2_entry",
+    "_handle_sensor3_entry",
+    "_handle_position_settled",
+    "_request_station_capture",
+    "_schedule_actuation",
+    "_remove_completed_fifo_prefix",
+    "_verify_resume_conditions",
+    "_handle_log_persisted_ack",
+    "request_shutdown",
+    "conveyor_resume_timeout_ms",
+    "OperatorCommand",
+):
+    require(token in master, f"Master implementation block skeleton missing: {token}")
+master_readme = (SOURCE / "nodes" / "inspection_master" / "README.md").read_text(
+    encoding="utf-8"
+)
+require(
+    "`SKELETON`" not in master_readme and "`PARTIAL`" not in master_readme,
+    "Master README still reports incomplete implementation blocks",
+)
 for token in ("capture_id=request.capture_id", "vision.capture.max_attempts", "inference_queue.try_enqueue", "ENQUEUE_BLOCKED", "frame_arrival_skew_us", '"reason": ""'):
     require(token in vision, f"Vision capture contract missing: {token}")
 for token in ("deque", "queue_total_timeout_ms", "discard_expired", "_sweep_expired", "_load_with_one_retry", "_infer_with_one_retry", "_model_lock"):

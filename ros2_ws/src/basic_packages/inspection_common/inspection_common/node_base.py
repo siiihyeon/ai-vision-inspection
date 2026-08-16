@@ -34,6 +34,7 @@ from .constants import (
 )
 from .digest import is_sha256_hex
 from .identifiers import is_uuid4, new_uuid
+from .idempotency import IdempotencyStore, ReplayKind
 from .package_version import read_installed_package_version
 
 
@@ -134,7 +135,9 @@ class InspectionNodeBase(Node):
         ] = {}
         self._initialize_lock = threading.RLock()
         self._initialize_in_progress = False
-        self._seen_system_commands: dict[str, str] = {}
+        self._seen_system_commands: IdempotencyStore[bool] = IdempotencyStore(
+            capacity=4096
+        )
 
         self._heartbeat_group = MutuallyExclusiveCallbackGroup()
         self._service_group = MutuallyExclusiveCallbackGroup()
@@ -195,7 +198,12 @@ class InspectionNodeBase(Node):
     def set_health_state(self, state: NodeHealthState) -> None:
         self.health_state = state
 
-    def validate_command_header(self, command) -> tuple[bool, ErrorCode, str]:
+    def validate_command_header(
+        self,
+        command,
+        *,
+        allowed_system_states: set[SystemState] | None = None,
+    ) -> tuple[bool, ErrorCode, str]:
         """공통 멱등 저장소에 넣기 전 명령 envelope를 fail-closed 검증합니다."""
 
         if self.health_state != NodeHealthState.READY:
@@ -208,7 +216,8 @@ class InspectionNodeBase(Node):
             return False, ErrorCode.COMMAND_CONFLICT, "command_id must be UUIDv4"
         if not is_sha256_hex(command.payload_digest):
             return False, ErrorCode.COMMAND_CONFLICT, "payload_digest must be SHA-256"
-        if self.system_state != SystemState.RUN_SYS:
+        allowed = allowed_system_states or {SystemState.RUN_SYS}
+        if self.system_state not in allowed:
             return (
                 False,
                 ErrorCode.COMMAND_CONFLICT,
@@ -293,15 +302,26 @@ class InspectionNodeBase(Node):
             return
         if not is_uuid4(command.command_id) or not is_sha256_hex(command.payload_digest):
             return
-        previous_digest = self._seen_system_commands.get(command.command_id)
-        if previous_digest is not None:
-            if previous_digest != command.payload_digest:
-                self.health_state = NodeHealthState.FAULT
+        replay = self._seen_system_commands.inspect(
+            command.command_id, command.payload_digest
+        )
+        if replay.kind == ReplayKind.CONFLICT:
+            self.health_state = NodeHealthState.FAULT
+            return
+        if replay.kind == ReplayKind.REPLAY:
             return
         if command.command_epoch < self.command_epoch:
             return
-        self._seen_system_commands[command.command_id] = command.payload_digest
+        self._seen_system_commands.remember(
+            command.command_id, command.payload_digest, True
+        )
         self.command_epoch = command.command_epoch
+        if int(message.target_conveyor_id) != int(SystemCommand.ALL_CONVEYORS):
+            # Station 촬영 후 특정 컨베이어만 재가동하는 명령은
+            # 전체 SystemState를 바꾸지 않습니다. ControlNode의 장비
+            # adapter가 아래 확장점에서 실제 motor 명령을 수행합니다.
+            self.handle_targeted_conveyor_command(message)
+            return
         if message.command_type == SystemCommand.PAUSE:
             self.system_state = SystemState.PAUSING
         elif message.command_type == SystemCommand.RESUME:
@@ -309,6 +329,9 @@ class InspectionNodeBase(Node):
         elif message.command_type == SystemCommand.RESET:
             self.system_state = SystemState.RESETTING
             self.health_state = NodeHealthState.RECOVERING
+
+    def handle_targeted_conveyor_command(self, _message: SystemCommand) -> None:
+        """특정 컨베이어 명령을 Control adapter가 구현할 확장점입니다."""
 
     def _master_heartbeat_alive(self) -> bool:
         if self.node_id == NodeId.MASTER:
@@ -544,6 +567,20 @@ def spin_node(node: InspectionNodeBase) -> None:
         executor.spin()
     except KeyboardInterrupt:
         node.get_logger().info(f"{node.get_name()} shutdown requested")
+        request_shutdown = getattr(node, "request_shutdown", None)
+        if callable(request_shutdown):
+            # Master는 Ctrl+C에서도 즉시 destroy하지 않고 Control의
+            # 실제 정지 확인과 로컬 spool 보존을 끝낸 뒤 종료합니다.
+            request_shutdown("Ctrl+C")
+            try:
+                while rclpy.ok() and not bool(
+                    getattr(node, "shutdown_ready", False)
+                ):
+                    executor.spin_once(timeout_sec=0.1)
+            except KeyboardInterrupt:
+                node.get_logger().critical(
+                    "second Ctrl+C forced process exit before safe shutdown completed"
+                )
     finally:
         executor.shutdown()
         node.destroy_node()

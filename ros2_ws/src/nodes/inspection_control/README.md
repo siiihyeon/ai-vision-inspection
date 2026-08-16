@@ -8,6 +8,7 @@ Control은 Mega, sensor 원신호, TB6600 실제 동작과 actuator 완료의 �
 - UUID/digest/epoch/session 검증과 멱등 결과 재생
 - sim open-loop `PositionSettled`
 - serial adapter가 호출할 `publish_sensor_observation()`
+- `SystemCommand.target_conveyor_id`로 지정한 상·하층 개별 재가동 확장점
 - hardware 필수 설정 누락과 adapter 미구현 시 READY 차단
 
 ## 반드시 결정할 전장/프로토콜

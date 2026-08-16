@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import rclpy
-from inspection_common import ErrorCode, IdempotencyStore, NodeId, new_uuid
+from inspection_common import (
+    ConveyorId,
+    ErrorCode,
+    IdempotencyStore,
+    NodeId,
+    SystemState,
+    new_uuid,
+)
 from inspection_common.node_base import (
     InspectionNodeBase,
     NodeInitializationOutcome,
@@ -11,7 +18,7 @@ from inspection_common.node_base import (
     spin_node,
 )
 from inspection_interfaces.action import ActuateProduct, PositionProduct
-from inspection_interfaces.msg import PositionSettled, SensorEvent
+from inspection_interfaces.msg import PositionSettled, SensorEvent, SystemCommand
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 
@@ -82,6 +89,30 @@ class ControlNode(InspectionNodeBase):
         """향후 serial adapter가 debounced 센서 이벤트를 전달할 확장점."""
 
         self._sensor_publisher.publish(message)
+
+    def handle_targeted_conveyor_command(self, message: SystemCommand) -> None:
+        """Station 촬영 후 해당 층 컨베이어만 재가동하는 진입점."""
+
+        try:
+            conveyor_id = ConveyorId(message.target_conveyor_id)
+        except ValueError:
+            self.get_logger().error("targeted SystemCommand has invalid conveyor_id")
+            return
+        if int(message.command_type) != int(SystemCommand.RESUME):
+            self.get_logger().error(
+                "only RESUME is allowed for a targeted conveyor command"
+            )
+            return
+        if self.profile == "sim":
+            self.get_logger().info(
+                f"sim conveyor {conveyor_id.name} resume command accepted"
+            )
+            return
+        # TODO(IMPLEMENTATION): Mega/TB6600 adapter에 해당 conveyor RUN 명령을
+        # 전송하고 실제 RUN_CONV feedback을 Master에 보고해야 합니다.
+        self.get_logger().error(
+            f"hardware conveyor {conveyor_id.name} resume adapter is not implemented"
+        )
 
     def _accept_equipment_goal(self, goal_request) -> GoalResponse:
         return (
@@ -206,7 +237,10 @@ class ControlNode(InspectionNodeBase):
     async def _execute_actuation(self, goal_handle) -> ActuateProduct.Result:
         request = goal_handle.request
         result = ActuateProduct.Result()
-        valid, code, reason = self.validate_command_header(request.command)
+        valid, code, reason = self.validate_command_header(
+            request.command,
+            allowed_system_states={SystemState.RUN_SYS, SystemState.PAUSING},
+        )
         if not valid:
             result.error_code = int(code)
             result.reason = reason

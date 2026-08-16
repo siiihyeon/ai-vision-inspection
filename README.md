@@ -4,9 +4,9 @@
 
 ## 현재 산출물의 성격
 
-이 저장소는 수정 레퍼런스를 반영한 **modified v2 팀 협업용 통신·객체 골격**입니다. Message/Service/Action, 상태 소유권, 멱등성, 파일경로 FIFO, SQLite commit/ACK 경계와 구현 확장점은 들어 있습니다. 실제 MVS SDK, Mega serial protocol, 제품 물리 FSM, 추론 모델은 의도적으로 placeholder입니다. 따라서 지금 상태를 생산 장비에 연결하면 안 됩니다.
+이 저장소는 수정 레퍼런스를 반영한 **modified v2 팀 협업용 통신·공정 구현**입니다. Message/Service/Action, 상태 소유권, 멱등성, 파일경로 FIFO, SQLite commit/ACK 경계와 Master의 8개 공정 블록이 들어 있습니다. 실제 MVS SDK, Mega serial protocol/TB6600·액추에이터 adapter, 추론 모델은 아직 placeholder입니다. 따라서 지금 상태를 생산 장비에 연결하면 안 됩니다.
 
-남은 값을 각 폴더 README의 `결정 필요` 표대로 확정해 전달하면, placeholder를 실제 adapter/FSM/알고리즘으로 교체하는 최종 코드 단계로 진행할 수 있습니다.
+남은 값을 각 폴더 README의 `결정 필요` 표대로 확정해 전달하면, placeholder를 실제 장비 adapter와 추론 알고리즘으로 교체하고 통합 시험하는 단계로 진행할 수 있습니다.
 
 ## 확정된 핵심 Workflow
 
@@ -31,7 +31,7 @@ Control PositionSettled
 - Queue가 차면 Capture Action은 실패하지 않고 저장된 같은 FrameBatch를 보존한 채 `ENQUEUE_BLOCKED`로 유지됩니다. Master는 `PAUSED`, 공간 복구 후 enqueue 성공과 함께 재개합니다.
 - Queue에는 raw frame이 아닌 `frame_batch_id`와 절대 이미지 파일 경로만 들어갑니다.
 - FIFO는 worker가 꺼내는 순서까지 보장합니다. 병렬 완료 순서는 Master의 `fifo_sequence` reorder buffer가 정렬합니다.
-- 제품 결과 적용 deadline은 Sensor3입니다. 명시적 station 실패는 즉시 FORCED_NG, Sensor3 시 미완료도 FORCED_NG입니다.
+- 제품 결과 적용 deadline은 Sensor3입니다. 명시적 station 실패는 즉시 `FORCED_NG` 후보로 기록하고, Sensor3에서만 최종 판정을 잠금합니다. Sensor3 시 미완료도 `FORCED_NG`입니다.
 - RGB PNG가 canonical 파일입니다. OpenCV adapter는 로딩 직후 BGR→RGB 변환 후 모델에 전달해야 합니다.
 - LED는 외부 controller로 상시점등합니다. ROS/Arduino에는 밝기나 ON/OFF 제어 계약이 없습니다.
 - trigger 요청 직전·반환 직후의 host monotonic/wall 시각과 각 camera raw/domain timestamp를 보존합니다. 동기화 여부가 미정인 camera timestamp는 skew 계산에 사용하지 않습니다.

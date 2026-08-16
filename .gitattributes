@@ -1,4 +1,5 @@
 * text=auto
+.gitattributes text eol=lf
 *.py text eol=lf
 *.md text eol=lf
 *.xml text eol=lf
@@ -7,5 +8,6 @@
 *.msg text eol=lf
 *.srv text eol=lf
 *.action text eol=lf
+CMakeLists.txt text eol=lf
 *.xlsx binary
 *.pdf binary
