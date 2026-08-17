@@ -13,13 +13,14 @@ cd ~/ai-vision-inspection
 ## 2. 작업 시작 전 main 최신화
 
 ```bash
-git fetch origin
 git status --short --branch
 git switch main
-git pull origin main
+git pull --ff-only origin main
 ```
 
-GitHub의 최신 `main`을 WSL 저장소에 내려받습니다.
+`git pull`은 내부적으로 fetch까지 수행하므로 `git fetch origin`을 따로 실행할
+필요는 없습니다. `--ff-only`는 local `main`이 예상과 다르게 갈라져 있을 때
+자동으로 합치지 않고 멈춰서 알려주는 안전장치입니다.
 
 ## 3. 새 작업 브랜치 생성
 
@@ -136,14 +137,15 @@ main에 정상 병합된 작업 브랜치를 로컬에서 정리합니다.
 
 ## 팀원이 작업 중 main을 갱신한 경우
 
+작업 브랜치에 있는 상태 그대로 다음을 실행합니다.
+
 ```bash
-git switch main
-git pull origin main
-git switch feature/작업이름
-git merge main
+git fetch origin
+git merge origin/main
 ```
 
-최신 main을 현재 작업 브랜치에 합치고 충돌이 있으면 해당 파일만 해결합니다.
+`main`으로 왔다 갔다 하지 않고, 최신 GitHub `main`을 바로 현재 작업 브랜치로
+합칩니다. 충돌이 있으면 해당 파일만 해결합니다.
 
 충돌 해결 후:
 
