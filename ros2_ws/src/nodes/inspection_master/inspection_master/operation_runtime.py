@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -28,6 +29,27 @@ class ShutdownPhase(StrEnum):
     FINALIZING = "FINALIZING"
     READY_TO_EXIT = "READY_TO_EXIT"
     BLOCKED = "BLOCKED"
+
+
+def finite_float_or_none(value: float) -> float | None:
+    """유한한 실수만 로그·결과 계약에서 사용할 수 있게 정규화합니다."""
+
+    normalized = float(value)
+    return normalized if math.isfinite(normalized) else None
+
+
+def build_late_operation_diagnostic(
+    operation: str,
+    correlation_id: str = "",
+    details: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """적용하지 않은 비동기 결과를 원본 정보와 함께 진단 로그로 보존합니다."""
+
+    payload = dict(details or {})
+    # 호출자가 공통 식별자를 덮어쓰지 못하도록 마지막에 확정합니다.
+    payload["operation"] = operation
+    payload["correlation_id"] = correlation_id
+    return payload
 
 
 @dataclass(slots=True)

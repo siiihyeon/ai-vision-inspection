@@ -39,6 +39,12 @@ Vision은 camera capture, RGB PNG 파일, station-level FrameBatch, bounded FIFO
 | 파일 | `data_root`, attempt/frame naming, temp suffix+fsync+atomic rename, permission |
 | 보존 | 성공/NG/실패/late image 보존 기간, disk warning/stop, Log 삭제 요청 handshake |
 
+`StationResult.score`는 유한한 `float32`만 허용합니다. 계산 결과가 `NaN`·`Inf`이면
+`StationResult`를 발행하지 말고 `StationInferenceFailed`로 보고해야 합니다.
+비유한 score가 전송되면 Master는 결과 계약 위반으로 기록하고 해당 제품을
+`FORCED_NG` 처리합니다. score의 수학적 의미·정상 범위·threshold는 별도
+모델 검증으로 확정합니다.
+
 ## 필수 구현 순서
 
 1. fake `CaptureBackend` 통합 test

@@ -31,3 +31,7 @@ Log는 이벤트 영구 저장과 조회 projection을 소유합니다. 이미�
 - projection 실패가 원본 `log_events` commit을 손상시키지 않습니다.
 - 보존 삭제는 Vision 파일 소유권 handshake 없이 경로를 직접 지우지 않습니다.
 - schema migration/backup/복구 test를 추가합니다.
+- `InitializeNode`는 RESET·통신 복구 뒤 같은 프로세스에서 재호출될 수 있습니다.
+  LogNode는 새 SQLite repository를 먼저 연 뒤 교체하고, 교체가 성공한 경우에만
+  이전 repository를 명시적으로 닫습니다. 새 연결 생성 실패 시 기존 연결은
+  유지하며 초기화 실패를 반환합니다.

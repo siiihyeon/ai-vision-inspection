@@ -77,7 +77,7 @@ class LogNode(InspectionNodeBase):
                 )
         try:
             database_path = Path(str(self.get_parameter("log.database_path").value))
-            self.repository = LogRepository(database_path)
+            replacement_repository = LogRepository(database_path)
         except Exception as exc:
             return NodeInitializationOutcome(
                 success=False,
@@ -85,6 +85,16 @@ class LogNode(InspectionNodeBase):
                 reason=f"SQLite initialization failed: {type(exc).__name__}",
                 retryable=True,
             )
+        previous_repository = self.repository
+        self.repository = replacement_repository
+        if previous_repository is not None:
+            try:
+                previous_repository.close()
+            except Exception as exc:
+                self.get_logger().warning(
+                    "previous SQLite repository close failed after safe replacement: "
+                    f"{type(exc).__name__}"
+                )
         return NodeInitializationOutcome(
             success=True,
             reason="SQLite schema and WAL initialized",

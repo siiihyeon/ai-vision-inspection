@@ -67,6 +67,8 @@ from .operation_runtime import (
     ShutdownPhase,
     StationCycle,
     StationCyclePhase,
+    build_late_operation_diagnostic,
+    finite_float_or_none,
 )
 from .product_flow import (
     LockedProduct,
@@ -183,13 +185,18 @@ class MasterNode(InspectionNodeBase):
         self.position_tolerance_steps = int(
             self.get_parameter("master.position_tolerance_steps").value
         )
+        station_a_camera_ids = self.get_parameter(
+            "master.camera_ids.station_a"
+        ).value
+        station_b_camera_ids = self.get_parameter(
+            "master.camera_ids.station_b"
+        ).value
         self.station_camera_ids = {
-            StationId.A: tuple(
-                self.get_parameter("master.camera_ids.station_a").value
-            ),
-            StationId.B: tuple(
-                self.get_parameter("master.camera_ids.station_b").value
-            ),
+            # Type-only STRING_ARRAY 선언은 ROS 배포판이나 빈 YAML override에
+            # 따라 None으로 보일 수 있으므로, 미설정값을 빈 튜플로 정규화해
+            # 프로세스 crash 대신 기존 fail-closed START guard로 보냅니다.
+            StationId.A: tuple(station_a_camera_ids or ()),
+            StationId.B: tuple(station_b_camera_ids or ()),
         }
         self.position_timeout_ms = int(
             self.get_parameter("master.action.position_timeout_ms").value
@@ -355,6 +362,13 @@ class MasterNode(InspectionNodeBase):
                 self.get_logger().error(
                     f"Master log spool open failed; retrying: {type(exc).__name__}"
                 )
+        elif self.profile == "hardware":
+            self._log_spool_open_failure_reported = True
+            self.set_health_state(NodeHealthState.DEGRADED)
+            self.get_logger().error(
+                "master.log_spool_path is empty; INITIALIZING and START remain "
+                "blocked until a durable path is configured"
+            )
         self.worker_heartbeats: dict[NodeId, NodeHeartbeat] = {}
         self.worker_received_ns: dict[NodeId, int] = {}
         self.worker_states = {
@@ -1278,6 +1292,44 @@ class MasterNode(InspectionNodeBase):
             for state in self.worker_states.values()
         )
 
+    def _advance_command_epoch(
+        self,
+        reason: str,
+        *,
+        restarting_worker: NodeId | None = None,
+        reinitialize_all_workers: bool = False,
+    ) -> None:
+        """새 명령 epoch를 발급하고 worker 증거를 다시 생성하게 합니다.
+
+        재시작한 worker는 InitializeNode부터 다시 수행합니다. 나머지 worker는
+        일반적으로 GetNodeStatus만 다시 조회합니다. RESET처럼 worker health가
+        RECOVERING으로 래치되는 경로에서는 모든 worker의 InitializeNode Action을
+        다시 실행하여 READY 복귀 근거를 새로 만듭니다.
+        """
+
+        self.command_epoch += 1
+        now_ns = time.monotonic_ns()
+        interval_ns = self.init_retry_interval_ms * 1_000_000
+        for worker_id, state in self.worker_states.items():
+            if worker_id == restarting_worker:
+                continue
+            if reinitialize_all_workers:
+                state.schedule_retry(
+                    now_ns=now_ns,
+                    interval_ns=interval_ns,
+                    error_code=int(ErrorCode.NODE_INIT_FAILED),
+                    reason=f"reinitialize after command epoch change: {reason}",
+                    manual_intervention_required=False,
+                )
+            else:
+                state.invalidate_epoch_evidence(
+                    now_ns=now_ns,
+                    interval_ns=interval_ns,
+                )
+        self.get_logger().info(
+            f"command_epoch advanced to {self.command_epoch}: {reason}"
+        )
+
     def _try_mark_worker_ready(self, worker_id: NodeId) -> bool:
         state = self.worker_states[worker_id]
         if not state.can_mark_ready(
@@ -1355,7 +1407,10 @@ class MasterNode(InspectionNodeBase):
             self._reported_worker_outages.discard(worker_id)
             self.get_logger().info(f"{worker_id.value} heartbeat recovered")
         if update.restarted:
-            self.command_epoch += 1
+            self._advance_command_epoch(
+                f"{worker_id.value} process restart",
+                restarting_worker=worker_id,
+            )
             self._handle_worker_unavailable(
                 worker_id,
                 f"{worker_id.value} process restarted",
@@ -1486,17 +1541,34 @@ class MasterNode(InspectionNodeBase):
                 )
             return
 
-        if worker_id == NodeId.CONTROL and self.system_state in {
-            SystemState.RUN_SYS,
-            SystemState.PAUSING,
-        }:
+        # node_base의 READY 복귀 경로는 InitializeNode 성공뿐입니다. 프로세스
+        # 재시작뿐 아니라 heartbeat 단절로 DEGRADED/RECOVERING이 된 경우에도
+        # status poll만 반복하지 않고 초기화 Action을 다시 예약합니다.
+        state.schedule_retry(
+            now_ns=time.monotonic_ns(),
+            interval_ns=self.init_retry_interval_ms * 1_000_000,
+            error_code=int(ErrorCode.NODE_INIT_FAILED),
+            reason=reason,
+            manual_intervention_required=False,
+        )
+
+        control_faulted_while_moving = (
+            worker_id == NodeId.CONTROL
+            and self.system_state
+            in {
+                SystemState.RUN_SYS,
+                SystemState.PAUSING,
+            }
+        )
+        if control_faulted_while_moving:
             self.report_critical_fault(
                 reason,
                 recovery_policy=RecoveryPolicy.LINE_CLEAR_REQUIRED,
             )
-            return
-
-        if worker_id == NodeId.VISION and self.system_state == SystemState.RUN_SYS:
+        elif (
+            worker_id == NodeId.VISION
+            and self.system_state == SystemState.RUN_SYS
+        ):
             self.request_recoverable_device_pause(
                 reason,
                 pause_reason=(
@@ -1508,15 +1580,6 @@ class MasterNode(InspectionNodeBase):
         else:
             self.set_health_state(NodeHealthState.DEGRADED)
             self.get_logger().warning(reason)
-
-        if restarted:
-            state.schedule_retry(
-                now_ns=time.monotonic_ns(),
-                interval_ns=self.init_retry_interval_ms * 1_000_000,
-                error_code=int(ErrorCode.NODE_INIT_FAILED),
-                reason=reason,
-                manual_intervention_required=False,
-            )
 
     # endregion
 
@@ -1821,6 +1884,12 @@ class MasterNode(InspectionNodeBase):
         cycle = self._station_cycles.get(station_id)
         if cycle is None or cycle.position_command_id != command_id:
             return
+        if self._ignore_operation_while_fault_stopped(
+            "POSITION_GOAL_RESPONSE",
+            product_id=cycle.product_id,
+            correlation_id=command_id,
+        ):
+            return
         try:
             goal_handle = future.result()
         except Exception as exc:
@@ -1849,12 +1918,18 @@ class MasterNode(InspectionNodeBase):
         cycle = self._station_cycles.get(station_id)
         if cycle is None or cycle.position_command_id != command_id:
             return
+        if self._ignore_operation_while_fault_stopped(
+            "POSITION_RESULT",
+            product_id=cycle.product_id,
+            correlation_id=command_id,
+        ):
+            return
         try:
             result = future.result().result
         except Exception as exc:
-            self._pause_station_for_recovery(
-                station_id,
-                f"PositionProduct Result failed: {type(exc).__name__}",
+            self._fault_stop(
+                "PositionProduct Result became unavailable after Goal acceptance; "
+                f"physical position is unknown: {type(exc).__name__}"
             )
             return
         if (
@@ -1865,8 +1940,14 @@ class MasterNode(InspectionNodeBase):
             self._fault_stop("PositionProduct Result identity mismatch")
             return
         if not result.success:
-            if int(result.error_code) == int(ErrorCode.COMMAND_CONFLICT):
+            error_code = int(result.error_code)
+            if error_code == int(ErrorCode.COMMAND_CONFLICT):
                 self._fault_stop(f"PositionProduct command conflict: {result.reason}")
+            elif error_code == int(ErrorCode.POSITION_FAILED):
+                self._fault_stop(
+                    "PositionProduct reported an untrustworthy physical position: "
+                    + (result.reason or "POSITION_FAILED")
+                )
             else:
                 self._pause_station_for_recovery(
                     station_id, result.reason or "PositionProduct failed"
@@ -1889,6 +1970,12 @@ class MasterNode(InspectionNodeBase):
 
         if message.header.session_id != self.session_id:
             return
+        if self._ignore_operation_while_fault_stopped(
+            "POSITION_SETTLED",
+            product_id=message.product_id,
+            correlation_id=message.position_command_id,
+        ):
+            return
         try:
             station_id = StationId(message.station_id)
         except ValueError:
@@ -1896,7 +1983,16 @@ class MasterNode(InspectionNodeBase):
             return
         cycle = self._station_cycles.get(station_id)
         if cycle is None:
-            self._fault_stop("PositionSettled has no active station cycle")
+            self._emit_log_event(
+                severity=LogEvent.WARNING,
+                event_type="SUPERSEDED_POSITION_SETTLED_IGNORED",
+                product_id=message.product_id,
+                payload={
+                    "station_id": station_id.name,
+                    "position_command_id": message.position_command_id,
+                    "reason": "no active station cycle",
+                },
+            )
             return
         if (
             message.product_id != cycle.product_id
@@ -1910,29 +2006,6 @@ class MasterNode(InspectionNodeBase):
             self._pause_station_for_recovery(
                 station_id,
                 "PositionSettled exceeded configured position tolerance",
-            )
-            return
-        returned_camera_ids = tuple(image.camera_id for image in result.images)
-        required_camera_ids = self.station_camera_ids[station_id]
-        if (
-            not result.frame_batch_id
-            or not result.inference_job_id
-            or int(result.attempt_count) < 1
-            or len(returned_camera_ids) != len(set(returned_camera_ids))
-            or set(returned_camera_ids) != set(required_camera_ids)
-            or any(
-                not image.file_path
-                or not is_sha256_hex(image.sha256)
-                or int(image.file_size_bytes) <= 0
-                or int(image.width) <= 0
-                or int(image.height) <= 0
-                or image.pixel_format != "RGB8"
-                for image in result.images
-            )
-        ):
-            self._finish_capture_failure(
-                station_id,
-                "CaptureProduct success payload is incomplete or camera set differs",
             )
             return
         context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
@@ -2040,9 +2113,14 @@ class MasterNode(InspectionNodeBase):
         cycle = self._station_cycles.get(station_id)
         if cycle is None or cycle.capture_id != capture_id:
             return
+        # Capture feedback은 queue 대기 중 10 Hz로 반복될 수 있는 telemetry입니다.
+        # FAULT_STOP의 제품 원장은 보존하되 고빈도 진행 신호는 기록하지 않습니다.
+        if self.system_state == SystemState.FAULT_STOP:
+            return
         feedback = feedback_message.feedback
         if int(feedback.stage) == int(CaptureProduct.Feedback.ENQUEUE_BLOCKED):
             self._paused_by_queue = True
+            self._queue_recovered_pending = False
             self._pause(
                 f"Vision queue full; preserving FrameBatch {feedback.frame_batch_id}"
             )
@@ -2052,6 +2130,12 @@ class MasterNode(InspectionNodeBase):
     ) -> None:
         cycle = self._station_cycles.get(station_id)
         if cycle is None or cycle.capture_id != capture_id:
+            return
+        if self._ignore_operation_while_fault_stopped(
+            "CAPTURE_GOAL_RESPONSE",
+            product_id=cycle.product_id,
+            correlation_id=capture_id,
+        ):
             return
         try:
             goal_handle = future.result()
@@ -2081,6 +2165,12 @@ class MasterNode(InspectionNodeBase):
         cycle = self._station_cycles.get(station_id)
         if cycle is None or cycle.capture_id != capture_id:
             return
+        if self._ignore_operation_while_fault_stopped(
+            "CAPTURE_RESULT",
+            product_id=cycle.product_id,
+            correlation_id=capture_id,
+        ):
+            return
         try:
             result = future.result().result
         except Exception as exc:
@@ -2102,6 +2192,29 @@ class MasterNode(InspectionNodeBase):
                 return
             self._finish_capture_failure(
                 station_id, result.reason or "final station capture failed"
+            )
+            return
+        returned_camera_ids = tuple(image.camera_id for image in result.images)
+        required_camera_ids = self.station_camera_ids[station_id]
+        if (
+            not result.frame_batch_id
+            or not result.inference_job_id
+            or int(result.attempt_count) < 1
+            or len(returned_camera_ids) != len(set(returned_camera_ids))
+            or set(returned_camera_ids) != set(required_camera_ids)
+            or any(
+                not image.file_path
+                or not is_sha256_hex(image.sha256)
+                or int(image.file_size_bytes) <= 0
+                or int(image.width) <= 0
+                or int(image.height) <= 0
+                or image.pixel_format != "RGB8_PNG"
+                for image in result.images
+            )
+        ):
+            self._finish_capture_failure(
+                station_id,
+                "CaptureProduct success payload is incomplete or camera set differs",
             )
             return
         context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
@@ -2137,6 +2250,12 @@ class MasterNode(InspectionNodeBase):
     def _finish_capture_failure(self, station_id: StationId, reason: str) -> None:
         cycle = self._station_cycles.get(station_id)
         if cycle is None:
+            return
+        if self._ignore_operation_while_fault_stopped(
+            "CAPTURE_FAILURE",
+            product_id=cycle.product_id,
+            correlation_id=cycle.capture_id,
+        ):
             return
         context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
         if context is None:
@@ -2197,6 +2316,12 @@ class MasterNode(InspectionNodeBase):
             or cycle.phase != StationCyclePhase.RESUME_PENDING
         ):
             return False
+        if self._ignore_operation_while_fault_stopped(
+            "CONVEYOR_RESUME_CONFIRMATION",
+            product_id=product_id,
+            correlation_id=station_id.name,
+        ):
+            return False
         context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
         if context is None:
             self._fault_stop("conveyor resume references unknown product")
@@ -2219,6 +2344,11 @@ class MasterNode(InspectionNodeBase):
         return True
 
     def _pause_station_for_recovery(self, station_id: StationId, reason: str) -> None:
+        if self._ignore_operation_while_fault_stopped(
+            "STATION_RECOVERY",
+            correlation_id=station_id.name,
+        ):
+            return
         cycle = self._station_cycles.get(station_id)
         if cycle is not None:
             context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
@@ -2254,6 +2384,26 @@ class MasterNode(InspectionNodeBase):
 
     def _handle_station_result(self, message: StationResult) -> None:
         if message.header.session_id != self.session_id:
+            return
+        score = finite_float_or_none(message.score)
+        if self._ignore_operation_while_fault_stopped(
+            "STATION_RESULT",
+            product_id=message.product_id,
+            correlation_id=message.capture_id,
+            diagnostic_details={
+                "fifo_sequence": int(message.fifo_sequence),
+                "station_id": int(message.station_id),
+                "frame_batch_id": message.frame_batch_id,
+                "inference_job_id": message.inference_job_id,
+                "result_revision": int(message.result_revision),
+                "verdict": int(message.verdict),
+                "score": score,
+                "score_is_finite": score is not None,
+                "model_version": message.model_version,
+                "completed_at_sec": int(message.completed_at.sec),
+                "completed_at_nanosec": int(message.completed_at.nanosec),
+            },
+        ):
             return
         try:
             station_id = StationId(message.station_id)
@@ -2325,11 +2475,16 @@ class MasterNode(InspectionNodeBase):
             return
         if (
             verdict is None
+            or score is None
             or int(message.result_revision) < 1
             or not message.frame_batch_id
             or not message.inference_job_id
         ):
-            reason = "station result payload is invalid or incomplete"
+            reason = (
+                "station result score must be finite"
+                if score is None
+                else "station result payload is invalid or incomplete"
+            )
             with self._flow_lock:
                 context.record_station_contract_failure(station_id, reason)
             self._emit_log_event(
@@ -2388,6 +2543,23 @@ class MasterNode(InspectionNodeBase):
 
     def _handle_station_failure(self, message: StationInferenceFailed) -> None:
         if message.header.session_id != self.session_id:
+            return
+        if self._ignore_operation_while_fault_stopped(
+            "STATION_FAILURE",
+            product_id=message.product_id,
+            correlation_id=message.capture_id,
+            diagnostic_details={
+                "fifo_sequence": int(message.fifo_sequence),
+                "station_id": int(message.station_id),
+                "frame_batch_id": message.frame_batch_id,
+                "inference_job_id": message.inference_job_id,
+                "result_revision": int(message.result_revision),
+                "error_code": int(message.error_code),
+                "reason": message.reason,
+                "failed_at_sec": int(message.failed_at.sec),
+                "failed_at_nanosec": int(message.failed_at.nanosec),
+            },
+        ):
             return
         context = self.ledger.get(message.product_id, message.fifo_sequence)
         if context is None:
@@ -2600,6 +2772,12 @@ class MasterNode(InspectionNodeBase):
         cycle = self._actuation_cycles.get(actuator_job_id)
         if cycle is None or cycle.command_id != command_id:
             return
+        if self._ignore_operation_while_fault_stopped(
+            "ACTUATION_GOAL_RESPONSE",
+            product_id=cycle.product_id,
+            correlation_id=command_id,
+        ):
+            return
         try:
             goal_handle = future.result()
         except Exception as exc:
@@ -2638,6 +2816,12 @@ class MasterNode(InspectionNodeBase):
 
         cycle = self._actuation_cycles.get(actuator_job_id)
         if cycle is None or cycle.command_id != command_id:
+            return
+        if self._ignore_operation_while_fault_stopped(
+            "ACTUATION_RESULT",
+            product_id=cycle.product_id,
+            correlation_id=command_id,
+        ):
             return
         try:
             result = future.result().result
@@ -2692,6 +2876,8 @@ class MasterNode(InspectionNodeBase):
     def _remove_completed_fifo_prefix(self) -> None:
         """FIFO 맨 앞부터 연속된 DONE 제품만 순서대로 제거합니다."""
 
+        if self._ignore_operation_while_fault_stopped("FIFO_PREFIX_REMOVAL"):
+            return
         with self._flow_lock:
             removed = self.ledger.remove_completed_prefix(
                 now_ns=time.monotonic_ns()
@@ -2712,9 +2898,14 @@ class MasterNode(InspectionNodeBase):
     def _request_all_conveyors_stop(self, reason: str) -> None:
         """Control에 상·하층 컨베이어 안전 정지를 요청합니다."""
 
-        self._pause_deadline_ns = (
-            time.monotonic_ns() + self.pause_stop_timeout_ms * 1_000_000
-        )
+        if self.system_state == SystemState.PAUSING:
+            self._pause_deadline_ns = (
+                time.monotonic_ns() + self.pause_stop_timeout_ms * 1_000_000
+            )
+        else:
+            # FAULT_STOP은 PAUSING timeout 전이를 사용하지 않습니다. 이전
+            # 정지 요청의 deadline을 남겨 다음 운전에서 오해하지 않습니다.
+            self._pause_deadline_ns = 0
         self._publish_system_command(SystemCommand.PAUSE, reason)
         if self.profile == "sim":
             self.confirm_all_conveyors_stopped()
@@ -2762,7 +2953,10 @@ class MasterNode(InspectionNodeBase):
     def _start_reset_sequence(self, reason: str) -> None:
         """오류 종류에 맞는 소프트 복구 또는 line clear 절차를 시작합니다."""
 
-        self.command_epoch += 1
+        self._advance_command_epoch(
+            "reset sequence started",
+            reinitialize_all_workers=True,
+        )
         self._publish_system_command(SystemCommand.RESET, reason)
         if self.profile == "sim":
             self.confirm_reset_completed()
@@ -2837,6 +3031,34 @@ class MasterNode(InspectionNodeBase):
         )
         return self.equipment.line_clear_guards_satisfied()
 
+    def _cancel_tracked_operation_goals(self, *, include_actuation: bool) -> None:
+        """복구·종료 전에 Master가 보유한 Action Goal에 취소를 요청합니다.
+
+        취소 요청은 best-effort입니다. 실제 장비 안전 정지는 RESET/PAUSE 명령과
+        Control adapter의 안전 출력 적용으로 별도 보장해야 합니다.
+        """
+
+        goal_handles = [
+            goal_handle
+            for cycle in tuple(self._station_cycles.values())
+            for goal_handle in (cycle.position_goal_handle, cycle.capture_goal_handle)
+            if goal_handle is not None
+        ]
+        if include_actuation:
+            goal_handles.extend(
+                cycle.goal_handle
+                for cycle in tuple(self._actuation_cycles.values())
+                if cycle.goal_handle is not None
+                and cycle.phase != ActuationPhase.COMPLETED
+            )
+        for goal_handle in goal_handles:
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception:
+                # RESET/PAUSE가 실제 안전 정지를 별도로 수행하며, Action 취소
+                # 실패 자체가 복구 callback을 중단시키지는 않게 합니다.
+                pass
+
     def confirm_reset_completed(self) -> bool:
         """Control의 RESET·안전 출력 확인 후 복구 정책에 맞게 완료합니다."""
 
@@ -2846,6 +3068,7 @@ class MasterNode(InspectionNodeBase):
             if not self.equipment.line_clear_guards_satisfied():
                 self.report_reset_failed("line clear guards are incomplete")
                 return False
+            self._cancel_tracked_operation_goals(include_actuation=True)
             with self._flow_lock:
                 cleared = self.ledger.clear_active(now_ns=time.monotonic_ns())
                 self.sensor_events.reset()
@@ -2855,6 +3078,8 @@ class MasterNode(InspectionNodeBase):
                 self._actuation_id_owners = IdempotencyStore(capacity=4096)
                 self._deferred_station_starts.clear()
                 self._deferred_capture_resumes.clear()
+                self._paused_by_queue = False
+                self._queue_recovered_pending = False
             self._emit_log_event(
                 severity=LogEvent.WARNING,
                 event_type="LINE_CLEAR_APPLIED",
@@ -2872,6 +3097,9 @@ class MasterNode(InspectionNodeBase):
             return False
         if not self._prepare_in_place_recovery():
             return False
+        # RESET 뒤에는 이전 Vision queue 상태도 새 command epoch의 증거가 아닙니다.
+        self._paused_by_queue = False
+        self._queue_recovered_pending = False
         return self.report_reset_succeeded(line_cleared=False)
 
     def _prepare_in_place_recovery(self) -> bool:
@@ -2890,13 +3118,8 @@ class MasterNode(InspectionNodeBase):
             )
             return False
 
+        self._cancel_tracked_operation_goals(include_actuation=False)
         for station_id, cycle in tuple(self._station_cycles.items()):
-            for goal_handle in (cycle.position_goal_handle, cycle.capture_goal_handle):
-                if goal_handle is not None:
-                    try:
-                        goal_handle.cancel_goal_async()
-                    except Exception:
-                        pass
             cycle.deadline_ns = 0
             context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
             if context is None:
@@ -2938,6 +3161,10 @@ class MasterNode(InspectionNodeBase):
 
     def _handle_queue_state(self, message: VisionQueueState) -> None:
         if message.header.session_id != self.session_id:
+            return
+        # QueueState도 고빈도 telemetry이므로 FAULT_STOP 중에는 상태를 바꾸거나
+        # 로그를 만들지 않습니다. RESET 성공 후 새 queue 상태만 수락합니다.
+        if self.system_state == SystemState.FAULT_STOP:
             return
         if message.state == VisionQueueState.ENQUEUE_BLOCKED:
             if not self._paused_by_queue:
@@ -2986,6 +3213,30 @@ class MasterNode(InspectionNodeBase):
             recovery_policy=RecoveryPolicy.LINE_CLEAR_REQUIRED,
         )
         self.get_logger().error(reason)
+
+    def _ignore_operation_while_fault_stopped(
+        self,
+        operation: str,
+        *,
+        product_id: str = "",
+        correlation_id: str = "",
+        diagnostic_details: dict[str, object] | None = None,
+    ) -> bool:
+        """FAULT_STOP 이후 도착한 비동기 결과가 제품 원장을 바꾸지 못하게 합니다."""
+
+        if self.system_state != SystemState.FAULT_STOP:
+            return False
+        self._emit_log_event(
+            severity=LogEvent.WARNING,
+            event_type="LATE_OPERATION_IGNORED_DURING_FAULT_STOP",
+            product_id=product_id,
+            payload=build_late_operation_diagnostic(
+                operation,
+                correlation_id,
+                diagnostic_details,
+            ),
+        )
+        return True
 
     def confirm_all_conveyors_stopped(self) -> None:
         """Control의 실제 정지 완료를 받은 뒤 PAUSING을 확정합니다.
@@ -3142,14 +3393,13 @@ class MasterNode(InspectionNodeBase):
         payload: dict[str, object],
         product_id: str = "",
     ) -> None:
-        """중요 이벤트를 local spool에 먼저 보존한 뒤 LogNode로 발행합니다."""
+        """중요 이벤트를 보존하고 LogNode로 발행합니다.
 
-        if self._log_spool is None:
-            self.set_health_state(NodeHealthState.DEGRADED)
-            self.get_logger().error(
-                f"Master local log spool unavailable; event={event_type}"
-            )
-            return
+        정상 경로는 local spool 선기록 후 발행입니다. spool이 고장 난
+        비정상 경로에서도 LogNode까지 함께 차단하지 않고 직접 발행하여,
+        최소 한 곳에는 이벤트가 남을 가능성을 보존합니다.
+        """
+
         log_id = new_uuid()
         revision = 1
         envelope = {
@@ -3162,26 +3412,37 @@ class MasterNode(InspectionNodeBase):
             "product_id": product_id,
             "payload": payload,
         }
-        payload_json = canonical_json(envelope)
-        digest = sha256_text(payload_json)
         try:
-            self._log_spool.enqueue(
-                SpoolRecord(
-                    log_id=log_id,
-                    revision=revision,
-                    payload_json=payload_json,
-                    payload_digest=digest,
-                )
+            payload_json = canonical_json(envelope)
+            digest = sha256_text(payload_json)
+            record = SpoolRecord(log_id, revision, payload_json, digest)
+        except (TypeError, ValueError, OverflowError) as exc:
+            # 로그 payload 하나가 잘못되어도 ROS callback 전체를 죽이지 않습니다.
+            self.set_health_state(NodeHealthState.DEGRADED)
+            self.get_logger().error(
+                "Master log event serialization failed; "
+                f"event={event_type}; error={type(exc).__name__}"
             )
+            return
+        if self._log_spool is None:
+            self.set_health_state(NodeHealthState.DEGRADED)
+            self.get_logger().error(
+                "Master local log spool unavailable; publishing without durable "
+                f"producer copy; event={event_type}"
+            )
+            self._publish_spool_record(record)
+            return
+        try:
+            self._log_spool.enqueue(record)
         except Exception as exc:
             self.set_health_state(NodeHealthState.DEGRADED)
             self.get_logger().error(
-                f"Master log spool enqueue failed: {type(exc).__name__}"
+                "Master log spool enqueue failed; publishing without durable "
+                f"producer copy: {type(exc).__name__}"
             )
+            self._publish_spool_record(record)
             return
-        self._publish_spool_record(
-            SpoolRecord(log_id, revision, payload_json, digest)
-        )
+        self._publish_spool_record(record)
 
     def _publish_spool_record(self, record: SpoolRecord) -> None:
         try:
@@ -3333,19 +3594,7 @@ class MasterNode(InspectionNodeBase):
             return
         self.shutdown_phase = ShutdownPhase.FINALIZING
         self._shutdown_deadline_ns = 0
-        for cycle in tuple(self._station_cycles.values()):
-            for goal_handle in (cycle.position_goal_handle, cycle.capture_goal_handle):
-                if goal_handle is not None:
-                    try:
-                        goal_handle.cancel_goal_async()
-                    except Exception:
-                        pass
-        for cycle in tuple(self._actuation_cycles.values()):
-            if cycle.goal_handle is not None and cycle.phase != ActuationPhase.COMPLETED:
-                try:
-                    cycle.goal_handle.cancel_goal_async()
-                except Exception:
-                    pass
+        self._cancel_tracked_operation_goals(include_actuation=True)
         self._emit_log_event(
             severity=LogEvent.INFO,
             event_type="SHUTDOWN_READY",
@@ -3397,6 +3646,14 @@ class MasterNode(InspectionNodeBase):
                 "shutdown blocked because safe stop was not confirmed",
                 recovery_policy=RecoveryPolicy.EQUIPMENT_CHECK_REQUIRED,
             )
+            self.get_logger().critical(
+                "shutdown remains BLOCKED: verify Control/Mega communication and "
+                "physical conveyor stop; a second Ctrl+C forces an unsafe exit"
+            )
+        if self.system_state == SystemState.FAULT_STOP:
+            # FAULT_STOP 진입 시점의 제품·FIFO·cycle을 복구 근거로 보존합니다.
+            # 이미 도착한 개별 callback도 동일한 원칙으로 진입부에서 무시합니다.
+            return
         for station_id, cycle in tuple(self._station_cycles.items()):
             if not cycle.deadline_ns or now_ns <= cycle.deadline_ns:
                 continue
@@ -3415,17 +3672,25 @@ class MasterNode(InspectionNodeBase):
                 self._finish_capture_failure(
                     station_id, "CaptureProduct timed out"
                 )
-            elif cycle.phase in {
-                StationCyclePhase.POSITION_GOAL,
-                StationCyclePhase.WAITING_POSITION,
-            }:
+            elif cycle.phase == StationCyclePhase.POSITION_GOAL:
                 if cycle.position_goal_handle is not None:
                     try:
                         cycle.position_goal_handle.cancel_goal_async()
                     except Exception:
                         pass
                 self._pause_station_for_recovery(
-                    station_id, "PositionProduct timed out"
+                    station_id,
+                    "PositionProduct Goal response timed out before command acceptance",
+                )
+            elif cycle.phase == StationCyclePhase.WAITING_POSITION:
+                if cycle.position_goal_handle is not None:
+                    try:
+                        cycle.position_goal_handle.cancel_goal_async()
+                    except Exception:
+                        pass
+                self._fault_stop(
+                    "PositionProduct timed out after Goal acceptance; physical "
+                    "position is unknown"
                 )
             elif cycle.phase == StationCyclePhase.RESUME_PENDING:
                 self._deferred_capture_resumes.add(

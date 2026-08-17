@@ -30,6 +30,11 @@ Control은 Mega, sensor 원신호, TB6600 실제 동작과 actuator 완료의 �
 - serial I/O는 ROS callback을 block하지 않고 전용 thread/queue를 사용합니다.
 - 같은 command ID는 물리 출력을 두 번 발생시키지 않습니다.
 - reconnect 후 오래된 epoch 명령을 실행하지 않습니다.
+- Position·Actuation의 장시간 hardware 실행 루프는
+  `goal_handle.is_cancel_requested`를 주기적으로 확인하고 취소 시 물리 출력을
+  안전 상태로 만든 뒤 `goal_handle.canceled()`로 종료합니다.
+- RESET 또는 `command_epoch` 변경은 진행 중인 이전 명령을 무효화해야 하며,
+  Action cancel 수락만으로 물리 정지를 확정하지 않습니다.
 - 장애 시 STEP/ENABLE/actuator가 문서화된 safe state가 됩니다.
 - firmware protocol simulator와 hardware-in-loop test를 각각 둡니다.
 
