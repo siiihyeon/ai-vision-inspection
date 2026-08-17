@@ -28,13 +28,34 @@ class InferenceJob:
     frame_batch_id: str
     image_paths: tuple[str, ...]
     enqueued_monotonic_ns: int
+    enqueued_wall_time_ns: int = 0
     queue_total_timeout_ms: int | None = None
+    result_revision: int = 1
 
     def expired(self, now_ns: int | None = None) -> bool:
         if self.queue_total_timeout_ms is None:
             return False
         current = time.monotonic_ns() if now_ns is None else now_ns
-        return current - self.enqueued_monotonic_ns > self.queue_total_timeout_ms * 1_000_000
+        monotonic_expired = (
+            self.enqueued_monotonic_ns > 0
+            and current - self.enqueued_monotonic_ns
+            > self.queue_total_timeout_ms * 1_000_000
+        )
+        wall_expired = (
+            self.enqueued_wall_time_ns > 0
+            and time.time_ns() - self.enqueued_wall_time_ns
+            > self.queue_total_timeout_ms * 1_000_000
+        )
+        return monotonic_expired or wall_expired
+
+    def stamped_for_enqueue(self) -> "InferenceJob":
+        now_mono = time.monotonic_ns()
+        now_wall = time.time_ns()
+        return replace(
+            self,
+            enqueued_monotonic_ns=(self.enqueued_monotonic_ns or now_mono),
+            enqueued_wall_time_ns=(self.enqueued_wall_time_ns or now_wall),
+        )
 
 
 class InferenceQueue:
@@ -59,14 +80,20 @@ class InferenceQueue:
         with self._condition:
             return self._closed
 
-    def try_enqueue(self, job: InferenceJob) -> bool:
+    def try_enqueue(
+        self,
+        job: InferenceJob,
+        on_enqueued: Callable[[InferenceJob], None] | None = None,
+    ) -> bool:
         with self._condition:
             if self._closed or job.product_id in self._locked_products:
                 return False
             if len(self._items) >= self.capacity:
                 return False
             if job.enqueued_monotonic_ns <= 0:
-                job = replace(job, enqueued_monotonic_ns=time.monotonic_ns())
+                job = job.stamped_for_enqueue()
+            elif job.queue_total_timeout_ms is not None and job.enqueued_wall_time_ns <= 0:
+                job = replace(job, enqueued_wall_time_ns=time.time_ns())
             # fifo_sequence가 공식 순서키입니다. 같은 sequence 안에서는
             # 실제 enqueue monotonic 시각과 station_id로 안정적으로 정렬합니다.
             order = (job.fifo_sequence, job.enqueued_monotonic_ns, job.station_id)
@@ -81,6 +108,13 @@ class InferenceQueue:
                     insert_at = index
                     break
             self._items.insert(insert_at, job)
+            if on_enqueued is not None:
+                try:
+                    on_enqueued(job)
+                except Exception:
+                    self._items.remove(job)
+                    self._condition.notify_all()
+                    raise
             self._condition.notify()
             return True
 
@@ -92,6 +126,20 @@ class InferenceQueue:
                 return True
             self._condition.wait(timeout_seconds)
             return not self._closed and len(self._items) < self.capacity
+
+    def wait_until_depth_at_most(
+        self, maximum_depth: int, timeout_seconds: float
+    ) -> bool:
+        if maximum_depth < 0 or maximum_depth >= self.capacity:
+            raise ValueError("maximum_depth must be between 0 and capacity-1")
+        deadline = time.monotonic() + timeout_seconds
+        with self._condition:
+            while len(self._items) > maximum_depth and not self._closed:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
+            return not self._closed and len(self._items) <= maximum_depth
 
     def discard_expired(self, now_ns: int | None = None) -> tuple[InferenceJob, ...]:
         """deadline이 지난 대기 job을 FIFO에서 강제로 제거합니다."""
@@ -130,6 +178,10 @@ class InferenceQueue:
             self._condition.notify_all()
             return removed
 
+    def queued_jobs_for_product(self, product_id: str) -> tuple[InferenceJob, ...]:
+        with self._condition:
+            return tuple(job for job in self._items if job.product_id == product_id)
+
     def is_product_locked(self, product_id: str) -> bool:
         with self._condition:
             return product_id in self._locked_products
@@ -153,6 +205,7 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
         infer: Callable[[ModelT, tuple[LoadedT, ...]], ResultT],
         on_success: Callable[[InferenceJob, ResultT], None],
         on_failure: Callable[[InferenceJob, str], None],
+        on_claim: Callable[[InferenceJob], None] | None = None,
         serialize_model_access: bool = True,
     ) -> None:
         if worker_count < 1:
@@ -164,6 +217,7 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
         self._infer = infer
         self._on_success = on_success
         self._on_failure = on_failure
+        self._on_claim = on_claim
         self._model_lock = threading.Lock() if serialize_model_access else None
         self._threads: list[threading.Thread] = []
         self._sweeper_thread: threading.Thread | None = None
@@ -191,15 +245,22 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
         self._queue.close()
         for thread in self._threads:
             thread.join(timeout=5.0)
-        self._threads.clear()
         if self._sweeper_thread is not None:
             self._sweeper_thread.join(timeout=5.0)
-            self._sweeper_thread = None
+        alive = [thread.name for thread in self._threads if thread.is_alive()]
+        if self._sweeper_thread is not None and self._sweeper_thread.is_alive():
+            alive.append(self._sweeper_thread.name)
+        if alive:
+            raise RuntimeError(
+                "worker shutdown deadline exceeded: " + ", ".join(alive)
+            )
+        self._threads.clear()
+        self._sweeper_thread = None
 
     def _sweep_expired(self) -> None:
         while not self._stop_event.wait(0.05):
             for job in self._queue.discard_expired():
-                self._on_failure(job, "queue total inference timeout")
+                self._notify_failure(job, "queue total inference timeout")
 
     def _run(self) -> None:
         while True:
@@ -209,34 +270,60 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
             if self._queue.is_product_locked(job.product_id):
                 continue
             if job.expired():
-                self._on_failure(job, "queue total inference timeout")
+                self._notify_failure(job, "queue total inference timeout")
                 continue
+            if self._on_claim is not None:
+                try:
+                    self._on_claim(job)
+                except Exception as exc:
+                    self._notify_failure(
+                        job, f"inference job claim failed: {type(exc).__name__}"
+                    )
+                    continue
             try:
                 loaded = tuple(
                     self._load_with_one_retry(job, Path(path))
                     for path in job.image_paths
                 )
             except InferenceDeadlineExceeded:
-                self._on_failure(job, "queue total inference timeout")
+                self._notify_failure(job, "queue total inference timeout")
                 continue
             except Exception as exc:
-                self._on_failure(job, f"image read failed after retry: {type(exc).__name__}")
+                self._notify_failure(
+                    job, f"image read failed after retry: {type(exc).__name__}"
+                )
                 continue
             if job.expired():
-                self._on_failure(job, "queue total inference timeout")
+                self._notify_failure(job, "queue total inference timeout")
                 continue
             try:
                 result = self._infer_with_one_retry(job, loaded)
             except InferenceDeadlineExceeded:
-                self._on_failure(job, "queue total inference timeout")
+                self._notify_failure(job, "queue total inference timeout")
                 continue
             except Exception as exc:
-                self._on_failure(job, f"inference failed after retry: {type(exc).__name__}")
+                self._notify_failure(
+                    job, f"inference failed after retry: {type(exc).__name__}"
+                )
                 continue
             if job.expired():
-                self._on_failure(job, "queue total inference timeout")
+                self._notify_failure(job, "queue total inference timeout")
             elif not self._queue.is_product_locked(job.product_id):
-                self._on_success(job, result)
+                self._notify_success(job, result)
+
+    def _notify_failure(self, job: InferenceJob, reason: str) -> None:
+        try:
+            self._on_failure(job, reason)
+        except Exception:
+            # 외부 publisher/journal callback 하나의 예외로 worker thread가 영구
+            # 종료되지는 않게 합니다. callback 소유자가 health/log를 내립니다.
+            return
+
+    def _notify_success(self, job: InferenceJob, result: ResultT) -> None:
+        try:
+            self._on_success(job, result)
+        except Exception:
+            self._notify_failure(job, "inference success callback failed")
 
     def _load_with_one_retry(self, job: InferenceJob, path: Path) -> LoadedT:
         try:
@@ -251,8 +338,12 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
     ) -> ResultT:
         def execute() -> ResultT:
             if self._model_lock is None:
+                if job.expired():
+                    raise InferenceDeadlineExceeded
                 return self._infer(self._model, images)
             with self._model_lock:
+                if job.expired():
+                    raise InferenceDeadlineExceeded
                 return self._infer(self._model, images)
 
         try:

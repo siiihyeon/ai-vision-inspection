@@ -1,4 +1,4 @@
-"""HIKROBOT SDK adapter와 ROS Action 사이의 순수 Python 계약."""
+"""카메라 SDK, 파일 저장소와 ROS adapter 사이의 순수 Python 계약."""
 
 from __future__ import annotations
 
@@ -8,6 +8,99 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+
+
+class CaptureError(RuntimeError):
+    """촬영 단계에서 분류 가능한 오류입니다."""
+
+    def __init__(self, reason: str, *, retryable: bool = True) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retryable = retryable
+
+
+class CaptureSkewExceeded(CaptureError):
+    """필수 카메라의 host callback 도착 skew가 허용치를 넘었습니다."""
+
+
+class CaptureStorageError(CaptureError):
+    """RGB PNG 또는 manifest 내구 저장이 완료되지 않았습니다."""
+
+
+class CameraUnavailable(CaptureError):
+    """필수 카메라가 준비되지 않았거나 프레임을 반환하지 않았습니다."""
+
+
+@dataclass(frozen=True, slots=True)
+class CameraFrame:
+    """SDK callback에서 즉시 복사한 RGB8 packed 프레임과 상관관계 정보."""
+
+    camera_id: str
+    width: int
+    height: int
+    rgb_bytes: bytes
+    frame_number: int
+    external_trigger_count: int
+    camera_timestamp_raw: int
+    camera_timestamp_domain: str
+    camera_timestamp_ns: int
+    camera_timestamp_synchronized: bool
+    sdk_host_timestamp_raw: int
+    host_arrival_monotonic_ns: int
+    host_arrival_wall_time_ns: int
+
+    def validate(self) -> None:
+        if not self.camera_id:
+            raise ValueError("camera_id is required")
+        if self.width < 1 or self.height < 1:
+            raise ValueError("frame dimensions must be positive")
+        if len(self.rgb_bytes) != self.width * self.height * 3:
+            raise ValueError("RGB8 packed byte length does not match dimensions")
+        if self.frame_number < 0 or self.external_trigger_count < 0:
+            raise ValueError("frame counters cannot be negative")
+        if self.host_arrival_monotonic_ns <= 0 or self.host_arrival_wall_time_ns <= 0:
+            raise ValueError("host arrival timestamps are required")
+
+
+@dataclass(frozen=True, slots=True)
+class RawCaptureBatch:
+    """한 번의 station Action Command에서 연결된 메모리 프레임 묶음."""
+
+    product_id: str
+    station_id: int
+    capture_id: str
+    attempt: int
+    trigger_requested_monotonic_ns: int
+    trigger_returned_monotonic_ns: int
+    trigger_requested_wall_time_ns: int
+    trigger_returned_wall_time_ns: int
+    frames: tuple[CameraFrame, ...]
+
+    @property
+    def frame_arrival_skew_us(self) -> int:
+        arrivals = [frame.host_arrival_monotonic_ns for frame in self.frames]
+        return 0 if len(arrivals) < 2 else (max(arrivals) - min(arrivals)) // 1_000
+
+    def validate(self, required_camera_ids: tuple[str, ...]) -> None:
+        if self.station_id not in {1, 2}:
+            raise ValueError("station_id must be 1 or 2")
+        if self.attempt < 1:
+            raise ValueError("attempt must be positive")
+        if self.trigger_requested_monotonic_ns <= 0:
+            raise ValueError("trigger requested monotonic timestamp is missing")
+        if self.trigger_returned_monotonic_ns < self.trigger_requested_monotonic_ns:
+            raise ValueError("trigger returned before it was requested")
+        if self.trigger_requested_wall_time_ns <= 0:
+            raise ValueError("trigger requested wall timestamp is missing")
+        if self.trigger_returned_wall_time_ns < self.trigger_requested_wall_time_ns:
+            raise ValueError("trigger wall timestamps are not monotonic")
+        actual = tuple(frame.camera_id for frame in self.frames)
+        if len(actual) != len(set(actual)):
+            raise ValueError("duplicate camera_id in raw capture")
+        if set(actual) != set(required_camera_ids):
+            raise ValueError("raw capture does not contain every required camera")
+        for frame in self.frames:
+            frame.validate()
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,6 +118,9 @@ class ImageArtifact:
     camera_timestamp_synchronized: bool
     host_arrival_monotonic_ns: int
     host_arrival_timestamp_ns: int
+    frame_number: int = 0
+    external_trigger_count: int = 0
+    sdk_host_timestamp_raw: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +135,7 @@ class CaptureBatch:
     trigger_requested_wall_time_ns: int
     trigger_returned_wall_time_ns: int
     images: tuple[ImageArtifact, ...]
+    manifest_path: str = ""
 
     @property
     def frame_arrival_skew_us(self) -> int:
@@ -133,6 +230,9 @@ def _validate_rgb8_png(content: bytes, expected_width: int, expected_height: int
 
 
 class CaptureBackend(Protocol):
+    async def initialize(self) -> dict[str, object]:
+        """장치 열기, trigger 설정, callback 등록과 grabbing을 완료합니다."""
+
     async def capture_station(
         self,
         *,
@@ -141,10 +241,18 @@ class CaptureBackend(Protocol):
         capture_id: str,
         attempt: int,
         required_camera_ids: tuple[str, ...],
-    ) -> CaptureBatch:
-        """GigE Action Command 1회와 atomic RGB PNG 저장을 수행합니다."""
+    ) -> RawCaptureBatch:
+        """GigE Action Command 1회에 대응하는 RGB 메모리 프레임을 반환합니다."""
 
+    async def prepare_retry(
+        self, *, station_id: int, required_camera_ids: tuple[str, ...]
+    ) -> None:
+        """고정 sleep 없이 SDK buffer clear와 trigger 재무장을 완료합니다."""
 
-class UnimplementedCaptureBackend:
-    async def capture_station(self, **_kwargs) -> CaptureBatch:
-        raise NotImplementedError("HIKROBOT MVS GigE Action Command adapter is not implemented")
+    async def recover_station(
+        self, *, station_id: int, required_camera_ids: tuple[str, ...]
+    ) -> bool:
+        """재연결과 3회 시험 촬영을 수행하고 복구 성공 여부를 반환합니다."""
+
+    async def close(self) -> None:
+        """grabbing/handle/SDK 자원을 역순으로 안전하게 해제합니다."""
