@@ -10,7 +10,11 @@
 - `ImageReference`: camera raw/domain/정규화 ns와 동기화 여부, host arrival monotonic/wall 시각을 모두 보존합니다. skew는 host monotonic 필드만 사용합니다.
 - `VisionQueueState.ENQUEUE_BLOCKED`: 저장 실패가 아니라 bounded queue 포화 상태입니다.
 - `StationResult.result_revision`: 같은 station 결과의 append-only revision입니다.
+- `StationResult.score`: 유한한 `float32`만 허용합니다. 계산 불가 또는 `NaN`·`Inf`는
+  `StationInferenceFailed`로 보고하며, 잘못 전송된 비유한 score는 Master가
+  비전 결과 계약 위반과 `FORCED_NG`로 처리합니다.
 - `ProductResultLocked`: 이후 Vision 결과는 적용하지 않고 진단 로그만 남깁니다.
 - `LogPersistedAck.acked_log_ids`와 `acked_revisions`는 같은 index의 identity pair입니다.
 
-결정 필요 값: Sensor ID 체계, station/conveyor 실제 매핑, model score 의미·범위, camera timestamp domain 문자열 표준.
+결정 필요 값: Sensor ID 체계, station/conveyor 실제 매핑, 유한값 범위 안에서의
+model score 의미·정상 범위, camera timestamp domain 문자열 표준.

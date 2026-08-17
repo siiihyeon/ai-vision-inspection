@@ -184,6 +184,14 @@ class ProductContext:
         station = self.station(station_id)
         if station.position_command_id != position_command_id:
             raise ProductIdentityConflict("PositionSettled command identity mismatch")
+        # RELIABLE 재전송이나 Control 재발행으로 같은 정지 이벤트가 다시
+        # 도착해도 CAPTURE_REQUESTED 이후 상태를 뒤로 되돌리지 않습니다.
+        if station.position_settled:
+            return
+        if station.process_state != StationProcessState.POSITIONING:
+            raise ProductFlowError(
+                f"PositionSettled is not allowed from {station.process_state.value}"
+            )
         station.position_settled = True
         station.process_state = StationProcessState.POSITION_SETTLED
         self._touch()
@@ -512,9 +520,16 @@ class ProductContext:
 class SensorEventRegistry:
     """센서별 event_id와 sequence를 한 번만 수락합니다."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, event_capacity: int = 8192) -> None:
+        if event_capacity < 1:
+            raise ValueError("event_capacity must be positive")
         self._last_sequence: dict[str, int] = {}
-        self._event_digests: dict[str, str] = {}
+        self._event_digests: OrderedDict[str, str] = OrderedDict()
+        self._event_capacity = event_capacity
+
+    @property
+    def remembered_event_count(self) -> int:
+        return len(self._event_digests)
 
     def accept(
         self, sensor_id: str, event_id: str, sequence: int, digest: str
@@ -535,6 +550,8 @@ class SensorEventRegistry:
             if sequence != previous_sequence + 1:
                 return SensorEventOutcome.SEQUENCE_GAP
         self._event_digests[event_id] = digest
+        while len(self._event_digests) > self._event_capacity:
+            self._event_digests.popitem(last=False)
         self._last_sequence[sensor_id] = sequence
         return SensorEventOutcome.ACCEPTED
 
