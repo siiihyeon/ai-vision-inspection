@@ -4,9 +4,9 @@
 
 ## 현재 산출물의 성격
 
-이 저장소는 수정 레퍼런스를 반영한 **modified v2 팀 협업용 통신·공정 구현**입니다. Message/Service/Action, 상태 소유권, 멱등성, 파일경로 FIFO, SQLite commit/ACK 경계와 Master의 8개 공정 블록이 들어 있습니다. 실제 MVS SDK, Mega serial protocol/TB6600·액추에이터 adapter, 추론 모델은 아직 placeholder입니다. 따라서 지금 상태를 생산 장비에 연결하면 안 됩니다.
+이 저장소는 수정 레퍼런스를 반영한 **modified v2 팀 협업용 통신·공정 구현**입니다. Message/Service/Action, 상태 소유권, 멱등성, 파일경로 FIFO, SQLite commit/ACK 경계와 Master의 8개 공정 블록이 들어 있습니다. Vision에는 MVS Action Command/callback adapter, 원자 RGB 저장소, persistent Queue journal과 worker runtime이 구현되어 있습니다. 다만 Ubuntu용 MVS 실장비 검증, 실제 추론 모델, Mega serial protocol/TB6600·액추에이터 adapter는 아직 완료되지 않았습니다. 따라서 지금 상태를 생산 장비에 연결하면 안 됩니다.
 
-남은 값을 각 폴더 README의 `결정 필요` 표대로 확정해 전달하면, placeholder를 실제 장비 adapter와 추론 알고리즘으로 교체하고 통합 시험하는 단계로 진행할 수 있습니다.
+남은 값은 각 폴더 README의 결정표에 따라 확정합니다. Vision은 model plugin을 주입하고 MVS/GigE/GPU hardware acceptance를 통과해야 하며, Control은 실제 장비 adapter를 구현한 뒤 전체 통합 시험으로 진행합니다.
 
 ## 확정된 핵심 Workflow
 
@@ -61,12 +61,13 @@ cd ros2_ws
 source /opt/ros/jazzy/setup.bash
 python3 tools/verify_skeleton.py
 python3 tools/test_domain_contracts.py
+python3 tools/test_vision_node.py
 colcon build --symlink-install
 source install/setup.bash
 ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 ```
 
-`sim`도 카메라 fake adapter를 자동 생성하지 않습니다. 실제 capture 성공 시나리오는 Vision 담당자가 fake adapter test를 추가한 뒤 활성화합니다. `hardware`는 필수 설정과 adapter가 완성될 때까지 `INIT_BLOCKED`가 정상입니다.
+`sim`은 deterministic fake 카메라와 wiring 전용 fake model을 자동 사용합니다. 이는 통신·저장·Queue 시험용이며 판정 성능을 의미하지 않습니다. `hardware`는 미확정 카메라/시간/model 설정이 남아 있는 동안 `INIT_BLOCKED`가 정상입니다.
 
 ## 변경 금지 원칙
 

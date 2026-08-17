@@ -22,8 +22,8 @@
     master.station_a.position_offset_steps: 0
     master.station_b.position_offset_steps: 0
     master.position_tolerance_steps: 0
-    master.camera_ids.station_a: []
-    master.camera_ids.station_b: []
+    master.camera_ids.station_a: ["CAM_A_1", "CAM_A_2", "CAM_A_3"]
+    master.camera_ids.station_b: ["CAM_B_1"]
     master.action.position_timeout_ms: 10000
     master.action.capture_timeout_ms: 30000
     master.action.actuation_timeout_ms: 10000
@@ -50,18 +50,60 @@
   ros__parameters:
     comm.node_heartbeat_period_ms: 500
     vision.trigger.mode: "GIGE_ACTION_COMMAND"
-    vision.camera_ids.station_a: []
-    vision.camera_ids.station_b: []
-    vision.gige_action.device_key: 0
-    vision.gige_action.group_key: 0
-    vision.gige_action.group_mask: 0
+    vision.camera_ids.station_a: ["CAM_A_1", "CAM_A_2", "CAM_A_3"]
+    vision.camera_ids.station_b: ["CAM_B_1"]
+    vision.camera_serials.station_a: ["DA9880516", "", ""]
+    vision.camera_serials.station_b: [""]
+    vision.camera_ips.station_a: ["192.168.10.11", "192.168.10.12", "192.168.10.13"]
+    vision.camera_ips.station_b: ["192.168.10.14"]
+    vision.camera_macs.station_a: ["34:BD:20:8A:22:8A", "", ""]
+    vision.camera_macs.station_b: [""]
+    vision.camera.width: 2448
+    vision.camera.height: 2048
+    vision.camera.sdk_buffer_count: 8
+    vision.camera.frame_timeout_ms: 2000
+    vision.camera.timestamp_tick_hz: 0
+    vision.camera.ptp_enable_if_supported: true
+    vision.camera.ptp_stability_ms: 0
+    vision.camera.bayer_conversion_quality: 1
+    vision.camera.expected_model_name: "MV-CS050-10GC"
+    vision.camera.expected_firmware_version: "4.0.43"
+    vision.mvs.python_module_path: ""
+    vision.mvs.module_name: "MvCameraControl_class"
+    vision.mvs.expected_sdk_version: "5.0.2"
+    vision.mvs.expected_sdk_version_raw: 0
+    vision.gige_action.device_key: 324478056  # 0x13572468
+    vision.gige_action.station_a.group_key: 1
+    vision.gige_action.station_b.group_key: 2
+    vision.gige_action.group_mask: 4294967295  # 0xFFFFFFFF
+    vision.gige_action.broadcast_address: "255.255.255.255"
+    vision.gige_action.ack_timeout_ms: 200
+    vision.network.nic_ip: "192.168.10.10"
     vision.frame_arrival_skew_limit_us: 0
     vision.capture.max_attempts: 2
-    vision.queue.capacity: 0
-    vision.worker_count: 0
+    vision.queue.capacity: 16
+    vision.queue.warning_ratio: 0.75
+    vision.queue.resume_ratio: 0.50
+    vision.worker_count: 2
+    vision.worker.serialize_model_access: true
     vision.inference_queue_total_timeout_ms: 0
-    vision.data_root: ""
+    vision.data_root: "/var/lib/inspection/data"
+    vision.queue_journal_path: "/var/lib/inspection/spool/vision_queue.sqlite3"
+    vision.png_compression_level: 3
+    vision.storage.warning_used_percent: 80.0
+    vision.storage.pause_used_percent: 90.0
+    vision.storage.critical_used_percent: 95.0
+    vision.storage.warning_free_gb: 20
+    vision.storage.pause_free_gb: 10
+    vision.storage.critical_free_gb: 5
     vision.model.path: ""
+    vision.model.sha256: ""
+    vision.model.factory: ""
+    vision.model.device: "cuda:0"
+    vision.log.spool_path: "/var/lib/inspection/spool/vision_log.sqlite3"
+    vision.log.flush_period_ms: 1000
+    vision.recovery.max_reconnect_attempts: 3
+    vision.recovery.test_capture_count: 3
 
 /inspection/log_node:
   ros__parameters:
