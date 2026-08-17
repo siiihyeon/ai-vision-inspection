@@ -3,7 +3,7 @@ name: Static checks
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, "feature/**", "fix/**"]
 
 jobs:
   skeleton-contract:
@@ -21,3 +21,5 @@ jobs:
         run: python3 ros2_ws/tools/verify_skeleton.py
       - name: Test pure domain contracts
         run: python3 ros2_ws/tools/test_domain_contracts.py
+      - name: Test VisionNode domain and runtime contracts
+        run: python3 ros2_ws/tools/test_vision_node.py

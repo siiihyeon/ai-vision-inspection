@@ -125,6 +125,10 @@ REQUIRED_READMES = [
     SOURCE / "nodes" / "inspection_master" / "마스터노드_읽기가이드.md",
     SOURCE / "nodes" / "inspection_control" / "README.md",
     SOURCE / "nodes" / "inspection_vision" / "README.md",
+    SOURCE / "nodes" / "inspection_vision" / "코드 읽기 가이드.md",
+    SOURCE / "nodes" / "inspection_vision" / "실험_파라미터와_미결정사항.md",
+    SOURCE / "nodes" / "inspection_vision" / "MVS_실장비_검증절차.md",
+    SOURCE / "nodes" / "inspection_vision" / "검증결과.md",
     SOURCE / "nodes" / "inspection_log" / "README.md",
 ]
 
@@ -304,6 +308,11 @@ system_fsm = (SOURCE / "nodes" / "inspection_master" / "inspection_master" / "sy
 worker_supervision = (SOURCE / "nodes" / "inspection_master" / "inspection_master" / "worker_supervision.py").read_text(encoding="utf-8")
 operation_runtime = (SOURCE / "nodes" / "inspection_master" / "inspection_master" / "operation_runtime.py").read_text(encoding="utf-8")
 vision = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "vision_node.py").read_text(encoding="utf-8")
+vision_runtime = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "vision_runtime.py").read_text(encoding="utf-8")
+capture_service = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "capture_service.py").read_text(encoding="utf-8")
+artifact_store = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "artifact_store.py").read_text(encoding="utf-8")
+mvs_backend = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "mvs_backend.py").read_text(encoding="utf-8")
+queue_journal = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "queue_journal.py").read_text(encoding="utf-8")
 queue = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "inference_queue.py").read_text(encoding="utf-8")
 log_storage = (SOURCE / "nodes" / "inspection_log" / "inspection_log" / "storage.py").read_text(encoding="utf-8")
 for token in ("ProductResultReorderBuffer", "lock_product_at_sensor3", "StationInferenceFailed", "ENQUEUE_BLOCKED"):
@@ -361,8 +370,31 @@ require(
     "`SKELETON`" not in master_readme and "`PARTIAL`" not in master_readme,
     "Master README still reports incomplete implementation blocks",
 )
-for token in ("capture_id=request.capture_id", "vision.capture.max_attempts", "inference_queue.try_enqueue", "ENQUEUE_BLOCKED", "frame_arrival_skew_us", '"reason": ""'):
-    require(token in vision, f"Vision capture contract missing: {token}")
+vision_implementation = "\n".join(
+    (
+        vision,
+        vision_runtime,
+        capture_service,
+        artifact_store,
+        mvs_backend,
+        queue_journal,
+    )
+)
+for token in (
+    "capture_id=request.capture_id",
+    "vision.capture.max_attempts",
+    "try_enqueue",
+    "ENQUEUE_BLOCKED",
+    "frame_arrival_skew_us",
+    '"reason": ""',
+    "MV_GIGE_IssueActionCommand",
+    "MV_CC_RegisterImageCallBackEx",
+    "MV_CC_ConvertPixelTypeEx",
+    "_atomic_write",
+    "enqueue_committed",
+    "expected_sdk_version_raw",
+):
+    require(token in vision_implementation, f"Vision implementation contract missing: {token}")
 for token in ("deque", "queue_total_timeout_ms", "discard_expired", "_sweep_expired", "_load_with_one_retry", "_infer_with_one_retry", "_model_lock"):
     require(token in queue, f"Inference worker contract missing: {token}")
 for table in ("products_latest", "frame_batch_attempts", "inference_jobs_latest", "camera_result_revisions", "station_result_revisions", "faults", "pending_projections"):
