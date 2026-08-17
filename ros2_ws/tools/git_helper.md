@@ -12,9 +12,9 @@ cd ~/ai-vision-inspection
 
 ## 2. 작업 시작 전 main 최신화
 
-git status --short --branch
-
 ```bash
+git fetch origin
+git status --short --branch
 git switch main
 git pull origin main
 ```
