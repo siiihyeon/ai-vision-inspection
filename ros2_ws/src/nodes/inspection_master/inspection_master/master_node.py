@@ -479,6 +479,27 @@ class MasterNode(InspectionNodeBase):
         )
         self.get_logger().info("MasterNode v2 orchestration started")
 
+    def required_hardware_parameters(self) -> tuple[str, ...]:
+        return (
+            "master.sensor_ids.sensor_1",
+            "master.sensor_ids.sensor_2",
+            "master.sensor_ids.sensor_3",
+            "master.hardware_mapping_confirmed",
+            "master.station_a.position_offset_steps",
+            "master.station_b.position_offset_steps",
+            "master.position_tolerance_steps",
+            "master.camera_ids.station_a",
+            "master.camera_ids.station_b",
+            "master.action.position_timeout_ms",
+            "master.action.capture_timeout_ms",
+            "master.action.actuation_timeout_ms",
+            "master.action.conveyor_resume_timeout_ms",
+            "master.pause_stop_timeout_ms",
+            "master.shutdown_stop_timeout_ms",
+            "master.log_spool_path",
+            "master.completed_context_retention_ms",
+        )
+
     # region BLOCK 1 - 전체 시스템 FSM과 운전 명령
 
     def _handle_operator_command(
