@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,6 +35,7 @@ from inspection_interfaces.msg import (
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.parameter import Parameter
+from rclpy.task import Future
 
 from .capture_contract import (
     CaptureBackend,
@@ -96,6 +98,10 @@ class VisionNode(InspectionNodeBase):
         capacity = int(self.get_parameter("vision.queue.capacity").value)
         self.inference_queue = InferenceQueue(max(capacity, 1))
         self.worker_pool: WorkerPool | None = None
+        # 블로킹 호출을 executor 스레드 밖으로 넘기기 위한 전용 풀입니다.
+        self._blocking_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="vision-blocking"
+        )
         self.capture_backend = capture_backend or (
             FakeCaptureBackend(data_root=Path("/tmp/inspection/vision_fake"))
             if self.profile == "sim"
@@ -200,6 +206,32 @@ class VisionNode(InspectionNodeBase):
         # TODO(IMPLEMENTATION): MVS enumeration/configuration, Action1/PTP capability,
         # RGB PNG atomic storage, shared model load.
         return await super().initialize_node_resources()
+
+    def _run_blocking(self, fn, *args) -> Future:
+        """블로킹 호출을 스레드 풀에 넘기고 rclpy Future로 결과를 받습니다.
+
+        rclpy executor에는 asyncio 이벤트 루프가 없어 asyncio.to_thread를
+        쓸 수 없습니다. rclpy Future는 executor가 직접 깨우므로 await 시
+        executor 스레드가 정상 반납됩니다.
+        """
+
+        rclpy_future = Future()
+        pool_future = self._blocking_pool.submit(fn, *args)
+
+        def _relay(done_future) -> None:
+            try:
+                rclpy_future.set_result(done_future.result())
+            except Exception as exc:  # 호출부 await에서 다시 발생시킵니다.
+                rclpy_future.set_exception(exc)
+
+        pool_future.add_done_callback(_relay)
+        return rclpy_future
+
+    def destroy_node(self) -> bool:
+        """종료 시 블로킹 스레드 풀을 정리합니다."""
+
+        self._blocking_pool.shutdown(wait=False, cancel_futures=True)
+        return super().destroy_node()
 
     def _on_inference_success(self, job: InferenceJob, result) -> None:
         """추론 성공 결과를 StationResult로 포장해 발행합니다."""
@@ -423,7 +455,7 @@ class VisionNode(InspectionNodeBase):
                     "queue full",
                     batch.frame_batch_id,
                 )
-                await asyncio.to_thread(self.inference_queue.wait_for_space, 0.1)
+                await self._run_blocking(self.inference_queue.wait_for_space, 0.1)
 
             self._publish_queue_state(VisionQueueState.ACCEPTING, "")
             values = self._capture_success_values(batch, inference_job_id)
