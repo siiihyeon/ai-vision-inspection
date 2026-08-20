@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import rclpy
-from inspection_common import ErrorCode, NodeId, new_uuid, sha256_text
+from inspection_common import ErrorCode, NodeId, new_uuid
 from inspection_common.node_base import (
     InspectionNodeBase,
     NodeInitializationOutcome,
@@ -15,6 +14,7 @@ from inspection_common.node_base import (
 )
 from inspection_interfaces.msg import LogEvent, LogPersistedAck
 
+from .service import LogEventService
 from .storage import LogRepository, StoredLogEvent
 
 
@@ -30,6 +30,7 @@ class LogNode(InspectionNodeBase):
         self.declare_parameter("log.data_root", "/tmp/inspection")
         self.declare_parameter("log.retention_policy", "")
         self.repository: LogRepository | None = None
+        self.log_service: LogEventService | None = None
         self._event_subscription = self.create_subscription(
             LogEvent,
             "log/event",
@@ -87,6 +88,7 @@ class LogNode(InspectionNodeBase):
             )
         previous_repository = self.repository
         self.repository = replacement_repository
+        self.log_service = LogEventService(replacement_repository)
         if previous_repository is not None:
             try:
                 previous_repository.close()
@@ -106,13 +108,10 @@ class LogNode(InspectionNodeBase):
 
         if message.header.session_id != self.session_id:
             return
-        if self.repository is None:
+        if self.repository is None or self.log_service is None:
             self.get_logger().error("LogEvent received before SQLite initialization")
             return
         try:
-            json.loads(message.payload_json)
-            if sha256_text(message.payload_json) != message.payload_digest:
-                raise ValueError("payload_digest mismatch")
             event = StoredLogEvent(
                 log_id=message.log_id,
                 revision=message.revision,
@@ -128,7 +127,7 @@ class LogNode(InspectionNodeBase):
                     + message.occurred_at.nanosec
                 ),
             )
-            self.repository.append_event(event)
+            persisted = self.log_service.persist(event)
         except Exception as exc:
             self.get_logger().error(
                 f"LogEvent commit rejected for {message.log_id}: {type(exc).__name__}"
@@ -142,8 +141,8 @@ class LogNode(InspectionNodeBase):
         ack.header.correlation_id = message.header.message_id
         ack.producer_node = message.source_node
         ack.producer_instance_id = message.producer_instance_id
-        ack.acked_log_ids = [message.log_id]
-        ack.acked_revisions = [message.revision]
+        ack.acked_log_ids = [persisted.log_id]
+        ack.acked_revisions = [persisted.revision]
         ack.committed_at = ack.header.stamp
         self._ack_publisher.publish(ack)
 
@@ -151,6 +150,7 @@ class LogNode(InspectionNodeBase):
         if self.repository is not None:
             self.repository.close()
             self.repository = None
+            self.log_service = None
         super().destroy_node()
 
 
