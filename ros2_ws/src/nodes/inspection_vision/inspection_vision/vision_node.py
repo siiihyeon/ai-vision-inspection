@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from pathlib import Path
 
 import rclpy
@@ -12,6 +13,7 @@ from inspection_common import (
     IdempotencyStore,
     NodeId,
     SystemState,
+    Verdict,
     new_uuid,
 )
 from inspection_common.node_base import (
@@ -36,9 +38,31 @@ from rclpy.parameter import Parameter
 from .capture_contract import (
     CaptureBackend,
     CaptureBatch,
+    FakeCaptureBackend,
     UnimplementedCaptureBackend,
 )
-from .inference_queue import InferenceJob, InferenceQueue
+from .inference_queue import InferenceJob, InferenceQueue, WorkerPool
+
+
+@dataclass(frozen=True, slots=True)
+class _FakeInferenceResult:
+    """진짜 모델이 없을 때 파이프라인을 검증하기 위한 placeholder 결과."""
+
+    verdict: int = Verdict.PASS
+    score: float = 0.1
+    model_version: str = "fake-v0"
+
+
+def _fake_load_image(path: Path):
+    """진짜 이미지 로드 전, 파이프라인 검증용 placeholder."""
+
+    return path
+
+
+def _fake_infer(model, images: tuple):
+    """진짜 모델 추론 전, 파이프라인 검증용 placeholder."""
+
+    return _FakeInferenceResult()
 
 
 class VisionNode(InspectionNodeBase):
@@ -71,7 +95,12 @@ class VisionNode(InspectionNodeBase):
 
         capacity = int(self.get_parameter("vision.queue.capacity").value)
         self.inference_queue = InferenceQueue(max(capacity, 1))
-        self.capture_backend = capture_backend or UnimplementedCaptureBackend()
+        self.worker_pool: WorkerPool | None = None
+        self.capture_backend = capture_backend or (
+            FakeCaptureBackend(data_root=Path("/tmp/inspection/vision_fake"))
+            if self.profile == "sim"
+            else UnimplementedCaptureBackend()
+        )
         self._capture_results: IdempotencyStore[dict[str, object]] = IdempotencyStore()
         self._capture_identities: dict[str, tuple[str, int]] = {}
         self._completed_captures: dict[
@@ -156,9 +185,62 @@ class VisionNode(InspectionNodeBase):
         return list(dict.fromkeys(missing))
 
     async def initialize_node_resources(self) -> NodeInitializationOutcome:
+        if self.worker_pool is None:
+            worker_count = int(self.get_parameter("vision.worker_count").value)
+            self.worker_pool = WorkerPool(
+                queue=self.inference_queue,
+                model=None,
+                worker_count=max(worker_count, 1),
+                load_image=_fake_load_image,
+                infer=_fake_infer,
+                on_success=self._on_inference_success,
+                on_failure=self._on_inference_failure,
+            )
+            self.worker_pool.start()
         # TODO(IMPLEMENTATION): MVS enumeration/configuration, Action1/PTP capability,
-        # RGB PNG atomic storage, shared model load and WorkerPool.start().
+        # RGB PNG atomic storage, shared model load.
         return await super().initialize_node_resources()
+
+    def _on_inference_success(self, job: InferenceJob, result) -> None:
+        """추론 성공 결과를 StationResult로 포장해 발행합니다."""
+
+        message = StationResult()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.session_id = self.session_id
+        message.header.message_id = new_uuid()
+        message.header.correlation_id = job.capture_id
+        message.product_id = job.product_id
+        message.fifo_sequence = job.fifo_sequence
+        message.station_id = job.station_id
+        message.capture_id = job.capture_id
+        message.frame_batch_id = job.frame_batch_id
+        message.inference_job_id = job.inference_job_id
+        message.result_revision = 1
+        message.verdict = int(result.verdict)
+        message.score = result.score
+        message.model_version = result.model_version
+        message.completed_at = message.header.stamp
+        self._station_result_publisher.publish(message)
+
+    def _on_inference_failure(self, job: InferenceJob, reason: str) -> None:
+        """추론 실패를 StationInferenceFailed로 포장해 발행합니다."""
+
+        message = StationInferenceFailed()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.session_id = self.session_id
+        message.header.message_id = new_uuid()
+        message.header.correlation_id = job.capture_id
+        message.product_id = job.product_id
+        message.fifo_sequence = job.fifo_sequence
+        message.station_id = job.station_id
+        message.capture_id = job.capture_id
+        message.frame_batch_id = job.frame_batch_id
+        message.inference_job_id = job.inference_job_id
+        message.result_revision = 1
+        message.error_code = int(ErrorCode.INFERENCE_FAILED)
+        message.reason = reason
+        message.failed_at = message.header.stamp
+        self._station_failure_publisher.publish(message)
 
     def _accept_capture_goal(self, goal_request) -> GoalResponse:
         cameras = tuple(goal_request.required_camera_ids)
@@ -417,7 +499,8 @@ class VisionNode(InspectionNodeBase):
                     0.75,
                     "validating host-arrival skew and saved RGB PNG files",
                 )
-                await asyncio.to_thread(batch.validate, required)
+                # rclpy executor에는 asyncio 이벤트 루프가 없어 to_thread를 쓸 수 없습니다.
+                batch.validate(required)
                 if skew_limit > 0 and batch.frame_arrival_skew_us > skew_limit:
                     attempt_error = ErrorCode.CAPTURE_SKEW_EXCEEDED
                     raise ValueError("frame_arrival_skew_us exceeded configured limit")

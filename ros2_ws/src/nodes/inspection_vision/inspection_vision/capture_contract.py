@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import time
+import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -148,3 +150,85 @@ class CaptureBackend(Protocol):
 class UnimplementedCaptureBackend:
     async def capture_station(self, **_kwargs) -> CaptureBatch:
         raise NotImplementedError("HIKROBOT MVS GigE Action Command adapter is not implemented")
+
+
+def _write_fake_rgb8_png(path: Path, width: int, height: int) -> None:
+    """검증용 최소 크기의 단색 RGB8 PNG를 실제로 디스크에 씁니다."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    scanlines = bytearray()
+    for _ in range(height):
+        scanlines.append(0)  # PNG filter type: None
+        scanlines.extend(bytes([200, 200, 200]) * width)
+    compressed = zlib.compress(bytes(scanlines))
+
+    def chunk(chunk_type: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + chunk_type
+            + data
+            + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    content = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", compressed)
+        + chunk(b"IEND", b"")
+    )
+    path.write_bytes(content)
+
+
+class FakeCaptureBackend:
+    """실제 카메라 없이 파이프라인 전체를 검증하기 위한 sim 전용 백엔드."""
+
+    def __init__(self, *, data_root: Path) -> None:
+        self._data_root = data_root
+
+    async def capture_station(
+        self,
+        *,
+        product_id: str,
+        station_id: int,
+        capture_id: str,
+        attempt: int,
+        required_camera_ids: tuple[str, ...],
+    ) -> CaptureBatch:
+        now_ns = time.monotonic_ns()
+        wall_ns = time.time_ns()
+        images = []
+        for camera_id in required_camera_ids:
+            width, height = 64, 48
+            path = self._data_root / f"{capture_id}_{camera_id}_{attempt}.png"
+            _write_fake_rgb8_png(path, width, height)
+            content = path.read_bytes()
+            images.append(
+                ImageArtifact(
+                    camera_id=camera_id,
+                    file_path=str(path),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                    file_size_bytes=len(content),
+                    width=width,
+                    height=height,
+                    pixel_format="RGB8_PNG",
+                    camera_timestamp_raw=wall_ns,
+                    camera_timestamp_domain="fake",
+                    camera_timestamp_ns=wall_ns,
+                    camera_timestamp_synchronized=False,
+                    host_arrival_monotonic_ns=now_ns,
+                    host_arrival_timestamp_ns=wall_ns,
+                )
+            )
+        return CaptureBatch(
+            product_id=product_id,
+            station_id=station_id,
+            capture_id=capture_id,
+            frame_batch_id=uuid.uuid4().hex,
+            attempt=attempt,
+            trigger_requested_monotonic_ns=now_ns,
+            trigger_returned_monotonic_ns=now_ns + 1,
+            trigger_requested_wall_time_ns=wall_ns,
+            trigger_returned_wall_time_ns=wall_ns + 1,
+            images=tuple(images),
+        )
