@@ -2435,7 +2435,20 @@ class MasterNode(InspectionNodeBase):
 
         match decision.outcome:
             case StationMessageOutcome.INVALID_STATION_ID:
-                self._fault_stop("station result contains an invalid station_id")
+                # station_id를 신뢰할 수 없어 어느 station 결과인지 특정할 수
+                # 없습니다. 제품 식별자와 FIFO는 온전하므로 라인을 세우지 않고
+                # 이 메시지만 버리며, 해당 station 결과가 비어 Sensor3에서
+                # FORCED_NG로 잠깁니다. 원인은 SQLite에 남깁니다.
+                self._emit_log_event(
+                    severity=LogEvent.ERROR,
+                    event_type="INVALID_STATION_ID_RESULT_IGNORED",
+                    product_id=message.product_id,
+                    payload={
+                        "station_id_raw": int(message.station_id),
+                        "capture_id": message.capture_id,
+                        "fifo_sequence": int(message.fifo_sequence),
+                    },
+                )
 
             case StationMessageOutcome.EXPIRED_PRODUCT:
                 self._emit_log_event(
@@ -2600,23 +2613,20 @@ class MasterNode(InspectionNodeBase):
 
         match decision.outcome:
             case StationMessageOutcome.INVALID_STATION_ID:
-                # TODO(REFACTOR): result는 _fault_stop, failure는 ROS 로그만
-                # 남기는 비대칭입니다. 다음 커밋에서 무시 + SQLite 기록으로
-                # 통일합니다.
-                self.get_logger().error(
-                    "station failure contains an invalid station_id"
+                # station_id를 신뢰할 수 없어 어느 station 결과인지 특정할 수
+                # 없습니다. 제품 식별자와 FIFO는 온전하므로 라인을 세우지 않고
+                # 이 메시지만 버리며, 해당 station 결과가 비어 Sensor3에서
+                # FORCED_NG로 잠깁니다. 원인은 SQLite에 남깁니다.
+                self._emit_log_event(
+                    severity=LogEvent.ERROR,
+                    event_type="INVALID_STATION_ID_FAILURE_IGNORED",
+                    product_id=message.product_id,
+                    payload={
+                        "station_id_raw": int(message.station_id),
+                        "capture_id": message.capture_id,
+                        "fifo_sequence": int(message.fifo_sequence),
+                    },
                 )
-
-            case (
-                StationMessageOutcome.CAPTURE_OWNER_CONFLICT
-                | StationMessageOutcome.UNKNOWN_PRODUCT
-            ):
-                # TODO(REFACTOR): result는 capture owner 유무를 구분해 두 가지
-                # 사유를 남깁니다. 다음 커밋에서 동일하게 맞춥니다.
-                self._fault_stop("station failure references unknown product identity")
-
-            case StationMessageOutcome.UNREGISTERED_CAPTURE:
-                self._fault_stop("station failure capture identity is not registered")
 
             case StationMessageOutcome.EXPIRED_PRODUCT:
                 self._emit_log_event(
@@ -2625,6 +2635,17 @@ class MasterNode(InspectionNodeBase):
                     product_id=message.product_id,
                     payload={"capture_id": message.capture_id},
                 )
+
+            case StationMessageOutcome.CAPTURE_OWNER_CONFLICT:
+                self._fault_stop(
+                    "station failure product identity conflicts with capture owner"
+                )
+
+            case StationMessageOutcome.UNKNOWN_PRODUCT:
+                self._fault_stop("station failure references unknown product identity")
+
+            case StationMessageOutcome.UNREGISTERED_CAPTURE:
+                self._fault_stop("station failure capture identity is not registered")
 
             case StationMessageOutcome.REMOVED_PRODUCT:
                 self._emit_log_event(
