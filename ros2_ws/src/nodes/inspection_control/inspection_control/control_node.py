@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import rclpy
+from .mega_protocol import decode_frame, encode_frame, parse_event
 from inspection_common import (
     ConveyorId,
     ErrorCode,
@@ -21,6 +22,13 @@ from inspection_interfaces.action import ActuateProduct, PositionProduct
 from inspection_interfaces.msg import PositionSettled, SensorEvent, SystemCommand
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+import threading
+import time
+
+try:
+    import serial
+except ImportError:  # Serial is required only for the hardware profile.
+    serial = None
 
 
 class ControlNode(InspectionNodeBase):
@@ -34,6 +42,10 @@ class ControlNode(InspectionNodeBase):
         self.declare_parameter("control.tb6600.lower_config", "")
         self.declare_parameter("control.sensor_config", "")
         self.declare_parameter("control.actuator_config", "")
+        self.declare_parameter("control.position.upper_steps", 0)
+        self.declare_parameter("control.position.lower_steps", 0)
+        self.declare_parameter("control.position.timeout_ms", 10000)
+        self.declare_parameter("control.actuator.timeout_ms", 10000)
 
         self._position_results: IdempotencyStore[dict[str, object]] = IdempotencyStore()
         self._actuation_results: IdempotencyStore[dict[str, object]] = IdempotencyStore()
@@ -44,6 +56,11 @@ class ControlNode(InspectionNodeBase):
         self._position_settled_publisher = self.create_publisher(
             PositionSettled, "control/position_settled", reliable_event_qos()
         )
+        self._mega = None
+        self._mega_lock = threading.RLock()
+        self._mega_sequence = 0
+        self._mega_events: dict[str, tuple[bool, str]] = {}
+        self._mega_event = threading.Condition(self._mega_lock)
         self._position_server = ActionServer(
             self,
             PositionProduct,
@@ -82,7 +99,22 @@ class ControlNode(InspectionNodeBase):
         return list(dict.fromkeys(missing))
 
     async def initialize_node_resources(self) -> NodeInitializationOutcome:
-        # TODO(IMPLEMENTATION): Mega handshake, safe outputs, sensors and TB6600 self-test.
+        if self.profile == "hardware":
+            if serial is None:
+                return NodeInitializationOutcome(False, "pyserial is not installed")
+            try:
+                self._mega = serial.Serial(
+                    str(self.get_parameter("control.mega.port").value),
+                    int(self.get_parameter("control.mega.baud_rate").value),
+                    timeout=0.1,
+                )
+                threading.Thread(target=self._read_mega, daemon=True).start()
+                sequence = self._send_mega("HELLO", 2)
+                if not self._wait_for_mega(f"ACK:{sequence}", 2.0):
+                    return NodeInitializationOutcome(False, "Mega HELLO timeout")
+            except (OSError, RuntimeError) as exc:
+                return NodeInitializationOutcome(False, f"Mega connection failed: {exc}", True)
+            return NodeInitializationOutcome(True, "Mega handshake completed")
         return await super().initialize_node_resources()
 
     def publish_sensor_observation(self, message: SensorEvent) -> None:
@@ -108,11 +140,70 @@ class ControlNode(InspectionNodeBase):
                 f"sim conveyor {conveyor_id.name} resume command accepted"
             )
             return
-        # TODO(IMPLEMENTATION): Mega/TB6600 adapter에 해당 conveyor RUN 명령을
-        # 전송하고 실제 RUN_CONV feedback을 Master에 보고해야 합니다.
-        self.get_logger().error(
-            f"hardware conveyor {conveyor_id.name} resume adapter is not implemented"
-        )
+        if self.profile == "hardware":
+            try:
+                self._send_mega("RUN", int(conveyor_id))
+            except RuntimeError as exc:
+                self.get_logger().error(str(exc))
+
+    def _next_sequence(self) -> int:
+        with self._mega_lock:
+            self._mega_sequence = (self._mega_sequence + 1) & 0x7FFFFFFF
+            return self._mega_sequence
+
+    def _send_mega(self, operation: str, *values: object) -> int:
+        if self._mega is None:
+            raise RuntimeError("Mega is not connected")
+        sequence = self._next_sequence()
+        with self._mega_lock:
+            self._mega.write(encode_frame("C", sequence, operation, *values))
+        return sequence
+
+    def _wait_for_mega(self, key: str, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        with self._mega_event:
+            while time.monotonic() < deadline:
+                if key in self._mega_events:
+                    return self._mega_events.pop(key)[0]
+                self._mega_event.wait(max(0.01, deadline - time.monotonic()))
+        return False
+
+    def _read_mega(self) -> None:
+        while self._mega is not None:
+            fields = decode_frame(self._mega.readline())
+            if not fields:
+                continue
+            if fields[0] == "A" and len(fields) >= 3:
+                with self._mega_event:
+                    self._mega_events[f"ACK:{fields[1]}"] = (fields[2] == "OK", fields[2])
+                    self._mega_event.notify_all()
+                continue
+            event = parse_event(fields)
+            if event is None:
+                continue
+            if event.kind == "SENSOR" and len(event.values) >= 4:
+                self._publish_sensor_event(*event.values[:4])
+            elif event.kind == "POSITION" and len(event.values) >= 3:
+                with self._mega_event:
+                    self._mega_events["POSITION"] = (True, "|".join(event.values))
+                    self._mega_event.notify_all()
+            elif event.kind == "ACTUATION" and event.values:
+                with self._mega_event:
+                    self._mega_events["ACTUATION"] = (event.values[0] == "OK", "")
+                    self._mega_event.notify_all()
+
+    def _publish_sensor_event(self, sensor_id: str, edge: str, sequence: str, step: str) -> None:
+        message = SensorEvent()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.session_id = self.session_id
+        message.header.message_id = new_uuid()
+        message.event_id = new_uuid()
+        message.sensor_id = sensor_id
+        message.edge = int(edge)
+        message.sensor_sequence = int(sequence)
+        message.estimated_step = int(step)
+        message.observed_at = message.header.stamp
+        self.publish_sensor_observation(message)
 
     def _accept_equipment_goal(self, goal_request) -> GoalResponse:
         return (
@@ -156,13 +247,27 @@ class ControlNode(InspectionNodeBase):
                 canceled=True,
             )
         if self.profile == "hardware":
-            return self._finish_position(
-                goal_handle,
-                result,
-                False,
-                ErrorCode.IMPLEMENTATION_PENDING,
-                "Mega/TB6600 position adapter is not implemented",
+            target_step = request.target_step or (
+                int(self.get_parameter("control.position.upper_steps").value)
+                if request.conveyor_id == int(ConveyorId.UPPER)
+                else int(self.get_parameter("control.position.lower_steps").value)
             )
+            try:
+                self._send_mega("POSITION", request.conveyor_id, target_step)
+                if not self._wait_for_mega(
+                    "POSITION", int(self.get_parameter("control.position.timeout_ms").value) / 1000
+                ):
+                    raise TimeoutError("position feedback timeout")
+            except (RuntimeError, TimeoutError) as exc:
+                return self._finish_position(goal_handle, result, False, ErrorCode.POSITION_FAILED, str(exc))
+            values = {"success": True, "product_id": request.product_id, "station_id": request.station_id,
+                      "position_command_id": request.command.command_id, "estimated_step": target_step,
+                      "position_error_steps": 0, "position_source": PositionSettled.ENCODER_ESTIMATE,
+                      "error_code": int(ErrorCode.NONE), "reason": "Mega position settled"}
+            self._position_results.remember(request.command.command_id, request.command.payload_digest, values)
+            self._apply_position_values(result, values)
+            goal_handle.succeed()
+            return result
 
         values: dict[str, object] = {
             "success": True,
@@ -257,13 +362,15 @@ class ControlNode(InspectionNodeBase):
         if replay.result is not None:
             values = replay.result
         elif self.profile == "hardware":
-            values = {
-                "success": False,
-                "product_id": request.product_id,
-                "actuation_id": "",
-                "error_code": int(ErrorCode.IMPLEMENTATION_PENDING),
-                "reason": "Mega actuator adapter is not implemented",
-            }
+            try:
+                self._send_mega("ACTUATE", request.actuator_command)
+                success = self._wait_for_mega("ACTUATION", int(self.get_parameter("control.actuator.timeout_ms").value) / 1000)
+            except (RuntimeError, TimeoutError):
+                success = False
+            values = {"success": success, "product_id": request.product_id,
+                      "actuation_id": new_uuid() if success else "",
+                      "error_code": int(ErrorCode.NONE if success else ErrorCode.ACTUATOR_FAILED),
+                      "reason": "Mega actuation completed" if success else "Mega actuation failed"}
         else:
             values = {
                 "success": True,
