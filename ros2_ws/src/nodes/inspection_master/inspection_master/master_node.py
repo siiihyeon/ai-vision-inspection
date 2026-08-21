@@ -1706,10 +1706,8 @@ class MasterNode(InspectionNodeBase):
                     pause_reason=PauseReason.DEVICE_RECOVERY_MANUAL,
                 )
             return
-        if self.system_state == SystemState.RUN_SYS:
-            self._start_station_cycle(product_id, fifo_sequence, StationId.A)
-        else:
-            self._deferred_station_starts.add((product_id, StationId.A))
+        # RUN_SYS가 아니면 _start_station_cycle이 스스로 대기 목록에 넣습니다.
+        self._start_station_cycle(product_id, fifo_sequence, StationId.A)
 
     def _handle_sensor2_entry(self, message: SensorEvent) -> None:
         """뒤집기 완료 제품을 Station B 대기 제품과 매핑합니다."""
@@ -1729,12 +1727,10 @@ class MasterNode(InspectionNodeBase):
             product_id=context.product_id,
             payload=context.snapshot(),
         )
-        if self.system_state == SystemState.RUN_SYS:
-            self._start_station_cycle(
-                context.product_id, context.fifo_sequence, StationId.B
-            )
-        else:
-            self._deferred_station_starts.add((context.product_id, StationId.B))
+        # RUN_SYS가 아니면 _start_station_cycle이 스스로 대기 목록에 넣습니다.
+        self._start_station_cycle(
+            context.product_id, context.fifo_sequence, StationId.B
+        )
 
     def _handle_sensor3_entry(self, message: SensorEvent) -> None:
         """분류 지점 제품을 매핑하고 판정 잠금·액추에이터 블록으로 넘깁니다."""
