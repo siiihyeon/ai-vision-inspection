@@ -1606,18 +1606,6 @@ class MasterNode(InspectionNodeBase):
 
     # region BLOCK 3 - 단일 물리 FIFO와 Sensor1/2/3 매핑
 
-    def register_product(self, product_id: str, fifo_sequence: int) -> None:
-        """제품 원장과 활성 FIFO에 같은 identity를 원자적으로 등록합니다."""
-
-        with self._flow_lock:
-            context = self.ledger.register(product_id, fifo_sequence)
-        self._emit_log_event(
-            severity=LogEvent.INFO,
-            event_type="PRODUCT_REGISTERED",
-            product_id=product_id,
-            payload=context.snapshot(),
-        )
-
     def _handle_sensor_event(self, message: SensorEvent) -> None:
         """Control이 정제한 센서 이벤트를 Sensor1/2/3 블록으로 전달합니다."""
 
@@ -2683,18 +2671,6 @@ class MasterNode(InspectionNodeBase):
     # endregion
 
     # region BLOCK 6 - Sensor3 액추에이터 분류와 FIFO 제거
-
-    def lock_product_at_sensor3(
-        self, product_id: str, fifo_sequence: int, sensor3_event_id: str
-    ) -> None:
-        """물리 FIFO 추적기가 Sensor3 이벤트를 제품에 매핑한 뒤 호출합니다."""
-
-        context = self.ledger.get(product_id, fifo_sequence)
-        if context is None:
-            raise KeyError("Sensor3 mapping references unknown product")
-        locked = context.lock_at_sensor3(sensor3_event_id)
-        self._accept_locked(locked)
-        self._schedule_actuation(locked)
 
     def _schedule_actuation(self, locked: LockedProduct) -> None:
         """Sensor3에 매핑된 잠금 판정을 실제 분류 명령으로 변환합니다."""
