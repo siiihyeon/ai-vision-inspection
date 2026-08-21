@@ -78,8 +78,13 @@ from .product_flow import (
     ProductResultReorderBuffer,
     SensorEventOutcome,
     SensorEventRegistry,
+    StationContractDefect,
     StationDecision,
+    StationMessageDecision,
+    StationMessageFacts,
+    StationMessageOutcome,
     StationResultConflict,
+    classify_station_message,
 )
 from .system_fsm import (
     InvalidSystemTransition,
@@ -1606,18 +1611,6 @@ class MasterNode(InspectionNodeBase):
 
     # region BLOCK 3 - 단일 물리 FIFO와 Sensor1/2/3 매핑
 
-    def register_product(self, product_id: str, fifo_sequence: int) -> None:
-        """제품 원장과 활성 FIFO에 같은 identity를 원자적으로 등록합니다."""
-
-        with self._flow_lock:
-            context = self.ledger.register(product_id, fifo_sequence)
-        self._emit_log_event(
-            severity=LogEvent.INFO,
-            event_type="PRODUCT_REGISTERED",
-            product_id=product_id,
-            payload=context.snapshot(),
-        )
-
     def _handle_sensor_event(self, message: SensorEvent) -> None:
         """Control이 정제한 센서 이벤트를 Sensor1/2/3 블록으로 전달합니다."""
 
@@ -1706,10 +1699,8 @@ class MasterNode(InspectionNodeBase):
                     pause_reason=PauseReason.DEVICE_RECOVERY_MANUAL,
                 )
             return
-        if self.system_state == SystemState.RUN_SYS:
-            self._start_station_cycle(product_id, fifo_sequence, StationId.A)
-        else:
-            self._deferred_station_starts.add((product_id, StationId.A))
+        # RUN_SYS가 아니면 _start_station_cycle이 스스로 대기 목록에 넣습니다.
+        self._start_station_cycle(product_id, fifo_sequence, StationId.A)
 
     def _handle_sensor2_entry(self, message: SensorEvent) -> None:
         """뒤집기 완료 제품을 Station B 대기 제품과 매핑합니다."""
@@ -1729,12 +1720,10 @@ class MasterNode(InspectionNodeBase):
             product_id=context.product_id,
             payload=context.snapshot(),
         )
-        if self.system_state == SystemState.RUN_SYS:
-            self._start_station_cycle(
-                context.product_id, context.fifo_sequence, StationId.B
-            )
-        else:
-            self._deferred_station_starts.add((context.product_id, StationId.B))
+        # RUN_SYS가 아니면 _start_station_cycle이 스스로 대기 목록에 넣습니다.
+        self._start_station_cycle(
+            context.product_id, context.fifo_sequence, StationId.B
+        )
 
     def _handle_sensor3_entry(self, message: SensorEvent) -> None:
         """분류 지점 제품을 매핑하고 판정 잠금·액추에이터 블록으로 넘깁니다."""
@@ -2426,103 +2415,127 @@ class MasterNode(InspectionNodeBase):
             },
         ):
             return
-        try:
-            station_id = StationId(message.station_id)
-        except ValueError:
-            self._fault_stop("station result contains an invalid station_id")
-            return
-        try:
-            verdict = Verdict(message.verdict)
-        except ValueError:
-            verdict = None
-        context = self.ledger.get(message.product_id, message.fifo_sequence)
-        if context is None:
-            if self.ledger.is_retired_product(
-                message.product_id, message.fifo_sequence
-            ) or self.ledger.is_retired_capture(message.capture_id):
+        decision = classify_station_message(
+            self.ledger,
+            StationMessageFacts(
+                product_id=message.product_id,
+                fifo_sequence=int(message.fifo_sequence),
+                station_id_raw=int(message.station_id),
+                capture_id=message.capture_id,
+                frame_batch_id=message.frame_batch_id,
+                inference_job_id=message.inference_job_id,
+                result_revision=int(message.result_revision),
+                verdict_raw=int(message.verdict),
+                score=score,
+            ),
+            expects_verdict=True,
+        )
+        context = decision.context
+        station_id = decision.station_id
+
+        match decision.outcome:
+            case StationMessageOutcome.INVALID_STATION_ID:
+                # station_id를 신뢰할 수 없어 어느 station 결과인지 특정할 수
+                # 없습니다. 제품 식별자와 FIFO는 온전하므로 라인을 세우지 않고
+                # 이 메시지만 버리며, 해당 station 결과가 비어 Sensor3에서
+                # FORCED_NG로 잠깁니다. 원인은 SQLite에 남깁니다.
+                self._emit_log_event(
+                    severity=LogEvent.ERROR,
+                    event_type="INVALID_STATION_ID_RESULT_IGNORED",
+                    product_id=message.product_id,
+                    payload={
+                        "station_id_raw": int(message.station_id),
+                        "capture_id": message.capture_id,
+                        "fifo_sequence": int(message.fifo_sequence),
+                    },
+                )
+
+            case StationMessageOutcome.EXPIRED_PRODUCT:
                 self._emit_log_event(
                     severity=LogEvent.WARNING,
                     event_type="EXPIRED_PRODUCT_RESULT_IGNORED",
                     product_id=message.product_id,
                     payload={"capture_id": message.capture_id},
                 )
-                return
-            owner = self.ledger.capture_owner(message.capture_id)
-            if owner is not None:
+
+            case StationMessageOutcome.CAPTURE_OWNER_CONFLICT:
                 self._fault_stop(
                     "station result product identity conflicts with capture owner"
                 )
-            else:
+
+            case StationMessageOutcome.UNKNOWN_PRODUCT:
                 self._fault_stop("station result references unknown product identity")
-            return
-        owner = self.ledger.capture_owner(message.capture_id)
-        if owner != (context.product_id, station_id):
-            self._fault_stop("station result capture identity is not registered")
-            return
-        if context.removed:
-            self._emit_log_event(
-                severity=LogEvent.WARNING,
-                event_type="REMOVED_PRODUCT_RESULT_IGNORED",
-                product_id=context.product_id,
-                payload={"capture_id": message.capture_id},
-            )
-            return
-        if context.station(station_id).capture_id != message.capture_id:
-            # 장치 복구 중 이전 capture를 폐기하고 새 capture_id로
-            # 재시작했다면 이전 작업의 늦은 결과는 물리 상태를 바꾸지 않습니다.
-            self._emit_log_event(
-                severity=LogEvent.WARNING,
-                event_type="SUPERSEDED_STATION_RESULT_IGNORED",
-                product_id=context.product_id,
-                payload={
-                    "station_id": station_id.name,
-                    "capture_id": message.capture_id,
-                    "active_capture_id": context.station(station_id).capture_id,
-                },
-            )
-            return
-        if context.locked is not None:
-            self._emit_log_event(
-                severity=LogEvent.WARNING,
-                event_type="LATE_STATION_RESULT_IGNORED",
-                product_id=context.product_id,
-                payload={
-                    "station_id": station_id.name,
-                    "capture_id": message.capture_id,
-                    "result_revision": int(message.result_revision),
-                    "locked_verdict": context.locked.verdict.name,
-                },
-            )
-            return
-        if (
-            verdict is None
-            or score is None
-            or int(message.result_revision) < 1
-            or not message.frame_batch_id
-            or not message.inference_job_id
-        ):
-            reason = (
-                "station result score must be finite"
-                if score is None
-                else "station result payload is invalid or incomplete"
-            )
-            with self._flow_lock:
-                context.record_station_contract_failure(station_id, reason)
-            self._emit_log_event(
-                severity=LogEvent.ERROR,
-                event_type="VISION_RESULT_CONTRACT_FORCED_NG",
-                product_id=context.product_id,
-                payload={
-                    **context.snapshot(),
-                    "station_id": station_id.name,
-                    "capture_id": message.capture_id,
-                    "reason": reason,
-                },
-            )
-            return
-        decision = StationDecision(
-            station_id=station_id,
-            verdict=verdict,
+
+            case StationMessageOutcome.UNREGISTERED_CAPTURE:
+                self._fault_stop("station result capture identity is not registered")
+
+            case StationMessageOutcome.REMOVED_PRODUCT:
+                self._emit_log_event(
+                    severity=LogEvent.WARNING,
+                    event_type="REMOVED_PRODUCT_RESULT_IGNORED",
+                    product_id=context.product_id,
+                    payload={"capture_id": message.capture_id},
+                )
+
+            case StationMessageOutcome.SUPERSEDED_CAPTURE:
+                # 장치 복구 중 이전 capture를 폐기하고 새 capture_id로
+                # 재시작했다면 이전 작업의 늦은 결과는 물리 상태를 바꾸지 않습니다.
+                self._emit_log_event(
+                    severity=LogEvent.WARNING,
+                    event_type="SUPERSEDED_STATION_RESULT_IGNORED",
+                    product_id=context.product_id,
+                    payload={
+                        "station_id": station_id.name,
+                        "capture_id": message.capture_id,
+                        "active_capture_id": decision.active_capture_id,
+                    },
+                )
+
+            case StationMessageOutcome.LATE_AFTER_LOCK:
+                self._emit_log_event(
+                    severity=LogEvent.WARNING,
+                    event_type="LATE_STATION_RESULT_IGNORED",
+                    product_id=context.product_id,
+                    payload={
+                        "station_id": station_id.name,
+                        "capture_id": message.capture_id,
+                        "result_revision": int(message.result_revision),
+                        "locked_verdict": context.locked.verdict.name,
+                    },
+                )
+
+            case StationMessageOutcome.CONTRACT_INCOMPLETE:
+                reason = (
+                    "station result score must be finite"
+                    if decision.defect is StationContractDefect.SCORE_NOT_FINITE
+                    else "station result payload is invalid or incomplete"
+                )
+                with self._flow_lock:
+                    context.record_station_contract_failure(station_id, reason)
+                self._emit_log_event(
+                    severity=LogEvent.ERROR,
+                    event_type="VISION_RESULT_CONTRACT_FORCED_NG",
+                    product_id=context.product_id,
+                    payload={
+                        **context.snapshot(),
+                        "station_id": station_id.name,
+                        "capture_id": message.capture_id,
+                        "reason": reason,
+                    },
+                )
+
+            case StationMessageOutcome.ACCEPTED:
+                self._apply_accepted_station_result(message, decision)
+
+    def _apply_accepted_station_result(
+        self, message: StationResult, decision: StationMessageDecision
+    ) -> None:
+        """가드를 통과한 station result를 제품 원장에 반영합니다."""
+
+        context = decision.context
+        station_decision = StationDecision(
+            station_id=decision.station_id,
+            verdict=decision.verdict,
             revision=message.result_revision,
             capture_id=message.capture_id,
             inference_job_id=message.inference_job_id,
@@ -2530,7 +2543,7 @@ class MasterNode(InspectionNodeBase):
         )
         try:
             with self._flow_lock:
-                if not context.apply_station_result(decision):
+                if not context.apply_station_result(station_decision):
                     return
         except StationResultConflict as exc:
             # 같은 제품·station·capture의 결과값만 충돌한 경우에는 두 결과를
@@ -2541,8 +2554,8 @@ class MasterNode(InspectionNodeBase):
                 product_id=context.product_id,
                 payload={
                     **context.snapshot(),
-                    "station_id": decision.station_id.name,
-                    "capture_id": decision.capture_id,
+                    "station_id": station_decision.station_id.name,
+                    "capture_id": station_decision.capture_id,
                     "reason": str(exc),
                 },
             )
@@ -2556,9 +2569,9 @@ class MasterNode(InspectionNodeBase):
             product_id=context.product_id,
             payload={
                 **context.snapshot(),
-                "station_id": decision.station_id.name,
-                "capture_id": decision.capture_id,
-                "result_revision": decision.revision,
+                "station_id": station_decision.station_id.name,
+                "capture_id": station_decision.capture_id,
+                "result_revision": station_decision.revision,
             },
         )
 
@@ -2582,81 +2595,116 @@ class MasterNode(InspectionNodeBase):
             },
         ):
             return
-        context = self.ledger.get(message.product_id, message.fifo_sequence)
-        if context is None:
-            if self.ledger.is_retired_product(
-                message.product_id, message.fifo_sequence
-            ) or self.ledger.is_retired_capture(message.capture_id):
+        decision = classify_station_message(
+            self.ledger,
+            StationMessageFacts(
+                product_id=message.product_id,
+                fifo_sequence=int(message.fifo_sequence),
+                station_id_raw=int(message.station_id),
+                capture_id=message.capture_id,
+                frame_batch_id=message.frame_batch_id,
+                inference_job_id=message.inference_job_id,
+                result_revision=int(message.result_revision),
+            ),
+            expects_verdict=False,
+        )
+        context = decision.context
+        station_id = decision.station_id
+
+        match decision.outcome:
+            case StationMessageOutcome.INVALID_STATION_ID:
+                # station_id를 신뢰할 수 없어 어느 station 결과인지 특정할 수
+                # 없습니다. 제품 식별자와 FIFO는 온전하므로 라인을 세우지 않고
+                # 이 메시지만 버리며, 해당 station 결과가 비어 Sensor3에서
+                # FORCED_NG로 잠깁니다. 원인은 SQLite에 남깁니다.
+                self._emit_log_event(
+                    severity=LogEvent.ERROR,
+                    event_type="INVALID_STATION_ID_FAILURE_IGNORED",
+                    product_id=message.product_id,
+                    payload={
+                        "station_id_raw": int(message.station_id),
+                        "capture_id": message.capture_id,
+                        "fifo_sequence": int(message.fifo_sequence),
+                    },
+                )
+
+            case StationMessageOutcome.EXPIRED_PRODUCT:
                 self._emit_log_event(
                     severity=LogEvent.WARNING,
                     event_type="EXPIRED_PRODUCT_FAILURE_IGNORED",
                     product_id=message.product_id,
                     payload={"capture_id": message.capture_id},
                 )
-                return
-            self._fault_stop("station failure references unknown product identity")
-            return
-        try:
-            station_id = StationId(message.station_id)
-        except ValueError:
-            self.get_logger().error("station failure contains an invalid station_id")
-            return
-        owner = self.ledger.capture_owner(message.capture_id)
-        if owner != (context.product_id, station_id):
-            self._fault_stop("station failure capture identity is not registered")
-            return
-        if context.removed:
-            self._emit_log_event(
-                severity=LogEvent.WARNING,
-                event_type="REMOVED_PRODUCT_FAILURE_IGNORED",
-                product_id=context.product_id,
-                payload={"capture_id": message.capture_id},
-            )
-            return
-        if context.station(station_id).capture_id != message.capture_id:
-            self._emit_log_event(
-                severity=LogEvent.WARNING,
-                event_type="SUPERSEDED_STATION_FAILURE_IGNORED",
-                product_id=context.product_id,
-                payload={
-                    "station_id": station_id.name,
-                    "capture_id": message.capture_id,
-                    "active_capture_id": context.station(station_id).capture_id,
-                },
-            )
-            return
-        if context.locked is not None:
-            self._emit_log_event(
-                severity=LogEvent.WARNING,
-                event_type="LATE_STATION_FAILURE_IGNORED",
-                product_id=context.product_id,
-                payload={
-                    "station_id": station_id.name,
-                    "capture_id": message.capture_id,
-                    "reason": message.reason,
-                },
-            )
-            return
-        if (
-            int(message.result_revision) < 1
-            or not message.frame_batch_id
-            or not message.inference_job_id
-        ):
-            reason = "station failure payload is incomplete"
-            with self._flow_lock:
-                context.record_station_contract_failure(station_id, reason)
-            self._emit_log_event(
-                severity=LogEvent.ERROR,
-                event_type="VISION_FAILURE_CONTRACT_FORCED_NG",
-                product_id=context.product_id,
-                payload={
-                    **context.snapshot(),
-                    "station_id": station_id.name,
-                    "capture_id": message.capture_id,
-                    "reason": reason,
-                },
-            )
-            return
+
+            case StationMessageOutcome.CAPTURE_OWNER_CONFLICT:
+                self._fault_stop(
+                    "station failure product identity conflicts with capture owner"
+                )
+
+            case StationMessageOutcome.UNKNOWN_PRODUCT:
+                self._fault_stop("station failure references unknown product identity")
+
+            case StationMessageOutcome.UNREGISTERED_CAPTURE:
+                self._fault_stop("station failure capture identity is not registered")
+
+            case StationMessageOutcome.REMOVED_PRODUCT:
+                self._emit_log_event(
+                    severity=LogEvent.WARNING,
+                    event_type="REMOVED_PRODUCT_FAILURE_IGNORED",
+                    product_id=context.product_id,
+                    payload={"capture_id": message.capture_id},
+                )
+
+            case StationMessageOutcome.SUPERSEDED_CAPTURE:
+                self._emit_log_event(
+                    severity=LogEvent.WARNING,
+                    event_type="SUPERSEDED_STATION_FAILURE_IGNORED",
+                    product_id=context.product_id,
+                    payload={
+                        "station_id": station_id.name,
+                        "capture_id": message.capture_id,
+                        "active_capture_id": decision.active_capture_id,
+                    },
+                )
+
+            case StationMessageOutcome.LATE_AFTER_LOCK:
+                self._emit_log_event(
+                    severity=LogEvent.WARNING,
+                    event_type="LATE_STATION_FAILURE_IGNORED",
+                    product_id=context.product_id,
+                    payload={
+                        "station_id": station_id.name,
+                        "capture_id": message.capture_id,
+                        "reason": message.reason,
+                    },
+                )
+
+            case StationMessageOutcome.CONTRACT_INCOMPLETE:
+                reason = "station failure payload is incomplete"
+                with self._flow_lock:
+                    context.record_station_contract_failure(station_id, reason)
+                self._emit_log_event(
+                    severity=LogEvent.ERROR,
+                    event_type="VISION_FAILURE_CONTRACT_FORCED_NG",
+                    product_id=context.product_id,
+                    payload={
+                        **context.snapshot(),
+                        "station_id": station_id.name,
+                        "capture_id": message.capture_id,
+                        "reason": reason,
+                    },
+                )
+
+            case StationMessageOutcome.ACCEPTED:
+                self._apply_accepted_station_failure(message, decision)
+
+    def _apply_accepted_station_failure(
+        self, message: StationInferenceFailed, decision: StationMessageDecision
+    ) -> None:
+        """가드를 통과한 station 추론 실패를 제품 원장에 반영합니다."""
+
+        context = decision.context
+        station_id = decision.station_id
         try:
             with self._flow_lock:
                 applied = context.record_station_failure(
@@ -2687,18 +2735,6 @@ class MasterNode(InspectionNodeBase):
     # endregion
 
     # region BLOCK 6 - Sensor3 액추에이터 분류와 FIFO 제거
-
-    def lock_product_at_sensor3(
-        self, product_id: str, fifo_sequence: int, sensor3_event_id: str
-    ) -> None:
-        """물리 FIFO 추적기가 Sensor3 이벤트를 제품에 매핑한 뒤 호출합니다."""
-
-        context = self.ledger.get(product_id, fifo_sequence)
-        if context is None:
-            raise KeyError("Sensor3 mapping references unknown product")
-        locked = context.lock_at_sensor3(sensor3_event_id)
-        self._accept_locked(locked)
-        self._schedule_actuation(locked)
 
     def _schedule_actuation(self, locked: LockedProduct) -> None:
         """Sensor3에 매핑된 잠금 판정을 실제 분류 명령으로 변환합니다."""

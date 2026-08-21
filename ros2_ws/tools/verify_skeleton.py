@@ -306,7 +306,7 @@ operation_runtime = (SOURCE / "nodes" / "inspection_master" / "inspection_master
 vision = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "vision_node.py").read_text(encoding="utf-8")
 queue = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "inference_queue.py").read_text(encoding="utf-8")
 log_storage = (SOURCE / "nodes" / "inspection_log" / "inspection_log" / "storage.py").read_text(encoding="utf-8")
-for token in ("ProductResultReorderBuffer", "lock_product_at_sensor3", "StationInferenceFailed", "ENQUEUE_BLOCKED"):
+for token in ("ProductResultReorderBuffer", "lock_at_sensor3", "StationInferenceFailed", "ENQUEUE_BLOCKED"):
     require(token in master + product_flow, f"Master ownership contract missing: {token}")
 for token in (
     "START_REQUEST",
