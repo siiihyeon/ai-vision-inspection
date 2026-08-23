@@ -1,0 +1,10 @@
+/inspection/vision_node:
+  ros__parameters:
+    vision.model.path: ""
+    vision.model.version: "Model_v_1"
+    vision.model.sha256: ""
+    vision.model.runtime: "PYTORCH_TORCHSCRIPT"
+    vision.model.cuda_required: false
+    vision.model.warmup_runs: 10
+    vision.model.serialize_access: true
+    vision.worker_count: 1

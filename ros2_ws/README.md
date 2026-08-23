@@ -1,6 +1,6 @@
 # ROS 2 Jazzy Workspace
 
-`src/basic_packages`는 공통 계약, `src/nodes`는 네 실행 노드입니다. 인터페이스 2.0.0은 breaking baseline입니다.
+`src/basic_packages`는 공통 계약, `src/nodes`는 네 실행 노드입니다. 인터페이스 2.1.0은 Vision cancellation/replay baseline입니다.
 
 ## 검증 순서
 
@@ -28,6 +28,9 @@ ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 | `/inspection/control/position_product` | `PositionProduct` Action | Master → Control |
 | `/inspection/vision/capture_product` | `CaptureProduct` Action | Master → Vision |
 | `/inspection/vision/station_result` | `StationResult` | Vision → Master |
+| `/inspection/master/inference_cancellation` | `InferenceCancellation` | Master → Vision |
+| `/inspection/vision/inference_cancellation_ack` | `InferenceCancellationAck` | Vision → Master |
+| `/inspection/log/replay_station_results` | `ReplayStationResults` Service | Master → Log |
 | `/inspection/master/product_result_locked` | `ProductResultLocked` | Master → Vision/Control/Log |
 | `/inspection/control/actuate_product` | `ActuateProduct` Action | Master → Control |
 | `/inspection/log/event` | `LogEvent` | all → Log |

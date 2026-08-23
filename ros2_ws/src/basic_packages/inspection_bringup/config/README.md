@@ -1,49 +1,42 @@
 # 실행 설정 결정표
 
+Launch는 공통 `sim.yaml`/`hardware.yaml`과 Vision 전용 세 파일을 순서대로 읽습니다. 생산값을 한 파일에 섞지 않기 위한 구조입니다.
+
+| 파일 | 책임 |
+|---|---|
+| `hardware.yaml` | Master, Control, Log와 공통 heartbeat |
+| `vision_capture.hardware.yaml` | 카메라/Action/PTP/packet/Mono8 저장 |
+| `vision_model.hardware.yaml` | `.pt` identity, CUDA, warmup, worker/model lock |
+| `vision_runtime.hardware.yaml` | queue, A/B timeout, disk, spool, 종료, 자동 tuning |
+
 ## 확정값
 
-- Heartbeat period 500 ms, timeout 2,000 ms
-- Initialize Action 1회 timeout 10,000 ms, 재시도 간격 1,000 ms
-- 초기화 실패 3회부터 작업자 경고(최대 횟수나 FAULT_STOP 기준이 아님)
-- interface 2.0.0
-- trigger mode `GIGE_ACTION_COMMAND`
-- capture max attempts 2
-- Station A 카메라 3대, Station B 카메라 1대
-- Master 활성 FIFO 개발 기본값 soft 18 / hard 20
-- 액추에이터 완료 후 Master 제품 Context 보존 10분
-- sim worker count 1
-- LED 관련 key 없음
+- interface `2.1.0`, heartbeat 500 ms/timeout 2,000 ms
+- Action broadcast, 전체 station 재시도 최대 2회, 재시도 전 추가 대기 없음
+- 카메라 A 3대 `DA9880512`, `DA9880516`, `DA7552836`; B 1대 `DA7838410`
+- canonical `MONO8_PNG`, 센서 해상도 `2248×2048`, packet size 1500
+- packet delay 초기값 5000 ticks, disk warning 90%/stop 95%
+- shutdown queue soft timeout 3초, GPU/NVML sampling 200 ms
+- 완성 이미지 최근 10,000장, timeout 최소 표본 A/B 각각 10,000, p99.9×1.2, 자동 적용 기본 false
+- 모델 이름 형식 `Model_v_1`, runtime PyTorch TorchScript `.pt`, warmup 기본 10회, CPU fallback 금지
 
-## hardware.yaml에 반드시 채울 값
+## Hardware에서 아직 0/빈 값으로 남겨야 하는 항목
 
-| 소유자 | 키 | 필요한 정보 |
-|---|---|---|
-| Master | `master.sensor_ids.*` | Mega/Control 논리 센서 ID와 실제 배선·polarity 대응 |
-| Master | `master.hardware_mapping_confirmed` | 센서·station·conveyor·actuator 매핑 검증 완료 여부 |
-| Master | `master.station_*.position_offset_steps` | Sensor1/2 감지점부터 촬영 위치까지 보정 step |
-| Master | `master.position_tolerance_steps` | open-loop 위치 오차 허용 범위 |
-| Master | `master.camera_ids.*` | Vision 설정과 정확히 같은 A 3대/B 1대 ID |
-| Master | `master.action.*_timeout_ms` | 위치·촬영·액추에이터·개별 컨베이어 재가동 확인의 최악 처리시간 |
-| Master | `master.*stop_timeout_ms` | PAUSE·종료 안전 정지 확인 제한시간 |
-| Master | `master.log_spool_*` | producer SQLite spool 경로와 경고·정지 용량 |
-| Master | `master.completed_context_retention_ms` | 기본 600000 ms; 생산 주기·late result 실측 후 재검토 |
-| Control | `control.mega.*` | device path, baud와 serial protocol version |
-| Control | `control.tb6600.*_config` | step calibration, 속도/가감속/방향/limit의 versioned config 경로 |
-| Control | `control.sensor_config` | pin, polarity, debounce, rearm, stuck 기준 config 경로 |
-| Control | `control.actuator_config` | pin, 안전상태, 동작/복귀 timing, feedback config 경로 |
-| Vision | `vision.camera_ids.*` | 각 station 필수 camera serial과 role |
-| Vision | `vision.gige_action.*` | MVS 시험으로 확정한 device/group key와 mask |
-| Vision | `vision.frame_arrival_skew_limit_us` | 허용 host receive skew |
-| Vision | `vision.queue.capacity` | production bounded depth |
-| Vision | `vision.worker_count` | GPU/CPU 부하 시험 결과 |
-| Vision | `vision.inference_queue_total_timeout_ms` | enqueue→결과 총 허용시간 |
-| Vision | `vision.data_root` | 동일 Ubuntu PC의 canonical image root |
-| Vision | `vision.model.path` | version/digest로 고정한 model artifact |
-| Log | `log.database_path` | SQLite 절대 경로 |
-| Log | `log.producer_spool_root` | 노드별 spool root |
-| Log | `log.data_root` | Vision과 합의한 공유 root |
-| Log | `log.retention_policy` | versioned 보존/삭제 정책 이름 |
+- MVS device key/group key/group mask, acquisition timeout, frame skew limit
+- PTP 지원/미지원 검증 완료 표시, exposure/gain/ROI
+- 최대 제품 유입률을 반영한 queue capacity
+- A/B enqueue→결과 timeout. 시험 후 보고서 p99.9를 이용합니다.
+- 실제 `.pt` SHA-256, 모델 입출력/전처리 계약, worker/model-lock 실험 결과
+- Mega port/baud/firmware protocol, 센서·TB6600·actuator 설정과 위치 timeout
 
-현재 Master는 profile·설정/인터페이스 버전·FIFO 한도·센서 ID·카메라 ID를
-canonical SHA-256 session config digest에 포함합니다. 배포 파이프라인에서는
-최종 hardware.yaml 전체 snapshot digest와의 일치 검증을 추가해야 합니다.
+미확정 값 때문에 hardware가 `INIT_BLOCKED`되는 것은 정상입니다. 값을 임의로 채워 READY를 우회하지 마십시오.
+
+## Linux 경로 준비
+
+```bash
+sudo mkdir -p /var/lib/inspection/{images,log,spool,reports,config}
+sudo mkdir -p /opt/inspection/models
+sudo chown -R "$USER":"$USER" /var/lib/inspection /opt/inspection/models
+```
+
+모델은 `/opt/inspection/models/Model_v_1.pt`에 놓고 `sha256sum` 결과를 `vision_model.hardware.yaml`에 입력합니다. 실제 서비스 계정을 만들면 위 소유자를 그 계정으로 바꿉니다.

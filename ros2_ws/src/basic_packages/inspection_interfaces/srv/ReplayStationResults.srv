@@ -1,0 +1,11 @@
+string session_id
+string requester_instance_id
+uint32 max_results
+uint32 offset
+---
+bool success
+StationResult[] results
+StationInferenceFailed[] failures
+uint32 next_offset
+bool has_more
+string reason

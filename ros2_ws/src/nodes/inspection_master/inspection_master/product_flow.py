@@ -35,6 +35,7 @@ class StationProcessState(StrEnum):
     POSITION_SETTLED = "POSITION_SETTLED"
     CAPTURE_REQUESTED = "CAPTURE_REQUESTED"
     CAPTURE_COMPLETED = "CAPTURE_COMPLETED"
+    SKIPPED = "SKIPPED"
     FAILED = "FAILED"
 
 
@@ -88,6 +89,7 @@ class StationInspection:
     failed: bool = False
     conflicted: bool = False
     failure_reason: str = ""
+    skipped_reason: str = ""
     last_failure_revision: int = 0
 
     @property
@@ -120,6 +122,8 @@ class ProductContext:
     completed: bool = False
     removed: bool = False
     removed_monotonic_ns: int = 0
+    station_b_skip_requested: bool = False
+    station_b_skip_reason: str = ""
     revision: int = 1
 
     def _touch(self) -> None:
@@ -314,9 +318,58 @@ class ProductContext:
         if self.physical_state != ProductPhysicalState.FLIPPING:
             raise ProductFlowError("Sensor2 product is not in FLIPPING")
         self.record_sensor(2, event_id, step)
-        self.physical_state = ProductPhysicalState.STATION_B_WAIT
+        if self.station_b_skip_requested:
+            station_b = self.station(StationId.B)
+            station_b.process_state = StationProcessState.SKIPPED
+            station_b.skipped_reason = self.station_b_skip_reason
+            self.physical_state = ProductPhysicalState.SENSOR3_WAIT
+            self.physical_zone = PhysicalZone.LOWER_TO_SENSOR3
+        else:
+            self.physical_state = ProductPhysicalState.STATION_B_WAIT
+            self.physical_zone = PhysicalZone.LOWER_INSPECTION
+        self._touch()
+
+    def request_station_b_skip(self, reason: str) -> bool:
+        """Station A terminal NG 뒤 B 촬영/추론을 영구 금지합니다."""
+
+        if self.station_b_skip_requested:
+            return False
+        self.station_b_skip_requested = True
+        self.station_b_skip_reason = reason or "Station A terminal NG"
+        self._touch()
+        return True
+
+    def mark_station_b_skipped(self, reason: str = "") -> bool:
+        """이미 B 구간에 진입한 제품을 촬영 없이 완료 상태로 전환합니다."""
+
+        station_b = self.station(StationId.B)
+        if station_b.process_state == StationProcessState.SKIPPED:
+            return False
+        if station_b.decision is not None or station_b.failed or station_b.conflicted:
+            return False
+        self.request_station_b_skip(reason)
+        station_b.process_state = StationProcessState.SKIPPED
+        station_b.skipped_reason = self.station_b_skip_reason
+        self.physical_state = ProductPhysicalState.STATION_B_DONE
         self.physical_zone = PhysicalZone.LOWER_INSPECTION
         self._touch()
+        return True
+
+    def bypass_station_b(self, reason: str = "") -> bool:
+        """B 위치 정지 명령 전에 lower conveyor를 계속 운전시킵니다."""
+
+        if self.physical_state != ProductPhysicalState.STATION_B_WAIT:
+            return False
+        station_b = self.station(StationId.B)
+        if station_b.process_state != StationProcessState.PENDING:
+            return False
+        self.request_station_b_skip(reason)
+        station_b.process_state = StationProcessState.SKIPPED
+        station_b.skipped_reason = self.station_b_skip_reason
+        self.physical_state = ProductPhysicalState.SENSOR3_WAIT
+        self.physical_zone = PhysicalZone.LOWER_TO_SENSOR3
+        self._touch()
+        return True
 
     def apply_station_result(self, decision: StationDecision) -> bool:
         """더 최신인 revision만 반영하며 Sensor3 잠금 뒤 결과는 거부합니다."""
@@ -339,6 +392,22 @@ class ProductContext:
             return False
         previous = station.decision
         if previous is not None:
+            if (
+                decision.station_id == StationId.A
+                and previous.verdict == Verdict.NG
+            ):
+                if (
+                    decision.verdict != Verdict.NG
+                    or decision.capture_id != previous.capture_id
+                    or decision.inference_job_id != previous.inference_job_id
+                ):
+                    station.conflicted = True
+                    station.failure_reason = (
+                        "Station A terminal NG cannot be revised or replaced"
+                    )
+                    self._touch()
+                    raise StationResultConflict(station.failure_reason)
+                return False
             if decision.revision < previous.revision:
                 return False
             if decision.revision == previous.revision:
@@ -402,6 +471,11 @@ class ProductContext:
         station_b = self.station(StationId.B)
         if station_a.failed or station_a.conflicted:
             return Verdict.FORCED_NG, station_a.failure_reason or "Station A failed"
+        if (
+            station_a.decision is not None
+            and station_a.decision.verdict == Verdict.NG
+        ):
+            return Verdict.NG, "Station A terminal NG"
         if station_b.failed or station_b.conflicted:
             return Verdict.FORCED_NG, station_b.failure_reason or "Station B failed"
         if station_a.decision is None or station_b.decision is None:
@@ -507,6 +581,12 @@ class ProductContext:
                 for station, state in self.stations.items()
                 if state.failure_reason
             },
+            "station_skip_reasons": {
+                station.name: state.skipped_reason
+                for station, state in self.stations.items()
+                if state.skipped_reason
+            },
+            "station_b_skip_requested": self.station_b_skip_requested,
             "final_verdict": self.locked.verdict.name if self.locked else "PENDING",
             "lock_reason": self.locked.reason if self.locked else "",
             "actuator_job_id": self.actuator_job_id,

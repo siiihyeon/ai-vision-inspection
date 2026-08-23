@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
+import ipaddress
+import json
+import math
+import shutil
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
 from pathlib import Path
 
 import rclpy
 from inspection_common import (
     ErrorCode,
+    DurableLogSpool,
     IdempotencyStore,
     NodeId,
+    NodeHealthState,
+    SpoolRecord,
     SystemState,
-    Verdict,
+    canonical_json,
     new_uuid,
+    sha256_text,
 )
 from inspection_common.node_base import (
     InspectionNodeBase,
@@ -28,6 +36,10 @@ from inspection_common.node_base import (
 from inspection_interfaces.action import CaptureProduct
 from inspection_interfaces.msg import (
     ImageReference,
+    InferenceCancellation,
+    InferenceCancellationAck,
+    LogEvent,
+    LogPersistedAck,
     ProductResultLocked,
     StationInferenceFailed,
     StationResult,
@@ -41,19 +53,21 @@ from rclpy.task import Future
 from .capture_contract import (
     CaptureBackend,
     CaptureBatch,
+    CapturePacketLossError,
     FakeCaptureBackend,
+    MONO8_PNG,
     UnimplementedCaptureBackend,
 )
-from .inference_queue import InferenceJob, InferenceQueue, WorkerPool
-
-
-@dataclass(frozen=True, slots=True)
-class _FakeInferenceResult:
-    """진짜 모델이 없을 때 파이프라인을 검증하기 위한 placeholder 결과."""
-
-    verdict: int = Verdict.PASS
-    score: float = 0.1
-    model_version: str = "fake-v0"
+from .inference_queue import (
+    InferenceFailure,
+    InferenceFailureKind,
+    InferenceJob,
+    InferenceQueue,
+    WorkerPool,
+    InferenceTiming,
+)
+from .gpu_monitor import GpuMonitor
+from .model_backend import FakeStationModel
 
 
 def _fake_load_image(path: Path):
@@ -62,10 +76,8 @@ def _fake_load_image(path: Path):
     return path
 
 
-def _fake_infer(model, images: tuple):
-    """진짜 모델 추론 전, 파이프라인 검증용 placeholder."""
-
-    return _FakeInferenceResult()
+def _infer_station(model, images: tuple):
+    return model.infer(images)
 
 
 class ExecutorLock:
@@ -161,28 +173,92 @@ class VisionNode(InspectionNodeBase):
         self.declare_parameter("vision.gige_action.device_key", 0)
         self.declare_parameter("vision.gige_action.group_key", 0)
         self.declare_parameter("vision.gige_action.group_mask", 0)
+        self.declare_parameter("vision.camera_network_map_json", "{}")
         self.declare_parameter("vision.frame_arrival_skew_limit_us", 0)
+        self.declare_parameter("vision.capture.acquisition_timeout_ms", 0)
         self.declare_parameter("vision.capture.max_attempts", 2)
+        self.declare_parameter("vision.gige.packet_size", 1500)
+        self.declare_parameter("vision.gige.packet_delay_ticks", 5000)
+        self.declare_parameter("vision.ptp.enabled", False)
+        self.declare_parameter("vision.ptp.validation_completed", False)
+        self.declare_parameter("vision.camera.disconnect_pause_after_ms", 5000)
+        self.declare_parameter("vision.camera.reconnect_interval_ms", 1000)
+        self.declare_parameter("vision.camera.reconnect_max_attempts", 5)
         self.declare_parameter("vision.queue.capacity", 16)
         self.declare_parameter("vision.worker_count", 1)
+        self.declare_parameter("vision.model.serialize_access", True)
         self.declare_parameter("vision.inference_queue_total_timeout_ms", 0)
+        self.declare_parameter("vision.inference.station_a.total_timeout_ms", 0)
+        self.declare_parameter("vision.inference.station_b.total_timeout_ms", 0)
         self.declare_parameter("vision.data_root", "")
         self.declare_parameter("vision.model.path", "")
+        self.declare_parameter("vision.model.version", "Model_v_1")
+        self.declare_parameter("vision.model.sha256", "")
+        self.declare_parameter("vision.model.runtime", "PYTORCH_TORCHSCRIPT")
+        self.declare_parameter("vision.model.cuda_required", True)
+        self.declare_parameter("vision.model.warmup_runs", 10)
+        self.declare_parameter("vision.image.sensor_width", 2248)
+        self.declare_parameter("vision.image.sensor_height", 2048)
+        self.declare_parameter("vision.image.canonical_pixel_format", MONO8_PNG)
+        self.declare_parameter(
+            "vision.result_spool_path", "/tmp/inspection/spool/vision.sqlite3"
+        )
+        self.declare_parameter("vision.shutdown.queue_drain_timeout_ms", 3000)
+        self.declare_parameter("vision.gpu.sample_interval_ms", 200)
+        self.declare_parameter("vision.disk.warning_ratio", 0.90)
+        self.declare_parameter("vision.disk.stop_ratio", 0.95)
+        self.declare_parameter("vision.timeout_tuning.auto_apply", False)
+        self.declare_parameter(
+            "vision.timeout_tuning.generated_path",
+            "/var/lib/inspection/config/vision_timeout_tuning.json",
+        )
+        self.declare_parameter("vision.timeout_tuning.minimum_samples", 10000)
+        self.declare_parameter("vision.timeout_tuning.safety_factor", 1.2)
+
+        self._apply_generated_timeout_tuning()
 
         if str(self.get_parameter("vision.trigger.mode").value) != "GIGE_ACTION_COMMAND":
             raise ValueError("vision.trigger.mode must be GIGE_ACTION_COMMAND")
         if int(self.get_parameter("vision.capture.max_attempts").value) != 2:
             raise ValueError("vision.capture.max_attempts is fixed at 2")
+        canonical_pixel_format = str(
+            self.get_parameter("vision.image.canonical_pixel_format").value
+        )
+        if canonical_pixel_format != MONO8_PNG:
+            raise ValueError("vision.image.canonical_pixel_format must be MONO8_PNG")
 
         capacity = int(self.get_parameter("vision.queue.capacity").value)
         self.inference_queue = InferenceQueue(max(capacity, 1))
         self.worker_pool: WorkerPool | None = None
+        self._worker_stopped = False
+        self._session_metrics_emitted = False
+        self._disk_warning_active = False
+        self._shutdown_requested = False
+        self._shutdown_ready = False
+        self._state_guard = threading.RLock()
+        self._canceled_station_scopes: set[tuple[str, int | None]] = set()
+        self._inference_timings: dict[str, InferenceTiming] = {}
+        self._result_spool: DurableLogSpool | None = None
+        self._result_spool_path = str(
+            self.get_parameter("vision.result_spool_path").value
+        )
+        self._gpu_monitor = GpuMonitor(
+            interval_seconds=max(
+                int(self.get_parameter("vision.gpu.sample_interval_ms").value), 1
+            )
+            / 1000.0
+        )
         # 블로킹 호출을 executor 스레드 밖으로 넘기기 위한 전용 풀입니다.
         self._blocking_pool = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="vision-blocking"
         )
         self.capture_backend = capture_backend or (
-            FakeCaptureBackend(data_root=Path("/tmp/inspection/vision_fake"))
+            FakeCaptureBackend(
+                data_root=Path(
+                    str(self.get_parameter("vision.data_root").value)
+                    or "/tmp/inspection/vision_fake"
+                )
+            )
             if self.profile == "sim"
             else UnimplementedCaptureBackend()
         )
@@ -219,6 +295,30 @@ class VisionNode(InspectionNodeBase):
             "vision/station_inference_failed",
             reliable_event_qos(),
         )
+        self._cancellation_subscription = self.create_subscription(
+            InferenceCancellation,
+            "/inspection/master/inference_cancellation",
+            self._handle_inference_cancellation,
+            reliable_event_qos(),
+        )
+        self._cancellation_ack_publisher = self.create_publisher(
+            InferenceCancellationAck,
+            "vision/inference_cancellation_ack",
+            reliable_event_qos(),
+        )
+        self._log_event_publisher = self.create_publisher(
+            LogEvent, "log/event", reliable_event_qos()
+        )
+        self._log_ack_subscription = self.create_subscription(
+            LogPersistedAck,
+            "/inspection/log/persisted_ack",
+            self._handle_log_persisted_ack,
+            reliable_event_qos(),
+        )
+        self._result_spool_timer = self.create_timer(1.0, self._flush_result_spool)
+        self._gpu_snapshot_timer = self.create_timer(
+            10.0, self._emit_gpu_metrics_snapshot
+        )
         self._locked_subscription = self.create_subscription(
             ProductResultLocked,
             "/inspection/master/product_result_locked",
@@ -235,12 +335,21 @@ class VisionNode(InspectionNodeBase):
             "vision.gige_action.device_key",
             "vision.gige_action.group_key",
             "vision.gige_action.group_mask",
+            "vision.camera_network_map_json",
             "vision.frame_arrival_skew_limit_us",
+            "vision.capture.acquisition_timeout_ms",
+            "vision.gige.packet_delay_ticks",
+            "vision.ptp.validation_completed",
             "vision.queue.capacity",
             "vision.worker_count",
-            "vision.inference_queue_total_timeout_ms",
+            "vision.inference.station_a.total_timeout_ms",
+            "vision.inference.station_b.total_timeout_ms",
             "vision.data_root",
             "vision.model.path",
+            "vision.model.version",
+            "vision.model.sha256",
+            "vision.result_spool_path",
+            "vision.image.canonical_pixel_format",
         )
 
     def validate_hardware_profile(self) -> list[str]:
@@ -251,7 +360,10 @@ class VisionNode(InspectionNodeBase):
             "vision.frame_arrival_skew_limit_us",
             "vision.queue.capacity",
             "vision.worker_count",
-            "vision.inference_queue_total_timeout_ms",
+            "vision.inference.station_a.total_timeout_ms",
+            "vision.inference.station_b.total_timeout_ms",
+            "vision.capture.acquisition_timeout_ms",
+            "vision.gige.packet_delay_ticks",
         )
         for key in positive_keys:
             if self.has_parameter(key) and int(self.get_parameter(key).value) <= 0:
@@ -264,27 +376,85 @@ class VisionNode(InspectionNodeBase):
             missing.append("vision.camera_ids.station_b must contain 1 camera")
         if set(station_a) & set(station_b):
             missing.append("station camera sets must be disjoint")
+        try:
+            network_map = json.loads(
+                str(self.get_parameter("vision.camera_network_map_json").value)
+            )
+            if not isinstance(network_map, dict) or set(network_map) != set(
+                station_a + station_b
+            ):
+                missing.append("vision.camera_network_map_json camera set mismatch")
+            else:
+                for address in network_map.values():
+                    ipaddress.ip_address(str(address))
+        except (TypeError, ValueError):
+            missing.append("vision.camera_network_map_json is invalid")
         data_root = str(self.get_parameter("vision.data_root").value)
         if data_root and not Path(data_root).is_absolute():
             missing.append("vision.data_root must be absolute")
+        spool_path = str(self.get_parameter("vision.result_spool_path").value)
+        if spool_path and not Path(spool_path).is_absolute():
+            missing.append("vision.result_spool_path must be absolute")
+        if int(self.get_parameter("vision.image.sensor_width").value) != 2248:
+            missing.append("vision.image.sensor_width must be 2248")
+        if int(self.get_parameter("vision.image.sensor_height").value) != 2048:
+            missing.append("vision.image.sensor_height must be 2048")
+        if int(self.get_parameter("vision.gige.packet_size").value) != 1500:
+            missing.append("vision.gige.packet_size must remain 1500")
+        if not bool(self.get_parameter("vision.ptp.validation_completed").value):
+            missing.append("vision.ptp.validation_completed must be confirmed")
+        warning_ratio = float(self.get_parameter("vision.disk.warning_ratio").value)
+        stop_ratio = float(self.get_parameter("vision.disk.stop_ratio").value)
+        if warning_ratio != 0.90 or stop_ratio != 0.95:
+            missing.append("vision disk ratios must remain warning=0.90/stop=0.95")
         return list(dict.fromkeys(missing))
 
     async def initialize_node_resources(self) -> NodeInitializationOutcome:
+        try:
+            replacement_spool = DurableLogSpool(Path(self._result_spool_path))
+        except Exception as exc:
+            return NodeInitializationOutcome(
+                success=False,
+                error_code=int(ErrorCode.LOG_COMMIT_FAILED),
+                reason=f"Vision result spool initialization failed: {type(exc).__name__}",
+                retryable=True,
+            )
+        previous_spool = self._result_spool
+        self._result_spool = replacement_spool
+        if previous_spool is not None:
+            previous_spool.close()
+        if self.profile == "hardware":
+            return NodeInitializationOutcome(
+                success=False,
+                error_code=int(ErrorCode.IMPLEMENTATION_PENDING),
+                reason=(
+                    "MVS Action1 adapter and TorchScript preprocessing/output "
+                    "decoder are awaiting hardware/model injection"
+                ),
+                retryable=True,
+            )
         if self.worker_pool is None:
             worker_count = int(self.get_parameter("vision.worker_count").value)
             self.worker_pool = WorkerPool(
                 queue=self.inference_queue,
-                model=None,
+                model=FakeStationModel(),
                 worker_count=max(worker_count, 1),
                 load_image=_fake_load_image,
-                infer=_fake_infer,
+                infer=_infer_station,
                 on_success=self._on_inference_success,
                 on_failure=self._on_inference_failure,
+                on_timing=self._on_inference_timing,
+                on_canceled=self._on_inference_canceled,
+                serialize_model_access=bool(
+                    self.get_parameter("vision.model.serialize_access").value
+                ),
             )
             self.worker_pool.start()
-        # TODO(IMPLEMENTATION): MVS enumeration/configuration, Action1/PTP capability,
-        # RGB PNG atomic storage, shared model load.
-        return await super().initialize_node_resources()
+        self._gpu_monitor.start()
+        return NodeInitializationOutcome(
+            success=True,
+            reason="sim Mono8 capture and batch model skeleton initialized",
+        )
 
     def _run_blocking(self, fn, *args) -> Future:
         """블로킹 호출을 스레드 풀에 넘기고 rclpy Future로 결과를 받습니다.
@@ -315,13 +485,84 @@ class VisionNode(InspectionNodeBase):
         추론 중이면 종료가 그만큼 지연될 수 있습니다.)
         """
 
-        if self.worker_pool is not None:
-            self.worker_pool.stop()
+        self._stop_workers_and_flush()
         self._blocking_pool.shutdown(wait=False, cancel_futures=True)
+        if self._result_spool is not None:
+            self._result_spool.close()
+            self._result_spool = None
         return super().destroy_node()
+
+    def request_shutdown(self, reason: str = "program termination") -> bool:
+        if self._shutdown_requested:
+            return False
+        self._shutdown_requested = True
+        self._stop_workers_and_flush(reason)
+        self._shutdown_ready = True
+        return True
+
+    @property
+    def shutdown_ready(self) -> bool:
+        return self._shutdown_ready
+
+    def _stop_workers_and_flush(self, reason: str = "node destroy") -> None:
+        if not self._worker_stopped and self.worker_pool is not None:
+            timeout_ms = int(
+                self.get_parameter("vision.shutdown.queue_drain_timeout_ms").value
+            )
+            self.worker_pool.stop(soft_timeout_seconds=max(timeout_ms, 0) / 1000.0)
+            if self.worker_pool.soft_shutdown_timeout_exceeded:
+                self.get_logger().critical(
+                    "active forward exceeded the 3 second soft shutdown timeout"
+                )
+            self._worker_stopped = True
+        snapshot = self._gpu_monitor.stop()
+        if self.session_id and not self._session_metrics_emitted:
+            self._session_metrics_emitted = True
+            self._emit_durable_event(
+                "VISION_SESSION_METRICS",
+                {
+                    "shutdown_reason": reason,
+                    "normal_shutdown": True,
+                    "gpu_available": snapshot.available,
+                    "gpu_sample_count": snapshot.sample_count,
+                    "mean_gpu_utilization_pct": snapshot.mean_utilization_pct,
+                    "mean_vram_used_mib": snapshot.mean_vram_used_mib,
+                    "peak_vram_used_mib": snapshot.peak_vram_used_mib,
+                    "total_vram_mib": snapshot.total_vram_mib,
+                },
+            )
+            self._flush_result_spool()
 
     def _on_inference_success(self, job: InferenceJob, result) -> None:
         """추론 성공 결과를 StationResult로 포장해 발행합니다."""
+
+        expected_views = 3 if job.station_id == 1 else 1
+        view_verdicts = tuple(int(value) for value in result.view_verdicts)
+        derived_verdict = (
+            int(StationResult.NG)
+            if int(StationResult.NG) in view_verdicts
+            else int(StationResult.PASS)
+        )
+        if (
+            len(job.image_paths) != expected_views
+            or len(view_verdicts) != expected_views
+            or len(result.view_scores) != expected_views
+            or any(
+                verdict not in {int(StationResult.PASS), int(StationResult.NG)}
+                for verdict in view_verdicts
+            )
+            or int(result.verdict) != derived_verdict
+            or not math.isfinite(float(result.score))
+            or any(not math.isfinite(float(score)) for score in result.view_scores)
+        ):
+            self._on_inference_failure(
+                job,
+                InferenceFailure(
+                    kind=InferenceFailureKind.MODEL,
+                    reason="model output contract is invalid",
+                ),
+            )
+            return
 
         message = StationResult()
         message.header.stamp = self.get_clock().now().to_msg()
@@ -339,9 +580,80 @@ class VisionNode(InspectionNodeBase):
         message.score = result.score
         message.model_version = result.model_version
         message.completed_at = message.header.stamp
+        timing = self._inference_timings.pop(job.inference_job_id, None)
+        self._emit_durable_event(
+            "VISION_STATION_RESULT_DURABLE",
+            {
+                "product_id": job.product_id,
+                "fifo_sequence": job.fifo_sequence,
+                "station_id": job.station_id,
+                "capture_id": job.capture_id,
+                "frame_batch_id": job.frame_batch_id,
+                "inference_job_id": job.inference_job_id,
+                "result_revision": 1,
+                "verdict": int(result.verdict),
+                "score": float(result.score),
+                "model_version": result.model_version,
+                "model_sha256": result.model_sha256,
+                "config_fingerprint": self._timeout_tuning_fingerprint(),
+                "view_verdicts": list(result.view_verdicts),
+                "view_scores": list(result.view_scores),
+                "camera_ids": list(job.camera_ids),
+                "image_paths": list(job.image_paths),
+                "capture_completed_monotonic_ns": job.capture_completed_monotonic_ns,
+                "completed_monotonic_ns": (
+                    timing.completed_monotonic_ns if timing else time.monotonic_ns()
+                ),
+                "model_forward_ms": timing.model_forward_ms if timing else None,
+                "enqueue_to_result_ms": (
+                    timing.enqueue_to_terminal_ms if timing else None
+                ),
+            },
+            product_id=job.product_id,
+        )
         self._station_result_publisher.publish(message)
 
-    def _on_inference_failure(self, job: InferenceJob, reason: str) -> None:
+    def _emit_gpu_metrics_snapshot(self) -> None:
+        snapshot = self._gpu_monitor.snapshot()
+        if not self.session_id or snapshot.sample_count < 1:
+            return
+        self._emit_durable_event(
+            "VISION_GPU_METRICS_SNAPSHOT",
+            {
+                "normal_shutdown": False,
+                "gpu_sample_count": snapshot.sample_count,
+                "mean_gpu_utilization_pct": snapshot.mean_utilization_pct,
+                "mean_vram_used_mib": snapshot.mean_vram_used_mib,
+                "peak_vram_used_mib": snapshot.peak_vram_used_mib,
+                "total_vram_mib": snapshot.total_vram_mib,
+            },
+        )
+
+    def _on_inference_timing(
+        self, job: InferenceJob, timing: InferenceTiming
+    ) -> None:
+        self._inference_timings[job.inference_job_id] = timing
+
+    def _on_inference_canceled(self, job: InferenceJob, stage: str) -> None:
+        self._inference_timings.pop(job.inference_job_id, None)
+        self._emit_durable_event(
+            "VISION_INFERENCE_CANCELED",
+            {
+                "product_id": job.product_id,
+                "fifo_sequence": job.fifo_sequence,
+                "station_id": job.station_id,
+                "capture_id": job.capture_id,
+                "frame_batch_id": job.frame_batch_id,
+                "inference_job_id": job.inference_job_id,
+                "stage": stage,
+                "image_paths": list(job.image_paths),
+            },
+            product_id=job.product_id,
+        )
+
+    def _on_inference_failure(
+        self, job: InferenceJob, failure: InferenceFailure
+    ) -> None:
         """추론 실패를 StationInferenceFailed로 포장해 발행합니다."""
 
         message = StationInferenceFailed()
@@ -356,10 +668,38 @@ class VisionNode(InspectionNodeBase):
         message.frame_batch_id = job.frame_batch_id
         message.inference_job_id = job.inference_job_id
         message.result_revision = 1
-        message.error_code = int(ErrorCode.INFERENCE_FAILED)
-        message.reason = reason
+        error_codes = {
+            InferenceFailureKind.TIMEOUT: ErrorCode.INFERENCE_TIMEOUT,
+            InferenceFailureKind.FILE_READ: ErrorCode.INFERENCE_FILE_READ_FAILED,
+            InferenceFailureKind.MODEL: ErrorCode.INFERENCE_FAILED,
+            InferenceFailureKind.CUDA_OOM: ErrorCode.GPU_OUT_OF_MEMORY,
+        }
+        message.error_code = int(error_codes[failure.kind])
+        message.reason = failure.reason
         message.failed_at = message.header.stamp
+        self._inference_timings.pop(job.inference_job_id, None)
+        self._emit_durable_event(
+            "VISION_STATION_FAILURE_DURABLE",
+            {
+                "product_id": job.product_id,
+                "fifo_sequence": job.fifo_sequence,
+                "station_id": job.station_id,
+                "capture_id": job.capture_id,
+                "frame_batch_id": job.frame_batch_id,
+                "inference_job_id": job.inference_job_id,
+                "result_revision": 1,
+                "error_code": int(message.error_code),
+                "failure_kind": failure.kind.value,
+                "reason": failure.reason,
+                "camera_ids": list(job.camera_ids),
+                "image_paths": list(job.image_paths),
+            },
+            product_id=job.product_id,
+            severity=LogEvent.ERROR,
+        )
         self._station_failure_publisher.publish(message)
+        if failure.kind == InferenceFailureKind.CUDA_OOM:
+            self.set_health_state(NodeHealthState.DEGRADED)
 
     def _accept_capture_goal(self, goal_request) -> GoalResponse:
         cameras = tuple(goal_request.required_camera_ids)
@@ -374,6 +714,8 @@ class VisionNode(InspectionNodeBase):
             else ()
         )
         valid = (
+            not self._shutdown_requested
+            and
             bool(goal_request.product_id)
             and bool(goal_request.capture_id)
             and goal_request.station_id in self._station_locks
@@ -381,6 +723,9 @@ class VisionNode(InspectionNodeBase):
             and len(cameras) == len(set(cameras))
             and cameras == configured
             and bool(goal_request.command.command_id)
+            and not self._is_scope_canceled(
+                goal_request.product_id, int(goal_request.station_id)
+            )
         )
         return GoalResponse.ACCEPT if valid else GoalResponse.REJECT
 
@@ -426,7 +771,24 @@ class VisionNode(InspectionNodeBase):
             goal_handle.succeed() if result.success else goal_handle.abort()
             return result
 
+        disk_stop_reason = self._check_disk_capacity()
+        if disk_stop_reason:
+            return self._terminal_capture(
+                goal_handle,
+                result,
+                ErrorCode.VISION_DISK_STOP,
+                disk_stop_reason,
+            )
+
         async with self._station_locks[request.station_id]:
+            if self._is_scope_canceled(request.product_id, request.station_id):
+                return self._terminal_capture(
+                    goal_handle,
+                    result,
+                    ErrorCode.CAPTURE_CANCELED,
+                    "capture scope was canceled before camera reservation",
+                    canceled=True,
+                )
             identity = (request.product_id, request.station_id)
             previous_identity = self._capture_identities.get(request.capture_id)
             if previous_identity is not None and previous_identity != identity:
@@ -478,10 +840,39 @@ class VisionNode(InspectionNodeBase):
                     capture_reason,
                 )
 
+            if (
+                goal_handle.is_cancel_requested
+                or self._is_scope_canceled(request.product_id, request.station_id)
+            ):
+                self._emit_capture_discarded(
+                    request.product_id,
+                    request.fifo_sequence,
+                    request.station_id,
+                    request.capture_id,
+                    batch,
+                    "capture completed after cancellation; canonical files retained for LogNode",
+                )
+                return self._terminal_capture(
+                    goal_handle,
+                    result,
+                    ErrorCode.CAPTURE_CANCELED,
+                    "capture completed after its inference scope was canceled",
+                    canceled=True,
+                )
+
             inference_job_id = new_uuid()
-            timeout_ms = int(
-                self.get_parameter("vision.inference_queue_total_timeout_ms").value
+            station_timeout_parameter = (
+                "vision.inference.station_a.total_timeout_ms"
+                if request.station_id == 1
+                else "vision.inference.station_b.total_timeout_ms"
             )
+            timeout_ms = int(self.get_parameter(station_timeout_parameter).value)
+            if timeout_ms <= 0:
+                timeout_ms = int(
+                    self.get_parameter(
+                        "vision.inference_queue_total_timeout_ms"
+                    ).value
+                )
             job = InferenceJob(
                 inference_job_id=inference_job_id,
                 product_id=request.product_id,
@@ -493,6 +884,10 @@ class VisionNode(InspectionNodeBase):
                 # 실제 Queue 등록 성공 시 InferenceQueue가 monotonic 시각을 찍습니다.
                 enqueued_monotonic_ns=0,
                 queue_total_timeout_ms=timeout_ms if timeout_ms > 0 else None,
+                camera_ids=tuple(image.camera_id for image in batch.images),
+                capture_completed_monotonic_ns=max(
+                    image.host_arrival_monotonic_ns for image in batch.images
+                ),
             )
             self._publish_capture_feedback(
                 goal_handle,
@@ -518,6 +913,22 @@ class VisionNode(InspectionNodeBase):
                         result,
                         ErrorCode.CAPTURE_CANCELED,
                         "product was locked before FrameBatch enqueue",
+                    )
+                if self._is_scope_canceled(request.product_id, request.station_id):
+                    self._emit_capture_discarded(
+                        request.product_id,
+                        request.fifo_sequence,
+                        request.station_id,
+                        request.capture_id,
+                        batch,
+                        "inference scope canceled while waiting for queue capacity",
+                    )
+                    return self._terminal_capture(
+                        goal_handle,
+                        result,
+                        ErrorCode.CAPTURE_CANCELED,
+                        "inference scope canceled before enqueue",
+                        canceled=True,
                     )
                 if goal_handle.is_cancel_requested:
                     return self._terminal_capture(
@@ -590,6 +1001,7 @@ class VisionNode(InspectionNodeBase):
                 "broadcasting GigE Vision Action Command",
             )
             try:
+                capture_started_ns = time.monotonic_ns()
                 batch = await self.capture_backend.capture_station(
                     product_id=request.product_id,
                     station_id=request.station_id,
@@ -597,6 +1009,7 @@ class VisionNode(InspectionNodeBase):
                     attempt=attempt,
                     required_camera_ids=required,
                 )
+                capture_completed_ns = time.monotonic_ns()
                 if (
                     batch.product_id != request.product_id
                     or batch.station_id != request.station_id
@@ -616,19 +1029,86 @@ class VisionNode(InspectionNodeBase):
                     ),
                     batch.frame_batch_id,
                     0.75,
-                    "validating host-arrival skew and saved RGB PNG files",
+                    "validating host-arrival skew and saved canonical PNG files",
                 )
                 # rclpy executor에는 asyncio 이벤트 루프가 없어 to_thread를 쓸 수 없습니다.
-                batch.validate(required)
+                validation_started_ns = time.monotonic_ns()
+                batch.validate(
+                    required,
+                    expected_pixel_format=str(
+                        self.get_parameter(
+                            "vision.image.canonical_pixel_format"
+                        ).value
+                    ),
+                )
+                if self.profile == "hardware" and any(
+                    image.width
+                    != int(self.get_parameter("vision.image.sensor_width").value)
+                    or image.height
+                    != int(self.get_parameter("vision.image.sensor_height").value)
+                    for image in batch.images
+                ):
+                    raise ValueError("canonical image resolution is not 2248x2048")
                 if skew_limit > 0 and batch.frame_arrival_skew_us > skew_limit:
                     attempt_error = ErrorCode.CAPTURE_SKEW_EXCEEDED
                     raise ValueError("frame_arrival_skew_us exceeded configured limit")
+                validation_completed_ns = time.monotonic_ns()
+                backend_ms = (capture_completed_ns - capture_started_ns) / 1_000_000
+                validation_ms = (
+                    validation_completed_ns - validation_started_ns
+                ) / 1_000_000
+                acquisition_ms = max(
+                    0.0,
+                    (
+                        max(
+                            image.host_arrival_monotonic_ns
+                            for image in batch.images
+                        )
+                        - batch.trigger_requested_monotonic_ns
+                    )
+                    / 1_000_000,
+                )
+                save_overhead_ms = max(0.0, backend_ms - acquisition_ms)
+                self._emit_durable_event(
+                    "VISION_CAPTURE_TIMING",
+                    {
+                        "product_id": request.product_id,
+                        "fifo_sequence": request.fifo_sequence,
+                        "station_id": request.station_id,
+                        "capture_id": request.capture_id,
+                        "frame_batch_id": batch.frame_batch_id,
+                        "attempt": attempt,
+                        "trigger_round_trip_ms": (
+                            batch.trigger_returned_monotonic_ns
+                            - batch.trigger_requested_monotonic_ns
+                        )
+                        / 1_000_000,
+                        "capture_and_save_ms": backend_ms,
+                        "capture_acquisition_ms": acquisition_ms,
+                        "save_overhead_ms": save_overhead_ms,
+                        "validation_ms": validation_ms,
+                        "capture_timeout_candidate_ms": acquisition_ms * 2.0
+                        + save_overhead_ms
+                        + validation_ms,
+                        "packet_loss_by_camera": {
+                            image.camera_id: image.packet_loss_count
+                            for image in batch.images
+                        },
+                        "packet_resend_by_camera": {
+                            image.camera_id: image.packet_resend_count
+                            for image in batch.images
+                        },
+                    },
+                    product_id=request.product_id,
+                )
                 return batch, ErrorCode.NONE, ""
             except Exception as exc:
                 if attempt_error != ErrorCode.CAPTURE_SKEW_EXCEEDED:
                     attempt_error = (
                         ErrorCode.IMPLEMENTATION_PENDING
                         if isinstance(exc, NotImplementedError)
+                        else ErrorCode.CAPTURE_FAILED
+                        if isinstance(exc, CapturePacketLossError)
                         else ErrorCode.CAPTURE_SAVE_FAILED
                         if isinstance(exc, ValueError)
                         else ErrorCode.CAPTURE_FAILED
@@ -760,7 +1240,314 @@ class VisionNode(InspectionNodeBase):
     def _handle_product_locked(self, message: ProductResultLocked) -> None:
         if message.header.session_id != self.session_id:
             return
-        self.inference_queue.lock_product(message.product_id)
+        with self._state_guard:
+            self._canceled_station_scopes.add((message.product_id, None))
+        removed = self.inference_queue.lock_product(message.product_id)
+        self._emit_durable_event(
+            "VISION_PRODUCT_LOCKED_CANCELLATION",
+            {
+                "product_id": message.product_id,
+                "fifo_sequence": message.fifo_sequence,
+                "removed_queue_jobs": removed,
+                "active_job_found": bool(
+                    self.worker_pool
+                    and self.worker_pool.has_active_job(message.product_id)
+                ),
+            },
+            product_id=message.product_id,
+        )
+
+    def _apply_generated_timeout_tuning(self) -> None:
+        """옵션이 True일 때만 직전 정상 session의 제안을 현재 실행에 적용합니다."""
+
+        if not bool(self.get_parameter("vision.timeout_tuning.auto_apply").value):
+            return
+        path = Path(
+            str(self.get_parameter("vision.timeout_tuning.generated_path").value)
+        )
+        if not path.is_file():
+            return
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"generated timeout tuning file is invalid: {type(exc).__name__}"
+            ) from exc
+        expected = {
+            "model_version": str(self.get_parameter("vision.model.version").value),
+            "model_sha256": str(self.get_parameter("vision.model.sha256").value),
+            "config_fingerprint": self._timeout_tuning_fingerprint(),
+        }
+        if any(str(document.get(key, "")) != value for key, value in expected.items()):
+            raise ValueError("generated timeout tuning model fingerprint mismatch")
+        updates = []
+        for station_name, parameter_name in (
+            ("station_a", "vision.inference.station_a.total_timeout_ms"),
+            ("station_b", "vision.inference.station_b.total_timeout_ms"),
+        ):
+            candidate = document.get("timeouts_ms", {}).get(station_name)
+            if candidate is not None and int(candidate) > 0:
+                updates.append(Parameter(parameter_name, value=int(candidate)))
+        if updates:
+            results = self.set_parameters(updates)
+            if not all(result.successful for result in results):
+                raise ValueError("generated timeout tuning parameters were rejected")
+
+    def _timeout_tuning_fingerprint(self) -> str:
+        return sha256_text(
+            canonical_json(
+                {
+                    "camera_ids_station_a": list(
+                        self.get_parameter("vision.camera_ids.station_a").value or ()
+                    ),
+                    "camera_ids_station_b": list(
+                        self.get_parameter("vision.camera_ids.station_b").value or ()
+                    ),
+                    "canonical_pixel_format": str(
+                        self.get_parameter(
+                            "vision.image.canonical_pixel_format"
+                        ).value
+                    ),
+                    "camera_network_map_json": str(
+                        self.get_parameter("vision.camera_network_map_json").value
+                    ),
+                    "model_runtime": str(
+                        self.get_parameter("vision.model.runtime").value
+                    ),
+                    "model_version": str(
+                        self.get_parameter("vision.model.version").value
+                    ),
+                    "model_sha256": str(
+                        self.get_parameter("vision.model.sha256").value
+                    ),
+                    "worker_count": int(
+                        self.get_parameter("vision.worker_count").value
+                    ),
+                    "serialize_model_access": bool(
+                        self.get_parameter("vision.model.serialize_access").value
+                    ),
+                }
+            )
+        )
+
+    def _is_scope_canceled(self, product_id: str, station_id: int) -> bool:
+        with self._state_guard:
+            return (
+                (product_id, None) in self._canceled_station_scopes
+                or (product_id, station_id) in self._canceled_station_scopes
+            )
+
+    def _check_disk_capacity(self) -> str:
+        root = Path(str(self.get_parameter("vision.data_root").value))
+        probe = root
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        try:
+            usage = shutil.disk_usage(probe)
+        except OSError as exc:
+            return f"DISK_STOP_LIMIT: usage check failed: {type(exc).__name__}"
+        used_ratio = usage.used / usage.total if usage.total else 1.0
+        warning_ratio = float(self.get_parameter("vision.disk.warning_ratio").value)
+        stop_ratio = float(self.get_parameter("vision.disk.stop_ratio").value)
+        if used_ratio >= stop_ratio:
+            self._emit_durable_event(
+                "VISION_DISK_STOP_LIMIT",
+                {
+                    "data_root": str(root),
+                    "used_ratio": used_ratio,
+                    "stop_ratio": stop_ratio,
+                },
+                severity=LogEvent.CRITICAL,
+            )
+            self.set_health_state(NodeHealthState.DEGRADED)
+            return (
+                f"DISK_STOP_LIMIT: used={used_ratio:.4f}, "
+                f"limit={stop_ratio:.2f}"
+            )
+        if used_ratio >= warning_ratio and not self._disk_warning_active:
+            self._disk_warning_active = True
+            self._emit_durable_event(
+                "VISION_DISK_WARNING_LIMIT",
+                {
+                    "data_root": str(root),
+                    "used_ratio": used_ratio,
+                    "warning_ratio": warning_ratio,
+                },
+                severity=LogEvent.WARNING,
+            )
+        elif used_ratio < warning_ratio:
+            self._disk_warning_active = False
+        return ""
+
+    def _handle_inference_cancellation(
+        self, message: InferenceCancellation
+    ) -> None:
+        if message.header.session_id != self.session_id or not message.product_id:
+            return
+        station_id = int(message.station_id) or None
+        with self._state_guard:
+            self._canceled_station_scopes.add((message.product_id, station_id))
+        removed = self.inference_queue.cancel_scope(message.product_id, station_id)
+        active = bool(
+            self.worker_pool
+            and self.worker_pool.has_active_job(message.product_id, station_id)
+        )
+        self._emit_durable_event(
+            "VISION_INFERENCE_CANCELLATION_APPLIED",
+            {
+                "cancellation_id": message.cancellation_id,
+                "product_id": message.product_id,
+                "fifo_sequence": message.fifo_sequence,
+                "station_id": int(message.station_id),
+                "reason_code": int(message.reason_code),
+                "reason": message.reason,
+                "removed_inference_job_ids": [
+                    job.inference_job_id for job in removed
+                ],
+                "active_job_found": active,
+                "active_result_will_be_discarded": active,
+            },
+            product_id=message.product_id,
+        )
+        ack = InferenceCancellationAck()
+        ack.header.stamp = self.get_clock().now().to_msg()
+        ack.header.session_id = self.session_id
+        ack.header.message_id = new_uuid()
+        ack.header.correlation_id = message.cancellation_id
+        ack.cancellation_id = message.cancellation_id
+        ack.product_id = message.product_id
+        ack.fifo_sequence = message.fifo_sequence
+        ack.station_id = int(message.station_id)
+        ack.removed_queue_jobs = len(removed)
+        ack.active_job_found = active
+        ack.active_result_will_be_discarded = active
+        ack.reason = "cancellation scope installed"
+        ack.acknowledged_at = ack.header.stamp
+        self._cancellation_ack_publisher.publish(ack)
+
+    def _emit_capture_discarded(
+        self,
+        product_id: str,
+        fifo_sequence: int,
+        station_id: int,
+        capture_id: str,
+        batch: CaptureBatch,
+        reason: str,
+    ) -> None:
+        self._emit_durable_event(
+            "VISION_CAPTURE_DISCARDED",
+            {
+                "product_id": product_id,
+                "fifo_sequence": fifo_sequence,
+                "station_id": station_id,
+                "capture_id": capture_id,
+                "frame_batch_id": batch.frame_batch_id,
+                "image_paths": [image.file_path for image in batch.images],
+                "reason": reason,
+                "deletion_owner": "LOG_NODE",
+            },
+            product_id=product_id,
+            severity=LogEvent.WARNING,
+        )
+
+    def _emit_durable_event(
+        self,
+        event_type: str,
+        payload: dict[str, object],
+        *,
+        product_id: str = "",
+        severity: int = LogEvent.INFO,
+    ) -> None:
+        log_id = new_uuid()
+        envelope = {
+            "schema_version": 2,
+            "event_type": event_type,
+            "severity": int(severity),
+            "source_node": NodeId.VISION.value,
+            "producer_instance_id": self.node_instance_id,
+            "session_id": self.session_id,
+            "product_id": product_id,
+            "payload": payload,
+        }
+        try:
+            payload_json = canonical_json(envelope)
+            record = SpoolRecord(
+                log_id=log_id,
+                revision=1,
+                payload_json=payload_json,
+                payload_digest=sha256_text(payload_json),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            self.get_logger().error(
+                f"Vision durable event serialization failed: {type(exc).__name__}"
+            )
+            return
+        if self._result_spool is not None:
+            try:
+                self._result_spool.enqueue(record)
+            except Exception as exc:
+                self.get_logger().error(
+                    f"Vision result spool enqueue failed: {type(exc).__name__}"
+                )
+        self._publish_spool_record(record)
+
+    def _publish_spool_record(self, record: SpoolRecord) -> None:
+        try:
+            envelope = json.loads(record.payload_json)
+        except (TypeError, ValueError):
+            self.get_logger().error(f"invalid Vision spool JSON: {record.log_id}")
+            return
+        message = LogEvent()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.session_id = self.session_id
+        message.header.message_id = new_uuid()
+        message.header.correlation_id = str(envelope.get("product_id", ""))
+        message.log_id = record.log_id
+        message.revision = record.revision
+        message.severity = int(envelope.get("severity", LogEvent.INFO))
+        message.event_type = str(envelope.get("event_type", "UNKNOWN"))
+        message.source_node = NodeId.VISION.value
+        message.producer_instance_id = self.node_instance_id
+        message.product_id = str(envelope.get("product_id", ""))
+        message.payload_json = record.payload_json
+        message.payload_digest = record.payload_digest
+        message.occurred_at = message.header.stamp
+        self._log_event_publisher.publish(message)
+
+    def _handle_log_persisted_ack(self, message: LogPersistedAck) -> None:
+        if message.header.session_id != self.session_id:
+            return
+        if message.producer_node != NodeId.VISION.value:
+            return
+        if message.producer_instance_id != self.node_instance_id:
+            return
+        if len(message.acked_log_ids) != len(message.acked_revisions):
+            self.get_logger().error("Vision LogPersistedAck arrays have unequal lengths")
+            return
+        if self._result_spool is None:
+            return
+        identities = [
+            (log_id, int(revision))
+            for log_id, revision in zip(
+                message.acked_log_ids, message.acked_revisions
+            )
+            if log_id and int(revision) > 0
+        ]
+        if identities:
+            self._result_spool.acknowledge(identities)
+
+    def _flush_result_spool(self) -> None:
+        if self._result_spool is None:
+            return
+        try:
+            records = self._result_spool.pending(limit=100)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Vision result spool read failed: {type(exc).__name__}"
+            )
+            return
+        for record in records:
+            self._publish_spool_record(record)
 
 
 def main(args: list[str] | None = None) -> None:

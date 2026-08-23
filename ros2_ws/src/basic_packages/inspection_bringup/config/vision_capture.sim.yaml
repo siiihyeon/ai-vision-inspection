@@ -1,0 +1,23 @@
+/inspection/vision_node:
+  ros__parameters:
+    vision.trigger.mode: "GIGE_ACTION_COMMAND"
+    vision.camera_ids.station_a: ["sim_station_a_camera_1", "sim_station_a_camera_2", "sim_station_a_camera_3"]
+    vision.camera_ids.station_b: ["sim_station_b_camera_1"]
+    vision.camera_network_map_json: "{}"
+    vision.gige_action.device_key: 0
+    vision.gige_action.group_key: 0
+    vision.gige_action.group_mask: 0
+    vision.frame_arrival_skew_limit_us: 0
+    vision.capture.acquisition_timeout_ms: 0
+    vision.capture.max_attempts: 2
+    vision.gige.packet_size: 1500
+    vision.gige.packet_delay_ticks: 5000
+    vision.ptp.enabled: false
+    vision.ptp.validation_completed: false
+    vision.camera.disconnect_pause_after_ms: 5000
+    vision.camera.reconnect_interval_ms: 1000
+    vision.camera.reconnect_max_attempts: 5
+    vision.image.sensor_width: 2248
+    vision.image.sensor_height: 2048
+    vision.image.canonical_pixel_format: "MONO8_PNG"
+    vision.data_root: "/tmp/inspection/images"

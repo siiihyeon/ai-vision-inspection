@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import struct
 import sys
 import tempfile
@@ -32,10 +33,13 @@ from inspection_common import (  # noqa: E402
     StationId,
     SystemState,
     Verdict,
+    canonical_json,
     payload_digest,
+    sha256_text,
 )
 from inspection_common.log_spool import DurableLogSpool, SpoolRecord  # noqa: E402
 from inspection_log.storage import LogRepository, StoredLogEvent  # noqa: E402
+from inspection_log.reporting import generate_session_report  # noqa: E402
 from inspection_master.operation_runtime import (  # noqa: E402
     EquipmentSnapshot,
     build_late_operation_diagnostic,
@@ -65,21 +69,31 @@ from inspection_master.worker_supervision import (  # noqa: E402
     WorkerInitPhase,
     WorkerRuntimeState,
 )
-from inspection_vision.capture_contract import CaptureBatch, ImageArtifact  # noqa: E402
+from inspection_vision.capture_contract import (  # noqa: E402
+    CaptureBatch,
+    ImageArtifact,
+    MONO8_PNG,
+    RGB8_PNG,
+)
 from inspection_vision.inference_queue import (  # noqa: E402
+    InferenceFailureKind,
     InferenceJob,
     InferenceQueue,
     WorkerPool,
 )
 
 
-def make_rgb8_png(width: int = 1, height: int = 1) -> bytes:
+def make_png(pixel_format: str, width: int = 1, height: int = 1) -> bytes:
     def chunk(kind: bytes, data: bytes) -> bytes:
         checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
 
-    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    scanlines = b"".join(b"\x00" + b"\x00\x00\x00" * width for _ in range(height))
+    channels = 1 if pixel_format == MONO8_PNG else 3
+    color_type = 0 if pixel_format == MONO8_PNG else 2
+    header = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    scanlines = b"".join(
+        b"\x00" + b"\x00" * channels * width for _ in range(height)
+    )
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", header)
@@ -586,6 +600,32 @@ class MasterContractTests(unittest.TestCase):
         self.assertEqual(locked.verdict, Verdict.FORCED_NG)
         self.assertIn("final capture failed", locked.reason)
 
+    def test_station_a_terminal_ng_skips_station_b_and_cannot_be_revised(self) -> None:
+        context = ProductLedger().register("terminal-ng", 1)
+        context.record_sensor(1, "sensor1-terminal-ng", 100)
+        self._complete_station(context, StationId.A, verdict=Verdict.NG)
+        self.assertTrue(context.request_station_b_skip("Station A terminal NG"))
+        context.accept_sensor2("sensor2-terminal-ng", 200)
+        self.assertEqual(context.physical_state, ProductPhysicalState.SENSOR3_WAIT)
+        self.assertEqual(
+            context.station(StationId.B).process_state,
+            StationProcessState.SKIPPED,
+        )
+        with self.assertRaises(StationResultConflict):
+            context.apply_station_result(
+                StationDecision(
+                    StationId.A,
+                    Verdict.PASS,
+                    2,
+                    "capture-a-terminal-ng",
+                    "job-a",
+                    "batch-a",
+                )
+            )
+        locked = context.lock_at_sensor3("sensor3-terminal-ng", 300)
+        self.assertIn(locked.verdict, {Verdict.NG, Verdict.FORCED_NG})
+        self.assertFalse(locked.station_b_completed)
+
     def test_vision_result_can_precede_capture_action_result(self) -> None:
         context = ProductLedger().register("race-product", 1)
         context.record_sensor(1, "sensor1-race", 100)
@@ -978,7 +1018,7 @@ class VisionContractTests(unittest.TestCase):
         queue = InferenceQueue(capacity=1)
         shared_model = object()
         successes: list[str] = []
-        failures: list[tuple[str, str]] = []
+        failures: list[tuple[str, InferenceFailureKind, str]] = []
         completed = threading.Event()
 
         def infer(model: object, _images: tuple[bytes, ...]) -> str:
@@ -990,14 +1030,14 @@ class VisionContractTests(unittest.TestCase):
             queue=queue,
             model=shared_model,
             worker_count=1,
-            load_image=lambda _path: b"rgb",
+            load_image=lambda _path: b"mono",
             infer=infer,
             on_success=lambda job, _result: (
                 successes.append(job.inference_job_id),
                 completed.set(),
             ),
-            on_failure=lambda job, reason: (
-                failures.append((job.inference_job_id, reason)),
+            on_failure=lambda job, failure: (
+                failures.append((job.inference_job_id, failure.kind, failure.reason)),
                 completed.set(),
             ),
         )
@@ -1011,10 +1051,80 @@ class VisionContractTests(unittest.TestCase):
         self.assertTrue(completed.wait(1.0))
         pool.stop()
         self.assertEqual(successes, [])
-        self.assertEqual(failures, [("job-1", "queue total inference timeout")])
+        self.assertEqual(
+            failures,
+            [("job-1", InferenceFailureKind.TIMEOUT, "queue total inference timeout")],
+        )
 
-    def test_capture_batch_validates_rgb_png_digest_and_host_skew(self) -> None:
-        png = make_rgb8_png()
+    def test_active_forward_finishes_but_result_is_discarded_after_cancel(self) -> None:
+        queue = InferenceQueue(capacity=1)
+        forward_started = threading.Event()
+        release_forward = threading.Event()
+        terminal = threading.Event()
+        successes: list[str] = []
+        canceled: list[tuple[str, str]] = []
+
+        def infer(_model: object, _images: tuple[bytes, ...]) -> str:
+            forward_started.set()
+            release_forward.wait(1.0)
+            return "PASS"
+
+        pool: WorkerPool[object, bytes, str] = WorkerPool(
+            queue=queue,
+            model=object(),
+            worker_count=1,
+            load_image=lambda _path: b"mono",
+            infer=infer,
+            on_success=lambda job, _result: successes.append(job.inference_job_id),
+            on_failure=lambda _job, _failure: terminal.set(),
+            on_canceled=lambda job, stage: (
+                canceled.append((job.inference_job_id, stage)),
+                terminal.set(),
+            ),
+        )
+        job = self._job(1, product="cancel-active")
+        self.assertTrue(queue.try_enqueue(job))
+        pool.start()
+        self.assertTrue(forward_started.wait(1.0))
+        self.assertEqual(queue.cancel_scope("cancel-active", 1), ())
+        release_forward.set()
+        self.assertTrue(terminal.wait(1.0))
+        pool.stop()
+        self.assertEqual(successes, [])
+        self.assertEqual(canceled, [("job-1", "DISCARDED_AFTER_FORWARD")])
+
+    def test_model_failure_is_not_retried(self) -> None:
+        queue = InferenceQueue(capacity=1)
+        attempts = 0
+        completed = threading.Event()
+        failures: list[InferenceFailureKind] = []
+
+        def infer(_model: object, _images: tuple[bytes, ...]) -> str:
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("model failed")
+
+        pool: WorkerPool[object, bytes, str] = WorkerPool(
+            queue=queue,
+            model=object(),
+            worker_count=1,
+            load_image=lambda _path: b"mono",
+            infer=infer,
+            on_success=lambda _job, _result: None,
+            on_failure=lambda _job, failure: (
+                failures.append(failure.kind),
+                completed.set(),
+            ),
+        )
+        self.assertTrue(queue.try_enqueue(self._job(1)))
+        pool.start()
+        self.assertTrue(completed.wait(1.0))
+        pool.stop()
+        self.assertEqual(attempts, 1)
+        self.assertEqual(failures, [InferenceFailureKind.MODEL])
+
+    def test_capture_batch_validates_mono_png_digest_and_host_skew(self) -> None:
+        png = make_png(MONO8_PNG)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "image.png"
             path.write_bytes(png)
@@ -1027,13 +1137,15 @@ class VisionContractTests(unittest.TestCase):
                     file_size_bytes=len(png),
                     width=1,
                     height=1,
-                    pixel_format="RGB8_PNG",
+                    pixel_format=MONO8_PNG,
                     camera_timestamp_raw=index,
                     camera_timestamp_domain="DEVICE_TICKS_UNSYNCED",
                     camera_timestamp_ns=index,
                     camera_timestamp_synchronized=False,
                     host_arrival_monotonic_ns=1_000_000 + index * 5_000,
                     host_arrival_timestamp_ns=1_000_000 + index * 5_000,
+                    packet_loss_count=0,
+                    packet_resend_count=0,
                 )
                 for index, camera in enumerate(("camera-a", "camera-b"))
             )
@@ -1049,11 +1161,148 @@ class VisionContractTests(unittest.TestCase):
                 trigger_returned_wall_time_ns=950_000,
                 images=artifacts,
             )
-            batch.validate(("camera-a", "camera-b"))
+            batch.validate(
+                ("camera-a", "camera-b"), expected_pixel_format=MONO8_PNG
+            )
             self.assertEqual(batch.frame_arrival_skew_us, 5)
+
+            with self.assertRaisesRegex(ValueError, "unrecovered packet loss"):
+                replace(
+                    batch,
+                    images=(replace(artifacts[0], packet_loss_count=1), artifacts[1]),
+                ).validate(("camera-a", "camera-b"), expected_pixel_format=MONO8_PNG)
+
+    def test_capture_batch_rejects_declared_mono_with_rgb_png(self) -> None:
+        png = make_png(RGB8_PNG)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rgb.png"
+            path.write_bytes(png)
+            artifact = ImageArtifact(
+                camera_id="camera-a",
+                file_path=str(path.resolve()),
+                sha256=hashlib.sha256(png).hexdigest(),
+                file_size_bytes=len(png),
+                width=1,
+                height=1,
+                pixel_format=MONO8_PNG,
+                camera_timestamp_raw=1,
+                camera_timestamp_domain="DEVICE_TICKS_UNSYNCED",
+                camera_timestamp_ns=1,
+                camera_timestamp_synchronized=False,
+                host_arrival_monotonic_ns=1,
+                host_arrival_timestamp_ns=1,
+                packet_loss_count=0,
+                packet_resend_count=0,
+            )
+            batch = CaptureBatch(
+                product_id="product",
+                station_id=1,
+                capture_id="capture",
+                frame_batch_id="batch",
+                attempt=1,
+                trigger_requested_monotonic_ns=1,
+                trigger_returned_monotonic_ns=2,
+                trigger_requested_wall_time_ns=1,
+                trigger_returned_wall_time_ns=2,
+                images=(artifact,),
+            )
+            with self.assertRaisesRegex(ValueError, "color type"):
+                batch.validate(("camera-a",), expected_pixel_format=MONO8_PNG)
 
 
 class LogContractTests(unittest.TestCase):
+    @staticmethod
+    def _durable_event(
+        *, event_type: str, payload: dict[str, object], log_id: str
+    ) -> StoredLogEvent:
+        envelope = {
+            "schema_version": 2,
+            "event_type": event_type,
+            "severity": 20,
+            "source_node": "vision",
+            "producer_instance_id": "vision-instance",
+            "session_id": "session-1",
+            "product_id": str(payload.get("product_id", "")),
+            "payload": payload,
+        }
+        payload_json = canonical_json(envelope)
+        return StoredLogEvent(
+            log_id=log_id,
+            revision=1,
+            severity=20,
+            event_type=event_type,
+            source_node="vision",
+            producer_instance_id="vision-instance",
+            product_id=str(payload.get("product_id", "")),
+            payload_json=payload_json,
+            payload_digest=sha256_text(payload_json),
+            occurred_at_ns=1,
+        )
+
+    def test_durable_vision_terminal_can_be_replayed_and_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = LogRepository(root / "log.sqlite3")
+            result_payload = {
+                "product_id": "product-1",
+                "fifo_sequence": 1,
+                "station_id": 1,
+                "capture_id": "capture-a",
+                "frame_batch_id": "batch-a",
+                "inference_job_id": "job-a",
+                "result_revision": 1,
+                "verdict": int(Verdict.NG),
+                "score": 0.9,
+                "model_version": "Model_v_1",
+                "model_sha256": "0" * 64,
+                "config_fingerprint": "1" * 64,
+                "model_forward_ms": 2.0,
+                "enqueue_to_result_ms": 3.0,
+                "capture_completed_monotonic_ns": 10,
+                "completed_monotonic_ns": 20,
+                "image_paths": [],
+            }
+            repository.append_event(
+                self._durable_event(
+                    event_type="VISION_STATION_RESULT_DURABLE",
+                    payload=result_payload,
+                    log_id="vision-result",
+                )
+            )
+            terminals, has_more = repository.replay_station_terminals(
+                "session-1", 100
+            )
+            self.assertFalse(has_more)
+            self.assertEqual(len(terminals), 1)
+            self.assertEqual(terminals[0].inference_job_id, "job-a")
+            report = generate_session_report(
+                repository,
+                session_id="session-1",
+                report_root=root / "reports",
+                timeout_tuning_path=root / "tuning.json",
+                auto_apply_timeouts=False,
+                minimum_samples=10000,
+                safety_factor=1.2,
+            )
+            self.assertTrue(report.csv_path.is_file())
+            self.assertTrue(report.summary_path.is_file())
+            self.assertIsNone(report.tuning_path)
+            tuned = generate_session_report(
+                repository,
+                session_id="session-1",
+                report_root=root / "reports-auto",
+                timeout_tuning_path=root / "tuning.json",
+                auto_apply_timeouts=True,
+                minimum_samples=1,
+                safety_factor=1.2,
+            )
+            self.assertEqual(tuned.tuning_path, root / "tuning.json")
+            tuning_document = json.loads(
+                (root / "tuning.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(tuning_document["timeouts_ms"]["station_a"], 4)
+            repository.close()
+
     def test_repository_replacement_can_close_previous_connection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "log.sqlite3"

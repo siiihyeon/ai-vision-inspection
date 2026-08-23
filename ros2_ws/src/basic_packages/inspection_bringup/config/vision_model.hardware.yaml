@@ -1,0 +1,10 @@
+/inspection/vision_node:
+  ros__parameters:
+    vision.model.path: "/opt/inspection/models/Model_v_1.pt"
+    vision.model.version: "Model_v_1"
+    vision.model.sha256: ""  # TODO(HARDWARE_REQUIRED): 배포 .pt의 SHA-256
+    vision.model.runtime: "PYTORCH_TORCHSCRIPT"
+    vision.model.cuda_required: true
+    vision.model.warmup_runs: 10
+    vision.model.serialize_access: true  # GPU 시험 후에만 false 검토
+    vision.worker_count: 0              # TODO(HARDWARE_REQUIRED): GPU 시험

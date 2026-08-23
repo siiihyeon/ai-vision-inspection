@@ -12,6 +12,15 @@ from pathlib import Path
 from typing import Protocol
 
 
+MONO8_PNG = "MONO8_PNG"
+RGB8_PNG = "RGB8_PNG"
+SUPPORTED_CANONICAL_PIXEL_FORMATS = frozenset({MONO8_PNG, RGB8_PNG})
+
+
+class CapturePacketLossError(ValueError):
+    """필수 frame에 복구되지 않은 GigE packet 손실이 남았습니다."""
+
+
 @dataclass(frozen=True, slots=True)
 class ImageArtifact:
     camera_id: str
@@ -27,6 +36,12 @@ class ImageArtifact:
     camera_timestamp_synchronized: bool
     host_arrival_monotonic_ns: int
     host_arrival_timestamp_ns: int
+    # 해당 frame 전송에서 끝내 복구하지 못한 packet 수입니다. SDK가 누적
+    # counter만 제공하면 capture 직전/직후 counter의 delta를 기록해야 합니다.
+    packet_loss_count: int
+    # 재전송으로 정상 복구된 packet 수입니다. 0이 아니어도 frame은 유효할 수
+    # 있지만 네트워크 품질 분석을 위해 packet loss와 분리해 보존합니다.
+    packet_resend_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,7 +62,12 @@ class CaptureBatch:
         arrivals = [image.host_arrival_monotonic_ns for image in self.images]
         return 0 if len(arrivals) < 2 else (max(arrivals) - min(arrivals)) // 1_000
 
-    def validate(self, required_camera_ids: tuple[str, ...]) -> None:
+    def validate(
+        self,
+        required_camera_ids: tuple[str, ...],
+        *,
+        expected_pixel_format: str | None = None,
+    ) -> None:
         if self.trigger_requested_monotonic_ns <= 0:
             raise ValueError("trigger requested monotonic timestamp is missing")
         if self.trigger_returned_monotonic_ns < self.trigger_requested_monotonic_ns:
@@ -61,10 +81,26 @@ class CaptureBatch:
             raise ValueError("duplicate camera_id in CaptureBatch")
         if set(actual) != set(required_camera_ids):
             raise ValueError("CaptureBatch does not contain all required cameras")
+        if (
+            expected_pixel_format is not None
+            and expected_pixel_format not in SUPPORTED_CANONICAL_PIXEL_FORMATS
+        ):
+            raise ValueError("expected canonical pixel format is unsupported")
         for image in self.images:
             path = Path(image.file_path)
-            if image.pixel_format != "RGB8_PNG":
-                raise ValueError("canonical image must be RGB8_PNG")
+            if image.pixel_format not in SUPPORTED_CANONICAL_PIXEL_FORMATS:
+                raise ValueError("canonical image pixel format is unsupported")
+            if (
+                expected_pixel_format is not None
+                and image.pixel_format != expected_pixel_format
+            ):
+                raise ValueError("canonical image pixel format differs from configuration")
+            if image.packet_loss_count < 0 or image.packet_resend_count < 0:
+                raise ValueError("packet counters must not be negative")
+            if image.packet_loss_count != 0:
+                raise CapturePacketLossError(
+                    "capture contains unrecovered packet loss"
+                )
             if not path.is_absolute():
                 raise ValueError("image file_path must be absolute")
             if len(image.sha256) != 64 or image.file_size_bytes < 1:
@@ -74,11 +110,21 @@ class CaptureBatch:
             content = path.read_bytes()
             if hashlib.sha256(content).hexdigest() != image.sha256:
                 raise ValueError("image SHA-256 metadata mismatches")
-            _validate_rgb8_png(content, image.width, image.height)
+            _validate_canonical_png(
+                content,
+                image.width,
+                image.height,
+                image.pixel_format,
+            )
 
 
-def _validate_rgb8_png(content: bytes, expected_width: int, expected_height: int) -> None:
-    """stdlib만으로 PNG CRC·압축 stream과 RGB8 IHDR를 검증합니다."""
+def _validate_canonical_png(
+    content: bytes,
+    expected_width: int,
+    expected_height: int,
+    pixel_format: str,
+) -> None:
+    """stdlib만으로 PNG CRC·압축 stream과 MONO8/RGB8 IHDR를 검증합니다."""
 
     if not content.startswith(b"\x89PNG\r\n\x1a\n"):
         raise ValueError("image file is not a PNG container")
@@ -120,16 +166,20 @@ def _validate_rgb8_png(content: bytes, expected_width: int, expected_height: int
         raise ValueError("PNG does not end with a valid IEND chunk")
     if (width, height) != (expected_width, expected_height):
         raise ValueError("PNG dimensions do not match metadata")
-    if bit_depth != 8 or color_type != 2 or interlace != 0:
-        raise ValueError("canonical PNG must be non-interlaced 8-bit RGB")
+    expected_color_type = 0 if pixel_format == MONO8_PNG else 2
+    channels = 1 if pixel_format == MONO8_PNG else 3
+    if bit_depth != 8 or color_type != expected_color_type or interlace != 0:
+        raise ValueError(
+            "canonical PNG color type does not match declared pixel format"
+        )
     try:
         scanlines = zlib.decompress(bytes(compressed))
     except zlib.error as exc:
         raise ValueError("PNG image data cannot be decompressed") from exc
-    expected_length = expected_height * (1 + expected_width * 3)
+    expected_length = expected_height * (1 + expected_width * channels)
     if len(scanlines) != expected_length:
-        raise ValueError("PNG RGB scanline length is invalid")
-    stride = 1 + expected_width * 3
+        raise ValueError("PNG scanline length is invalid")
+    stride = 1 + expected_width * channels
     if any(scanlines[row * stride] > 4 for row in range(expected_height)):
         raise ValueError("PNG scanline uses an invalid filter type")
 
@@ -144,7 +194,7 @@ class CaptureBackend(Protocol):
         attempt: int,
         required_camera_ids: tuple[str, ...],
     ) -> CaptureBatch:
-        """GigE Action Command 1회와 atomic RGB PNG 저장을 수행합니다."""
+        """GigE Action Command 1회와 atomic canonical PNG 저장을 수행합니다."""
 
 
 class UnimplementedCaptureBackend:
@@ -152,14 +202,27 @@ class UnimplementedCaptureBackend:
         raise NotImplementedError("HIKROBOT MVS GigE Action Command adapter is not implemented")
 
 
-def _write_fake_rgb8_png(path: Path, width: int, height: int) -> None:
-    """검증용 최소 크기의 단색 RGB8 PNG를 실제로 디스크에 씁니다."""
+def _write_fake_png(
+    path: Path,
+    width: int,
+    height: int,
+    pixel_format: str,
+) -> None:
+    """검증용 최소 크기의 MONO8/RGB8 PNG를 실제로 디스크에 씁니다."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     scanlines = bytearray()
+    if pixel_format == MONO8_PNG:
+        color_type = 0
+        row = bytes([200]) * width
+    elif pixel_format == RGB8_PNG:
+        color_type = 2
+        row = bytes([200, 200, 200]) * width
+    else:
+        raise ValueError("unsupported fake canonical pixel format")
     for _ in range(height):
         scanlines.append(0)  # PNG filter type: None
-        scanlines.extend(bytes([200, 200, 200]) * width)
+        scanlines.extend(row)
     compressed = zlib.compress(bytes(scanlines))
 
     def chunk(chunk_type: bytes, data: bytes) -> bytes:
@@ -170,7 +233,7 @@ def _write_fake_rgb8_png(path: Path, width: int, height: int) -> None:
             + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
         )
 
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
     content = (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", ihdr)
@@ -201,7 +264,7 @@ class FakeCaptureBackend:
         for camera_id in required_camera_ids:
             width, height = 64, 48
             path = self._data_root / f"{capture_id}_{camera_id}_{attempt}.png"
-            _write_fake_rgb8_png(path, width, height)
+            _write_fake_png(path, width, height, MONO8_PNG)
             content = path.read_bytes()
             images.append(
                 ImageArtifact(
@@ -211,13 +274,15 @@ class FakeCaptureBackend:
                     file_size_bytes=len(content),
                     width=width,
                     height=height,
-                    pixel_format="RGB8_PNG",
+                    pixel_format=MONO8_PNG,
                     camera_timestamp_raw=wall_ns,
                     camera_timestamp_domain="fake",
                     camera_timestamp_ns=wall_ns,
                     camera_timestamp_synchronized=False,
                     host_arrival_monotonic_ns=now_ns,
                     host_arrival_timestamp_ns=wall_ns,
+                    packet_loss_count=0,
+                    packet_resend_count=0,
                 )
             )
         return CaptureBatch(

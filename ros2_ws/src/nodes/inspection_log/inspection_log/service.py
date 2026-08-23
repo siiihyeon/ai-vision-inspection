@@ -31,7 +31,7 @@ class LogEventService:
         self._repository = repository
 
     def persist(self, event: StoredLogEvent) -> PersistResult:
-        # envelope = self._validate_event(event)
+        self._validate_event(event)
         # 원본 이벤트 commit이 이 메서드의 durability boundary입니다.
         self._repository.append_event(event)
         return PersistResult(log_id=event.log_id, revision=event.revision)

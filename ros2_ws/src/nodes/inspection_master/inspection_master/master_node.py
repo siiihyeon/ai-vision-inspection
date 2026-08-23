@@ -44,6 +44,8 @@ from inspection_interfaces.action import (
     PositionProduct,
 )
 from inspection_interfaces.msg import (
+    InferenceCancellation,
+    InferenceCancellationAck,
     LogEvent,
     LogPersistedAck,
     NodeHeartbeat,
@@ -55,7 +57,11 @@ from inspection_interfaces.msg import (
     SystemCommand,
     VisionQueueState,
 )
-from inspection_interfaces.srv import GetNodeStatus, OperatorCommand
+from inspection_interfaces.srv import (
+    GetNodeStatus,
+    OperatorCommand,
+    ReplayStationResults,
+)
 from rclpy.action import ActionClient
 from rclpy.parameter import Parameter
 from rclpy.signals import SignalHandlerOptions
@@ -386,6 +392,12 @@ class MasterNode(InspectionNodeBase):
         self._operator_results: IdempotencyStore[dict[str, object]] = (
             IdempotencyStore(capacity=512)
         )
+        self._station_replay_generation = 0
+        self._station_replay_completed_generation = -1
+        self._station_replay_offset = 0
+        self._station_replay_inflight = False
+        self._vision_outage_affected_scopes: set[tuple[str, StationId]] = set()
+        self._vision_outage_residual_scopes: set[tuple[str, StationId]] = set()
 
         self._worker_heartbeat_subscriptions = [
             self.create_subscription(
@@ -418,6 +430,10 @@ class MasterNode(InspectionNodeBase):
         )
         self.actuate_client = ActionClient(
             self, ActuateProduct, "/inspection/control/actuate_product"
+        )
+        self.station_replay_client = self.create_client(
+            ReplayStationResults,
+            "/inspection/log/replay_station_results",
         )
         self._station_result_subscription = self.create_subscription(
             StationResult,
@@ -454,6 +470,17 @@ class MasterNode(InspectionNodeBase):
             "master/product_result_locked",
             reliable_event_qos(),
         )
+        self._inference_cancellation_publisher = self.create_publisher(
+            InferenceCancellation,
+            "master/inference_cancellation",
+            reliable_event_qos(),
+        )
+        self._inference_cancellation_ack_subscription = self.create_subscription(
+            InferenceCancellationAck,
+            "/inspection/vision/inference_cancellation_ack",
+            self._handle_inference_cancellation_ack,
+            reliable_event_qos(),
+        )
         self._system_command_publisher = self.create_publisher(
             SystemCommand,
             "master/system_command",
@@ -478,6 +505,9 @@ class MasterNode(InspectionNodeBase):
         self._worker_watchdog = self.create_timer(0.5, self._check_worker_heartbeats)
         self._operation_watchdog = self.create_timer(
             0.1, self._check_operation_deadlines
+        )
+        self._station_replay_timer = self.create_timer(
+            2.0, self._request_station_result_replay
         )
         self._log_flush_timer = self.create_timer(
             self.log_flush_period_ms / 1000.0, self._flush_log_spool
@@ -1433,6 +1463,10 @@ class MasterNode(InspectionNodeBase):
             self._reported_worker_outages.discard(worker_id)
             self.get_logger().info(f"{worker_id.value} heartbeat recovered")
         if update.restarted:
+            if worker_id in {NodeId.VISION, NodeId.LOG}:
+                self._station_replay_generation += 1
+                self._station_replay_offset = 0
+                self._station_replay_inflight = False
             self._advance_command_epoch(
                 f"{worker_id.value} process restart",
                 restarting_worker=worker_id,
@@ -1577,6 +1611,8 @@ class MasterNode(InspectionNodeBase):
             reason=reason,
             manual_intervention_required=False,
         )
+        if worker_id == NodeId.VISION:
+            self._record_vision_outage_residency()
 
         control_faulted_while_moving = (
             worker_id == NodeId.CONTROL
@@ -1606,6 +1642,22 @@ class MasterNode(InspectionNodeBase):
         else:
             self.set_health_state(NodeHealthState.DEGRADED)
             self.get_logger().warning(reason)
+
+    def _record_vision_outage_residency(self) -> None:
+        """Vision 종료 순간 이미 위치 정지가 끝난 제품만 재촬영 대상으로 고정합니다."""
+
+        with self._flow_lock:
+            for station_id, cycle in self._station_cycles.items():
+                context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
+                if context is None:
+                    continue
+                station = context.station(station_id)
+                if station.result_completed:
+                    continue
+                key = (context.product_id, station_id)
+                self._vision_outage_affected_scopes.add(key)
+                if station.position_settled:
+                    self._vision_outage_residual_scopes.add(key)
 
     # endregion
 
@@ -1720,6 +1772,14 @@ class MasterNode(InspectionNodeBase):
             product_id=context.product_id,
             payload=context.snapshot(),
         )
+        if context.physical_state == ProductPhysicalState.SENSOR3_WAIT:
+            self._emit_log_event(
+                severity=LogEvent.INFO,
+                event_type="STATION_B_BYPASSED_AFTER_A_TERMINAL_NG",
+                product_id=context.product_id,
+                payload=context.snapshot(),
+            )
+            return
         # RUN_SYS가 아니면 _start_station_cycle이 스스로 대기 목록에 넣습니다.
         self._start_station_cycle(
             context.product_id, context.fifo_sequence, StationId.B
@@ -1741,6 +1801,12 @@ class MasterNode(InspectionNodeBase):
         except ProductFlowError as exc:
             self._fault_stop(f"Sensor3/FIFO mismatch: {exc}")
             return
+        self._publish_inference_cancellation(
+            context,
+            station_id=None,
+            reason_code=InferenceCancellation.SENSOR3_LOCKED,
+            reason="Sensor3 locked the product result",
+        )
         self._accept_locked(locked)
         self._schedule_actuation(locked)
 
@@ -1789,6 +1855,16 @@ class MasterNode(InspectionNodeBase):
         context = self.ledger.get(product_id, fifo_sequence)
         if context is None:
             self._fault_stop("station cycle references unknown product identity")
+            return
+        if station_id == StationId.B and context.station_b_skip_requested:
+            with self._flow_lock:
+                context.bypass_station_b(context.station_b_skip_reason)
+            self._emit_log_event(
+                severity=LogEvent.INFO,
+                event_type="STATION_B_BYPASSED_AFTER_A_TERMINAL_NG",
+                product_id=context.product_id,
+                payload=context.snapshot(),
+            )
             return
         sensor_index = 1 if station_id == StationId.A else 2
         if sensor_index not in context.sensor_steps:
@@ -1913,6 +1989,18 @@ class MasterNode(InspectionNodeBase):
                 station_id, "PositionProduct Goal was rejected"
             )
             return
+        canceled_context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
+        if (
+            station_id == StationId.B
+            and canceled_context is not None
+            and canceled_context.station_b_skip_requested
+        ):
+            cycle.position_goal_handle = goal_handle
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception:
+                pass
+            return
         cycle.position_goal_handle = goal_handle
         cycle.phase = StationCyclePhase.WAITING_POSITION
         result_future = goal_handle.get_result_async()
@@ -1948,6 +2036,13 @@ class MasterNode(InspectionNodeBase):
             or result.position_command_id != command_id
         ):
             self._fault_stop("PositionProduct Result identity mismatch")
+            return
+        canceled_context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
+        if (
+            station_id == StationId.B
+            and canceled_context is not None
+            and canceled_context.station_b_skip_requested
+        ):
             return
         if not result.success:
             error_code = int(result.error_code)
@@ -2012,15 +2107,23 @@ class MasterNode(InspectionNodeBase):
         ):
             self._fault_stop("PositionSettled identity or target mismatch")
             return
+        context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
+        if context is None:
+            self._fault_stop("PositionSettled references unknown product")
+            return
+        if station_id == StationId.B and context.station_b_skip_requested:
+            self._emit_log_event(
+                severity=LogEvent.INFO,
+                event_type="STATION_B_POSITION_SETTLED_IGNORED_AFTER_A_TERMINAL_NG",
+                product_id=context.product_id,
+                payload=context.snapshot(),
+            )
+            return
         if abs(int(message.position_error_steps)) > self.position_tolerance_steps:
             self._pause_station_for_recovery(
                 station_id,
                 "PositionSettled exceeded configured position tolerance",
             )
-            return
-        context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
-        if context is None:
-            self._fault_stop("PositionSettled references unknown product")
             return
         try:
             with self._flow_lock:
@@ -2052,6 +2155,10 @@ class MasterNode(InspectionNodeBase):
         context = self.ledger.get(product_id, fifo_sequence)
         if cycle is None or context is None or cycle.product_id != product_id:
             self._fault_stop("capture cycle identity mismatch")
+            return
+        if station_id == StationId.B and context.station_b_skip_requested:
+            if cycle.phase != StationCyclePhase.RESUME_PENDING:
+                self._resume_conveyor_after_capture(product_id, station_id)
             return
         if not self.capture_client.wait_for_server(timeout_sec=0.0):
             self._pause_station_for_recovery(
@@ -2160,6 +2267,18 @@ class MasterNode(InspectionNodeBase):
                 station_id, "CaptureProduct Goal was rejected"
             )
             return
+        canceled_context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
+        if (
+            station_id == StationId.B
+            and canceled_context is not None
+            and canceled_context.station_b_skip_requested
+        ):
+            cycle.capture_goal_handle = goal_handle
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception:
+                pass
+            return
         cycle.capture_goal_handle = goal_handle
         cycle.phase = StationCyclePhase.WAITING_CAPTURE_RESULT
         result_future = goal_handle.get_result_async()
@@ -2196,12 +2315,36 @@ class MasterNode(InspectionNodeBase):
         ):
             self._fault_stop("CaptureProduct Result identity mismatch")
             return
+        canceled_context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
+        if (
+            station_id == StationId.B
+            and canceled_context is not None
+            and canceled_context.station_b_skip_requested
+        ):
+            self._emit_log_event(
+                severity=LogEvent.WARNING,
+                event_type="STATION_B_CAPTURE_RESULT_IGNORED_AFTER_A_TERMINAL_NG",
+                product_id=canceled_context.product_id,
+                payload={
+                    **canceled_context.snapshot(),
+                    "capture_success": bool(result.success),
+                    "error_code": int(result.error_code),
+                    "reason": result.reason,
+                },
+            )
+            if cycle.phase != StationCyclePhase.RESUME_PENDING:
+                self._resume_conveyor_after_capture(
+                    canceled_context.product_id, StationId.B
+                )
+            return
         if not result.success:
             if int(result.error_code) == int(ErrorCode.COMMAND_CONFLICT):
                 self._fault_stop(f"CaptureProduct command conflict: {result.reason}")
                 return
             self._finish_capture_failure(
-                station_id, result.reason or "final station capture failed"
+                station_id,
+                result.reason or "final station capture failed",
+                error_code=int(result.error_code),
             )
             return
         returned_camera_ids = tuple(image.camera_id for image in result.images)
@@ -2218,7 +2361,7 @@ class MasterNode(InspectionNodeBase):
                 or int(image.file_size_bytes) <= 0
                 or int(image.width) <= 0
                 or int(image.height) <= 0
-                or image.pixel_format != "RGB8_PNG"
+                or image.pixel_format != "MONO8_PNG"
                 for image in result.images
             )
         ):
@@ -2257,7 +2400,9 @@ class MasterNode(InspectionNodeBase):
         )
         self._resume_conveyor_after_capture(cycle.product_id, station_id)
 
-    def _finish_capture_failure(self, station_id: StationId, reason: str) -> None:
+    def _finish_capture_failure(
+        self, station_id: StationId, reason: str, *, error_code: int = 0
+    ) -> None:
         cycle = self._station_cycles.get(station_id)
         if cycle is None:
             return
@@ -2283,8 +2428,22 @@ class MasterNode(InspectionNodeBase):
             severity=LogEvent.ERROR,
             event_type="STATION_CAPTURE_FORCED_NG",
             product_id=context.product_id,
-            payload={**context.snapshot(), "station_id": station_id.name, "reason": reason},
+            payload={
+                **context.snapshot(),
+                "station_id": station_id.name,
+                "reason": reason,
+                "error_code": error_code,
+            },
         )
+        if station_id == StationId.A:
+            self._cancel_station_b_after_a_terminal(
+                context, f"Station A capture failure: {reason}"
+            )
+        if error_code == int(ErrorCode.VISION_DISK_STOP):
+            self.request_recoverable_device_pause(
+                "Vision disk reached the 95% stop limit",
+                pause_reason=PauseReason.DEVICE_RECOVERY_MANUAL,
+            )
         self._resume_conveyor_after_capture(cycle.product_id, station_id)
 
     def _resume_conveyor_after_capture(
@@ -2523,6 +2682,8 @@ class MasterNode(InspectionNodeBase):
                         "reason": reason,
                     },
                 )
+                if station_id == StationId.A:
+                    self._cancel_station_b_after_a_terminal(context, reason)
 
             case StationMessageOutcome.ACCEPTED:
                 self._apply_accepted_station_result(message, decision)
@@ -2571,9 +2732,19 @@ class MasterNode(InspectionNodeBase):
                 **context.snapshot(),
                 "station_id": station_decision.station_id.name,
                 "capture_id": station_decision.capture_id,
+                "frame_batch_id": station_decision.frame_batch_id,
+                "inference_job_id": station_decision.inference_job_id,
+                "verdict": station_decision.verdict.name,
                 "result_revision": station_decision.revision,
             },
         )
+        if (
+            station_decision.station_id == StationId.A
+            and station_decision.verdict == Verdict.NG
+        ):
+            self._cancel_station_b_after_a_terminal(
+                context, "Station A terminal NG"
+            )
 
     def _handle_station_failure(self, message: StationInferenceFailed) -> None:
         if message.header.session_id != self.session_id:
@@ -2694,6 +2865,8 @@ class MasterNode(InspectionNodeBase):
                         "reason": reason,
                     },
                 )
+                if station_id == StationId.A:
+                    self._cancel_station_b_after_a_terminal(context, reason)
 
             case StationMessageOutcome.ACCEPTED:
                 self._apply_accepted_station_failure(message, decision)
@@ -2727,10 +2900,193 @@ class MasterNode(InspectionNodeBase):
                     **context.snapshot(),
                     "station_id": station_id.name,
                     "capture_id": message.capture_id,
+                    "frame_batch_id": message.frame_batch_id,
+                    "inference_job_id": message.inference_job_id,
                     "error_code": int(message.error_code),
                     "reason": message.reason,
                 },
             )
+            if station_id == StationId.A:
+                self._cancel_station_b_after_a_terminal(
+                    context, f"Station A inference failure: {message.reason}"
+                )
+            if int(message.error_code) == int(ErrorCode.GPU_OUT_OF_MEMORY):
+                self.request_recoverable_device_pause(
+                    "Vision CUDA out of memory; product forced NG and Vision reinitialization required",
+                    pause_reason=PauseReason.DEVICE_RECOVERY_MANUAL,
+                )
+
+    def _cancel_station_b_after_a_terminal(
+        self, context, reason: str
+    ) -> None:
+        """A terminal NG/실패 즉시 B의 미시작·대기·active 작업을 취소합니다."""
+
+        with self._flow_lock:
+            context.request_station_b_skip(reason)
+        self._publish_inference_cancellation(
+            context,
+            station_id=StationId.B,
+            reason_code=InferenceCancellation.STATION_A_TERMINAL_NG,
+            reason=reason,
+        )
+        cycle = self._station_cycles.get(StationId.B)
+        if cycle is not None and cycle.product_id == context.product_id:
+            for goal_handle in (
+                cycle.position_goal_handle,
+                cycle.capture_goal_handle,
+            ):
+                if goal_handle is None:
+                    continue
+                try:
+                    goal_handle.cancel_goal_async()
+                except Exception as exc:
+                    self.get_logger().warning(
+                        f"Station B action cancellation failed: {type(exc).__name__}"
+                    )
+            with self._flow_lock:
+                changed = context.mark_station_b_skipped(reason)
+                resume_existing_result = False
+                if (
+                    not changed
+                    and cycle.phase != StationCyclePhase.RESUME_PENDING
+                    and context.station(StationId.B).result_completed
+                ):
+                    context.promote_capture_completion_from_vision(StationId.B)
+                    resume_existing_result = True
+            if changed or resume_existing_result:
+                self._emit_log_event(
+                    severity=LogEvent.WARNING,
+                    event_type=(
+                        "STATION_B_ACTIVE_CANCELED_AFTER_A_TERMINAL_NG"
+                        if changed
+                        else "STATION_B_EXISTING_RESULT_RETAINED_AFTER_A_TERMINAL_NG"
+                    ),
+                    product_id=context.product_id,
+                    payload=context.snapshot(),
+                )
+                self._resume_conveyor_after_capture(
+                    context.product_id, StationId.B
+                )
+            return
+        if context.physical_state == ProductPhysicalState.STATION_B_WAIT:
+            with self._flow_lock:
+                changed = context.bypass_station_b(reason)
+            if changed:
+                self._emit_log_event(
+                    severity=LogEvent.INFO,
+                    event_type="STATION_B_BYPASSED_AFTER_A_TERMINAL_NG",
+                    product_id=context.product_id,
+                    payload=context.snapshot(),
+                )
+
+    def _publish_inference_cancellation(
+        self,
+        context,
+        *,
+        station_id: StationId | None,
+        reason_code: int,
+        reason: str,
+    ) -> None:
+        message = InferenceCancellation()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.session_id = self.session_id
+        message.header.message_id = new_uuid()
+        message.header.correlation_id = context.product_id
+        message.cancellation_id = new_uuid()
+        message.product_id = context.product_id
+        message.fifo_sequence = context.fifo_sequence
+        message.station_id = int(station_id) if station_id is not None else 0
+        message.reason_code = int(reason_code)
+        message.reason = reason
+        message.canceled_at = message.header.stamp
+        self._inference_cancellation_publisher.publish(message)
+
+    def _handle_inference_cancellation_ack(
+        self, message: InferenceCancellationAck
+    ) -> None:
+        if message.header.session_id != self.session_id:
+            return
+        self._emit_log_event(
+            severity=LogEvent.INFO,
+            event_type="VISION_INFERENCE_CANCELLATION_ACK",
+            product_id=message.product_id,
+            payload={
+                "cancellation_id": message.cancellation_id,
+                "fifo_sequence": int(message.fifo_sequence),
+                "station_id": int(message.station_id),
+                "removed_queue_jobs": int(message.removed_queue_jobs),
+                "active_job_found": bool(message.active_job_found),
+                "active_result_will_be_discarded": bool(
+                    message.active_result_will_be_discarded
+                ),
+                "reason": message.reason,
+            },
+        )
+
+    def _request_station_result_replay(self) -> None:
+        """Vision/Log 재시작 뒤 현재 session의 durable terminal을 page 단위 복원합니다."""
+
+        if (
+            self._station_replay_inflight
+            or self._station_replay_completed_generation
+            == self._station_replay_generation
+            or not self.session_id
+            or not self.station_replay_client.service_is_ready()
+        ):
+            return
+        request = ReplayStationResults.Request()
+        request.session_id = self.session_id
+        request.requester_instance_id = self.node_instance_id
+        request.max_results = 1000
+        request.offset = self._station_replay_offset
+        self._station_replay_inflight = True
+        try:
+            future = self.station_replay_client.call_async(request)
+        except Exception as exc:
+            self._station_replay_inflight = False
+            self.get_logger().warning(
+                f"station result replay request failed: {type(exc).__name__}"
+            )
+            return
+        future.add_done_callback(
+            partial(
+                self._handle_station_result_replay,
+                self._station_replay_generation,
+            )
+        )
+
+    def _handle_station_result_replay(self, generation: int, future) -> None:
+        self._station_replay_inflight = False
+        if generation != self._station_replay_generation:
+            return
+        try:
+            response = future.result()
+        except Exception as exc:
+            self.get_logger().warning(
+                f"station result replay response failed: {type(exc).__name__}"
+            )
+            return
+        if not response.success:
+            self.get_logger().warning(
+                f"station result replay deferred: {response.reason}"
+            )
+            return
+        for message in response.results:
+            self._handle_station_result(message)
+        for message in response.failures:
+            self._handle_station_failure(message)
+        self._station_replay_offset = int(response.next_offset)
+        if response.has_more:
+            return
+        self._station_replay_completed_generation = generation
+        self._emit_log_event(
+            severity=LogEvent.INFO,
+            event_type="LOG_STATION_RESULT_REPLAY_COMPLETED",
+            payload={
+                "generation": generation,
+                "terminal_count": self._station_replay_offset,
+            },
+        )
 
     # endregion
 
@@ -3176,6 +3532,7 @@ class MasterNode(InspectionNodeBase):
             return False
 
         self._cancel_tracked_operation_goals(include_actuation=False)
+        nonresidual_failures: list[tuple[object, StationId, str]] = []
         for station_id, cycle in tuple(self._station_cycles.items()):
             cycle.deadline_ns = 0
             context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
@@ -3198,6 +3555,27 @@ class MasterNode(InspectionNodeBase):
                         self._deferred_capture_resumes.add(
                             (cycle.product_id, station_id)
                         )
+                    elif (
+                        cycle.product_id,
+                        station_id,
+                    ) in self._vision_outage_affected_scopes and (
+                        cycle.product_id,
+                        station_id,
+                    ) not in self._vision_outage_residual_scopes:
+                        reason = (
+                            "Vision ended before station motor stop; product is "
+                            "non-residual and is not recaptured"
+                        )
+                        context.mark_capture_failed(
+                            station_id,
+                            capture_id=cycle.capture_id,
+                            reason=reason,
+                        )
+                        cycle.phase = StationCyclePhase.RESUME_PENDING
+                        self._deferred_capture_resumes.add(
+                            (cycle.product_id, station_id)
+                        )
+                        nonresidual_failures.append((context, station_id, reason))
                     else:
                         context.reset_unfinished_station_cycle(station_id)
                         self._station_cycles.pop(station_id, None)
@@ -3210,6 +3588,22 @@ class MasterNode(InspectionNodeBase):
                     recovery_policy=RecoveryPolicy.LINE_CLEAR_REQUIRED,
                 )
                 return False
+
+        for context, station_id, reason in nonresidual_failures:
+            self._emit_log_event(
+                severity=LogEvent.ERROR,
+                event_type="VISION_RESTART_NONRESIDUAL_FORCED_NG",
+                product_id=context.product_id,
+                payload={
+                    **context.snapshot(),
+                    "station_id": station_id.name,
+                    "reason": reason,
+                },
+            )
+            if station_id == StationId.A:
+                self._cancel_station_b_after_a_terminal(context, reason)
+        self._vision_outage_affected_scopes.clear()
+        self._vision_outage_residual_scopes.clear()
 
         for cycle in self._actuation_cycles.values():
             if cycle.phase == ActuationPhase.GOAL_PENDING:

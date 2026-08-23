@@ -1,0 +1,23 @@
+/inspection/vision_node:
+  ros__parameters:
+    vision.trigger.mode: "GIGE_ACTION_COMMAND"
+    vision.camera_ids.station_a: ["DA9880512", "DA9880516", "DA7552836"]
+    vision.camera_ids.station_b: ["DA7838410"]
+    vision.camera_network_map_json: '{"DA9880512":"192.168.10.13","DA9880516":"192.168.10.11","DA7552836":"192.168.10.14","DA7838410":"192.168.10.12"}'
+    vision.gige_action.device_key: 0       # TODO(HARDWARE_REQUIRED): MVS 확인
+    vision.gige_action.group_key: 0        # TODO(HARDWARE_REQUIRED): MVS 확인
+    vision.gige_action.group_mask: 0       # TODO(HARDWARE_REQUIRED): MVS 확인
+    vision.frame_arrival_skew_limit_us: 0  # TODO(HARDWARE_REQUIRED): 실측 분포
+    vision.capture.acquisition_timeout_ms: 0  # TODO(HARDWARE_REQUIRED): 실측
+    vision.capture.max_attempts: 2
+    vision.gige.packet_size: 1500
+    vision.gige.packet_delay_ticks: 5000  # 초기값, packet loss/skew 시험 후 조정
+    vision.ptp.enabled: false             # 전체 장비 지원 확인 전에는 사용 금지
+    vision.ptp.validation_completed: false  # TODO(HARDWARE_REQUIRED): 지원/미지원 검증
+    vision.camera.disconnect_pause_after_ms: 5000
+    vision.camera.reconnect_interval_ms: 1000
+    vision.camera.reconnect_max_attempts: 5
+    vision.image.sensor_width: 2248
+    vision.image.sensor_height: 2048
+    vision.image.canonical_pixel_format: "MONO8_PNG"
+    vision.data_root: "/var/lib/inspection/images"

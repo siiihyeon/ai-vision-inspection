@@ -41,10 +41,12 @@ REQUIRED_INTERFACES = {
         "StationInferenceFailed.msg",
         "ProductResultLocked.msg",
         "VisionQueueState.msg",
+        "InferenceCancellation.msg",
+        "InferenceCancellationAck.msg",
         "LogEvent.msg",
         "LogPersistedAck.msg",
     },
-    "srv": {"GetNodeStatus.srv", "OperatorCommand.srv"},
+    "srv": {"GetNodeStatus.srv", "OperatorCommand.srv", "ReplayStationResults.srv"},
     "action": {
         "InitializeNode.action",
         "PositionProduct.action",
@@ -69,6 +71,10 @@ EXPECTED_FIELDS = {
     "srv/OperatorCommand.srv": [
         ["request_id", "command_type", "reason", "operator_id"],
         ["request_id", "accepted", "system_state", "system_state_name", "message"],
+    ],
+    "srv/ReplayStationResults.srv": [
+        ["session_id", "requester_instance_id", "max_results", "offset"],
+        ["success", "results", "failures", "next_offset", "has_more", "reason"],
     ],
     "action/CaptureProduct.action": [
         ["command", "product_id", "fifo_sequence", "station_id", "capture_id", "required_camera_ids", "requested_at"],
@@ -231,7 +237,7 @@ require(
 )
 
 interface_manifest = ElementTree.parse(INTERFACES / "package.xml").getroot()
-require(interface_manifest.findtext("version") == "2.0.0", "interface version must be 2.0.0")
+require(interface_manifest.findtext("version") == "2.1.0", "interface version must be 2.1.0")
 
 for manifest in manifests:
     package_root = manifest.parent
@@ -245,10 +251,17 @@ for manifest in manifests:
 for readme in REQUIRED_READMES:
     require(readme.is_file() and readme.stat().st_size > 100, f"required README missing/empty: {readme}")
 
-sim = (SOURCE / "basic_packages" / "inspection_bringup" / "config" / "sim.yaml").read_text(encoding="utf-8")
-hardware = (SOURCE / "basic_packages" / "inspection_bringup" / "config" / "hardware.yaml").read_text(encoding="utf-8")
+config_root = SOURCE / "basic_packages" / "inspection_bringup" / "config"
+sim = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(config_root.glob("*sim.yaml"))
+)
+hardware = "\n".join(
+    path.read_text(encoding="utf-8")
+    for path in sorted(config_root.glob("*hardware.yaml"))
+)
 for config in (sim, hardware):
-    require('system.expected_interface_version: "2.0.0"' in config, "interface version config mismatch")
+    require('system.expected_interface_version: "2.1.0"' in config, "interface version config mismatch")
     require("comm.master_heartbeat_period_ms: 500" in config, "Master heartbeat period mismatch")
     require(config.count("comm.node_heartbeat_period_ms: 500") == 3, "worker heartbeat period mismatch")
     require("comm.master_heartbeat_timeout_ms: 2000" in config, "heartbeat timeout mismatch")
@@ -363,8 +376,9 @@ require(
 )
 for token in ("capture_id=request.capture_id", "vision.capture.max_attempts", "inference_queue.try_enqueue", "ENQUEUE_BLOCKED", "frame_arrival_skew_us", '"reason": ""'):
     require(token in vision, f"Vision capture contract missing: {token}")
-for token in ("deque", "queue_total_timeout_ms", "discard_expired", "_sweep_expired", "_load_with_one_retry", "_infer_with_one_retry", "_model_lock"):
+for token in ("deque", "queue_total_timeout_ms", "discard_expired", "_sweep_expired", "_load_with_one_retry", "_infer_once", "_model_lock", "CUDA_OOM"):
     require(token in queue, f"Inference worker contract missing: {token}")
+require("_infer_with_one_retry" not in queue, "model inference retry must remain disabled")
 for table in ("products_latest", "frame_batch_attempts", "inference_jobs_latest", "camera_result_revisions", "station_result_revisions", "faults", "pending_projections"):
     require(table in log_storage, f"Log schema table missing: {table}")
 

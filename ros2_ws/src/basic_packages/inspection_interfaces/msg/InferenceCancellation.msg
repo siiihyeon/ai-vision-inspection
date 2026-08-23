@@ -1,0 +1,11 @@
+uint8 STATION_A_TERMINAL_NG=1
+uint8 SENSOR3_LOCKED=2
+uint8 SESSION_SHUTDOWN=3
+CommonHeader header
+string cancellation_id
+string product_id
+uint64 fifo_sequence
+uint8 station_id
+uint8 reason_code
+string reason
+builtin_interfaces/Time canceled_at

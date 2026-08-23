@@ -22,6 +22,15 @@ def _launch_nodes(context: LaunchContext) -> list[Node]:
         raise RuntimeError(f"unknown inspection profile: {profile}")
 
     parameters = [str(config_path)]
+    vision_fragments = [
+        Path(get_package_share_directory("inspection_bringup"))
+        / "config"
+        / f"vision_{section}.{profile}.yaml"
+        for section in ("capture", "model", "runtime")
+    ]
+    if any(not path.is_file() for path in vision_fragments):
+        raise RuntimeError(f"Vision profile fragments are incomplete: {profile}")
+    vision_parameters = [str(config_path), *map(str, vision_fragments)]
     return [
         Node(
             package="inspection_master",
@@ -45,7 +54,7 @@ def _launch_nodes(context: LaunchContext) -> list[Node]:
             name="vision_node",
             namespace="inspection",
             output="screen",
-            parameters=parameters,
+            parameters=vision_parameters,
         ),
         Node(
             package="inspection_log",
