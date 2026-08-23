@@ -2,6 +2,8 @@
 
 `src/basic_packages`는 공통 계약, `src/nodes`는 네 실행 노드입니다. 인터페이스 2.1.0은 Vision cancellation/replay baseline입니다.
 
+Vision Node를 완성하기 위한 확정·미결정·실험 항목과 파라미터 위치는 [Vision Node 완성 결정표](src/nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)를 기준으로 합니다.
+
 ## 검증 순서
 
 ```bash

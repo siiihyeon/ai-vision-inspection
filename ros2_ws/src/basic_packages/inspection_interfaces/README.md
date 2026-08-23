@@ -31,4 +31,9 @@
 
 ## 결정 필요
 
-Message 구조 자체는 골격에 충분합니다. 다만 실제 값으로는 station별 camera ID, sensor ID, conveyor와 station mapping, timestamp domain, model score schema가 남았습니다. 값이 기존 필드로 표현 불가능한 경우에만 v2 계약 변경을 제안합니다.
+Message 구조 자체는 골격에 충분합니다. Camera serial과 station 배치는 확정됐지만
+Station A serial별 물리 view 역할·모델 입력 순서가 남았습니다. 그 밖에 sensor ID,
+conveyor와 station mapping, 진단용 camera timestamp domain 세부 의미, model score
+schema가 남았습니다. 값이 기존 필드로 표현 불가능한 경우에만 v2 계약 변경을
+제안합니다. Vision 항목은 [Vision Node 완성 결정표](../../nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)를
+기준으로 합니다.

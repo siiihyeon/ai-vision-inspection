@@ -2,6 +2,8 @@
 
 Launch는 공통 `sim.yaml`/`hardware.yaml`과 Vision 전용 세 파일을 순서대로 읽습니다. 생산값을 한 파일에 섞지 않기 위한 구조입니다.
 
+Vision의 전체 파라미터, 아직 key가 없는 모델·카메라 항목, 실험 인수조건은 [Vision Node 완성 결정표](../../../nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)를 따릅니다.
+
 | 파일 | 책임 |
 |---|---|
 | `hardware.yaml` | Master, Control, Log와 공통 heartbeat |
@@ -32,6 +34,8 @@ Launch는 공통 `sim.yaml`/`hardware.yaml`과 Vision 전용 세 파일을 순�
 - Mega port/baud/firmware protocol, 센서·TB6600·actuator 설정과 위치 timeout
 
 미확정 값 때문에 hardware가 `INIT_BLOCKED`되는 것은 정상입니다. 값을 임의로 채워 READY를 우회하지 마십시오.
+
+Exposure, gain, model device, input shape, crop/resize/normalization, output threshold는 아직 ROS parameter key가 없습니다. 값이 결정되면 `vision_node.py`에 선언·검증을 추가하고 capture 또는 model hardware YAML에 넣습니다. 설치 후 `install/` 아래 복사본을 직접 수정하지 않습니다.
 
 ## Linux 경로 준비
 

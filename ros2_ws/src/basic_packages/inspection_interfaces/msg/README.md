@@ -17,5 +17,6 @@
 - `InferenceCancellation`: station_id=0은 제품 전체, 1/2는 station scope입니다. Ack의 `active_result_will_be_discarded=true`는 이미 시작된 forward를 죽이지 않는다는 뜻입니다.
 - `LogPersistedAck.acked_log_ids`와 `acked_revisions`는 같은 index의 identity pair입니다.
 
-결정 필요 값: Sensor ID 체계, station/conveyor 실제 매핑, 유한값 범위 안에서의
-model score 의미·정상 범위, camera timestamp domain 문자열 표준.
+결정 필요 값: Station A serial별 물리 view 역할·모델 입력 순서, Sensor ID 체계,
+station/conveyor 실제 매핑, 유한값 범위 안에서의 model score 의미·정상 범위,
+진단용 camera timestamp domain 세부 표준. 생산 skew는 host monotonic만 사용합니다.

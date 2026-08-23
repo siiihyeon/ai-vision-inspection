@@ -2,6 +2,8 @@
 
 이 문서는 `feature/vision-node-2` 구현의 승인 정책 요약입니다. 과거 XLSX나 질의 기록에 RGB/Bayer, inference retry, confusion matrix가 남아 있으면 현재 코드와 이 문서가 우선합니다.
 
+Vision Node의 모든 미결정값과 수정 위치는 [Vision Node 완성 결정표](../ros2_ws/src/nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)가 단일 기준입니다. 이 문서는 노드 간 책임과 승인 정책만 요약하며 파라미터 목록을 중복 관리하지 않습니다.
+
 ## 책임과 판정
 
 - Vision은 A 세 장과 B 한 장을 각각 station job으로 추론합니다. 제품 최종 판정은 Master가 소유합니다.
@@ -47,8 +49,6 @@
 
 ## 실제 장비 전에 남은 결정/시험
 
-- 자동 조회되는 네 카메라 firmware 확인과 필요 시 승인 `.dav` 수동 적용, acquisition timeout
-- exposure/gain, packet delay 조정, A/B 동시 촬영 packet loss/host arrival skew
-- 실제 모델 input shape, 종횡비 resize/padding, normalization, output/threshold
-- 최대 제품 유입속도, queue/worker/model lock 초기값 조정, A/B timeout
+- Camera/MVS, 모델, queue, 파일의 전체 입력은 Vision Node 완성 결정표를 따릅니다.
+- 핵심 차단 항목은 firmware/runtime 실측, Host NIC 설정, exposure/gain/acquisition/skew, 실제 모델 입출력·전처리·threshold, 최대 제품 유입속도와 A/B timeout입니다.
 - Mega serial 방식과 firmware protocol은 Vision 내부 알고리즘에는 필요 없지만 전체 라인 Sensor3/재시작 잔류 판정 통합에는 반드시 필요

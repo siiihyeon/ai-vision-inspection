@@ -2,6 +2,10 @@
 
 Vision Node는 HIKROBOT 촬영, 완성된 Mono8 PNG 저장, station 단위 추론 queue와 PyTorch worker 골격을 소유합니다. 제품의 최종 불량 판정과 물리 FIFO는 Master 소유입니다. Ubuntu MVS 5.0.2 Action1 adapter는 구현됐지만 모델 전처리·출력 decoder와 실측 파라미터가 아직 주입 전이므로 hardware profile은 의도적으로 `INIT_BLOCKED`입니다.
 
+## 완성 결정표
+
+확정 정책, 아직 결정할 논리 정책, 실장비에서 정할 값, 현재 기본값과 각 ROS 파라미터의 정확한 수정 위치는 [README_COMPLETION_CHECKLIST.md](README_COMPLETION_CHECKLIST.md)에 모두 정리되어 있습니다. Vision 구현·시험 때는 이 문서를 체크리스트로 사용하고, 이 README는 구조와 workflow 요약으로 사용합니다.
+
 ## 확정 Workflow
 
 ```text
@@ -61,10 +65,10 @@ Ubuntu에서는 HIKROBOT MVS 5.0.2 x86_64를 `/opt/MVS`에 설치하고 Vision �
 
 ## 실제 장비 주입 전 남은 항목
 
-- 네 카메라에서 자동 조회될 firmware 버전 확인 및 필요 시 HIKROBOT 승인 `.dav` 수동 적용
-- exposure, gain, acquisition timeout, frame skew limit
-- A/B 동시 촬영 packet loss·host monotonic arrival skew 시험
-- 실제 TorchScript 입력 tensor shape, resize/padding, normalization, 출력 score/threshold decoder
-- 최대 제품 유입 속도, 모델 lock/worker 조합별 GPU/VRAM 및 latency 시험
+- 모델 계약: A view 물리 순서, 실제 `.pt`와 SHA-256, 입력 shape/dtype, crop·resize·padding·normalization, 출력 score·threshold·불확실 처리
+- Camera/MVS: Ubuntu runtime·firmware 자동 조회, Host NIC 고정 IP, exposure/gain, acquisition timeout, packet loss 0과 host arrival skew 생산값
+- 공정 성능: 최대 제품 유입 속도, A/B p99.9, queue/worker/model-lock 조합별 GPU/VRAM·latency와 저장장치 시험
+
+전체 항목과 입력 파일은 완성 결정표를 따릅니다. Bayer, white balance, demosaic, BGR→RGB는 Mono8 정책에서 필요한 입력값이 아닙니다. PTP와 camera timestamp unit도 현재 생산 skew 판정의 차단값이 아닙니다.
 
 SHA-256은 `.pt` 파일 내용에서 계산하는 64자리 지문입니다. 파일명은 같아도 내용이 바뀌면 지문이 바뀌므로 한 session 동안 모델이 몰래 교체되는 것을 막습니다. warmup은 생산 시작 전 dummy batch를 여러 번 forward하여 초기 CUDA kernel/메모리 할당 지연을 제거하는 절차이며 기본 골격 값은 10회입니다.

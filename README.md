@@ -6,7 +6,9 @@
 
 이 저장소는 **Vision Node 2 정책을 반영한 interface 2.1 공정 구현**입니다. Ubuntu MVS 5.0.2 Action1 adapter, Mono8 촬영 계약, packet-loss 검증, station batch worker, A terminal NG의 B 취소, Sensor3 lock, Vision durable 결과/replay, Log 보고서·10,000장 보존까지 연결되어 있습니다. Mega serial protocol/TB6600·액추에이터 adapter와 모델 전처리·출력 decoder는 아직 placeholder입니다. 따라서 남은 설정과 실장비 검증 없이 생산 라인을 운전하면 안 됩니다.
 
-남은 값을 각 폴더 README의 `결정 필요` 표대로 확정해 전달하면, placeholder를 실제 장비 adapter와 추론 알고리즘으로 교체하고 통합 시험하는 단계로 진행할 수 있습니다.
+Vision Node의 확정값, 미결정 정책, 실험값, 모든 파라미터 수정 위치는 [Vision Node 완성 결정표](ros2_ws/src/nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)를 단일 기준으로 사용합니다. 해당 표의 구현 차단 항목을 확정하면 placeholder를 실제 장비 adapter와 추론 알고리즘으로 교체할 수 있고, 이후 실장비 인수시험을 통과해야 생산 승인이 됩니다.
+
+기존 `README_비전검수_워크플로우.pdf`도 현재 Action1·Mono8·비동기 추론 정책에 맞춰 갱신되어 있습니다. 세부 파라미터는 PDF 요약이 아니라 위 완성 결정표와 hardware YAML을 기준으로 합니다.
 
 ## 확정된 핵심 Workflow
 
@@ -49,13 +51,13 @@ Control PositionSettled
 |---|---|---|
 | `inspection_master` | 시스템 FSM, 제품 ID/FIFO, A/B 결합, 최종 잠금 | 해당 패키지 README |
 | `inspection_control` | Mega, 센서, TB6600, 액추에이터 | 해당 패키지 README |
-| `inspection_vision` | MVS capture, Mono8 파일, queue/worker, station 결과 | 해당 패키지 README |
+| `inspection_vision` | MVS capture, Mono8 파일, queue/worker, station 결과 | 패키지 README와 `README_COMPLETION_CHECKLIST.md` |
 | `inspection_log` | SQLite, ACK, projection, 보존정책 | 해당 패키지 README |
 | `inspection_interfaces` | v2 노드 간 계약 | 해당 패키지와 msg/action/srv README |
 | `inspection_common` | ID/digest/QoS/초기화/spool | 해당 패키지 README |
 | `inspection_bringup` | sim/hardware 설정과 launch | config README |
 | `firmware/arduino_mega` | Mega firmware placeholder | firmware README |
-| `구현_전_상세설계` | 승인사항과 미결정사항 단일 목록 | 설계 README |
+| `구현_전_상세설계` | 노드 공통 승인 정책 요약 | 설계 README |
 
 ## 빌드와 검사
 
