@@ -74,6 +74,14 @@ from inspection_vision.capture_contract import (  # noqa: E402
     ImageArtifact,
     MONO8_PNG,
     RGB8_PNG,
+    write_mono8_png_atomic,
+)
+from inspection_vision.hikrobot_mvs import (  # noqa: E402
+    ActionGroup,
+    CameraInventoryEntry,
+    MvsBackendSettings,
+    MvsSdkError,
+    validate_camera_inventory,
 )
 from inspection_vision.inference_queue import (  # noqa: E402
     InferenceFailureKind,
@@ -1208,6 +1216,103 @@ class VisionContractTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "color type"):
                 batch.validate(("camera-a",), expected_pixel_format=MONO8_PNG)
+
+    def test_atomic_mono8_png_writer_refuses_completed_file_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / "mono.png"
+            digest, size_bytes = write_mono8_png_atomic(
+                path, bytes((0, 64, 128, 255)), 2, 2
+            )
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+            self.assertEqual(path.stat().st_size, size_bytes)
+            with self.assertRaises(FileExistsError):
+                write_mono8_png_atomic(path, bytes(4), 2, 2)
+            self.assertFalse(any(path.parent.glob("*.part")))
+
+    @staticmethod
+    def _mvs_inventory(firmware_a: str, firmware_b: str | None = None):
+        serials = ("A1", "A2", "A3", "B1")
+        addresses = ("192.168.10.13", "192.168.10.11", "192.168.10.14", "192.168.10.12")
+        return tuple(
+            CameraInventoryEntry(
+                serial=serial,
+                station_id=1 if index < 3 else 2,
+                ip_address=addresses[index],
+                model_name="MV-CS050-10GC",
+                firmware_version=(
+                    firmware_b if index == 3 and firmware_b is not None else firmware_a
+                ),
+            )
+            for index, serial in enumerate(serials)
+        )
+
+    def test_mvs_firmware_empty_expectation_requires_four_versions_to_match(self) -> None:
+        entries = self._mvs_inventory("V1.2.3")
+        network_map = {entry.serial: entry.ip_address for entry in entries}
+        version = validate_camera_inventory(
+            entries,
+            expected_serials=("A1", "A2", "A3", "B1"),
+            expected_network_map=network_map,
+            expected_model="MV-CS050-10GC",
+            expected_firmware_version="",
+        )
+        self.assertEqual(version, "V1.2.3")
+
+        with self.assertRaisesRegex(MvsSdkError, "firmware versions differ"):
+            validate_camera_inventory(
+                self._mvs_inventory("V1.2.3", "V1.2.4"),
+                expected_serials=("A1", "A2", "A3", "B1"),
+                expected_network_map=network_map,
+                expected_model="MV-CS050-10GC",
+                expected_firmware_version="",
+            )
+
+    def test_mvs_action_groups_and_initial_operating_defaults(self) -> None:
+        settings = MvsBackendSettings(
+            station_camera_ids={1: ("A1", "A2", "A3"), 2: ("B1",)},
+            camera_network_map={
+                "A1": "192.168.10.13",
+                "A2": "192.168.10.11",
+                "A3": "192.168.10.14",
+                "B1": "192.168.10.12",
+            },
+            action_device_key=1,
+            action_groups={1: ActionGroup(1, 1), 2: ActionGroup(2, 2)},
+            data_root=Path(tempfile.gettempdir()).resolve() / "inspection-images",
+            acquisition_timeout_ms=1000,
+        )
+        settings.validate()
+        self.assertEqual(settings.packet_size, 1500)
+        self.assertEqual(settings.action_groups[1], ActionGroup(1, 1))
+        self.assertEqual(settings.action_groups[2], ActionGroup(2, 2))
+
+        config_root = (
+            WORKSPACE
+            / "src"
+            / "basic_packages"
+            / "inspection_bringup"
+            / "config"
+        )
+        capture_config = (config_root / "vision_capture.hardware.yaml").read_text(
+            encoding="utf-8"
+        )
+        runtime_config = (config_root / "vision_runtime.hardware.yaml").read_text(
+            encoding="utf-8"
+        )
+        model_config = (config_root / "vision_model.hardware.yaml").read_text(
+            encoding="utf-8"
+        )
+        for expected_line in (
+            "vision.image.sensor_width: 2448",
+            "vision.image.sensor_height: 2048",
+            "vision.gige_action.station_a.group_key: 1",
+            "vision.gige_action.station_b.group_key: 2",
+            'vision.camera.expected_firmware_version: ""',
+        ):
+            self.assertIn(expected_line, capture_config)
+        self.assertIn("vision.queue.capacity: 16", runtime_config)
+        self.assertIn("vision.worker_count: 1", model_config)
+        self.assertIn("vision.model.serialize_access: true", model_config)
 
 
 class LogContractTests(unittest.TestCase):

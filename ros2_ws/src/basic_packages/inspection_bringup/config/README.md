@@ -14,7 +14,10 @@ Launch는 공통 `sim.yaml`/`hardware.yaml`과 Vision 전용 세 파일을 순�
 - interface `2.1.0`, heartbeat 500 ms/timeout 2,000 ms
 - Action broadcast, 전체 station 재시도 최대 2회, 재시도 전 추가 대기 없음
 - 카메라 A 3대 `DA9880512`, `DA9880516`, `DA7552836`; B 1대 `DA7838410`
-- canonical `MONO8_PNG`, 센서 해상도 `2248×2048`, packet size 1500
+- canonical `MONO8_PNG`, 전체 센서 ROI `2448×2048@(0,0)`, packet size 1500
+- MVS Action1 즉시 실행: DeviceKey 1, A key/mask 1/1, B 2/2
+- PTP와 무관하게 host monotonic arrival skew 사용
+- queue 16, worker 1, model lock 활성화는 최초 생산시험용 초기값
 - packet delay 초기값 5000 ticks, disk warning 90%/stop 95%
 - shutdown queue soft timeout 3초, GPU/NVML sampling 200 ms
 - 완성 이미지 최근 10,000장, timeout 최소 표본 A/B 각각 10,000, p99.9×1.2, 자동 적용 기본 false
@@ -22,11 +25,10 @@ Launch는 공통 `sim.yaml`/`hardware.yaml`과 Vision 전용 세 파일을 순�
 
 ## Hardware에서 아직 0/빈 값으로 남겨야 하는 항목
 
-- MVS device key/group key/group mask, acquisition timeout, frame skew limit
-- PTP 지원/미지원 검증 완료 표시, exposure/gain/ROI
-- 최대 제품 유입률을 반영한 queue capacity
+- acquisition timeout, frame skew limit, exposure/gain
+- 자동 조회 후 필요하면 입력할 승인 firmware 버전(`expected_firmware_version`)
 - A/B enqueue→결과 timeout. 시험 후 보고서 p99.9를 이용합니다.
-- 실제 `.pt` SHA-256, 모델 입출력/전처리 계약, worker/model-lock 실험 결과
+- 실제 `.pt` SHA-256, 모델 입출력/전처리 계약, queue/worker/model-lock 조정 결과
 - Mega port/baud/firmware protocol, 센서·TB6600·actuator 설정과 위치 timeout
 
 미확정 값 때문에 hardware가 `INIT_BLOCKED`되는 것은 정상입니다. 값을 임의로 채워 READY를 우회하지 마십시오.

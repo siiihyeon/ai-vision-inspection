@@ -4,7 +4,7 @@
 
 ## 현재 산출물의 성격
 
-이 저장소는 **Vision Node 2 정책을 반영한 interface 2.1 공정 구현**입니다. Mono8 촬영 계약, packet-loss 검증, station batch worker, A terminal NG의 B 취소, Sensor3 lock, Vision durable 결과/replay, Log 보고서·10,000장 보존까지 연결되어 있습니다. 실제 MVS SDK, Mega serial protocol/TB6600·액추에이터 adapter, 모델 전처리·출력 decoder는 아직 placeholder입니다. 따라서 지금 상태를 생산 장비에 연결하면 안 됩니다.
+이 저장소는 **Vision Node 2 정책을 반영한 interface 2.1 공정 구현**입니다. Ubuntu MVS 5.0.2 Action1 adapter, Mono8 촬영 계약, packet-loss 검증, station batch worker, A terminal NG의 B 취소, Sensor3 lock, Vision durable 결과/replay, Log 보고서·10,000장 보존까지 연결되어 있습니다. Mega serial protocol/TB6600·액추에이터 adapter와 모델 전처리·출력 decoder는 아직 placeholder입니다. 따라서 남은 설정과 실장비 검증 없이 생산 라인을 운전하면 안 됩니다.
 
 남은 값을 각 폴더 README의 `결정 필요` 표대로 확정해 전달하면, placeholder를 실제 장비 adapter와 추론 알고리즘으로 교체하고 통합 시험하는 단계로 진행할 수 있습니다.
 
@@ -16,7 +16,7 @@ Control PositionSettled
   → Vision GIGE_ACTION_COMMAND broadcast
   → station 필수 camera frame 전체 수신
   → host arrival monotonic 기준 frame_arrival_skew_us 검증
-  → 2248×2048 Mono8 PNG atomic 저장 + SHA-256 + packet_loss=0 검증
+  → 2448×2048 Mono8 PNG atomic 저장 + SHA-256 + packet_loss=0 검증
   → FrameBatch(image file paths) bounded FIFO enqueue
   → CaptureProduct 성공
   → A 3-view/B 1-view PyTorch batch worker 추론
@@ -33,6 +33,8 @@ Control PositionSettled
 - FIFO는 worker가 꺼내는 순서까지 보장합니다. 병렬 완료 순서는 Master의 `fifo_sequence` reorder buffer가 정렬합니다.
 - 제품 결과 적용 deadline은 Sensor3입니다. 명시적 station 실패는 즉시 `FORCED_NG` 후보로 기록하고, Sensor3에서만 최종 판정을 잠금합니다. Sensor3 시 미완료도 `FORCED_NG`입니다.
 - 1-channel Mono8 PNG가 canonical 파일입니다. resize/normalization은 모델 계약 주입 전까지 placeholder입니다.
+- Action1은 즉시 실행(`scheduled=false`)하며 A=`key/mask 1/1`, B=`2/2`로 분리합니다. PTP 상태와 무관하게 host monotonic frame-arrival 시각만 skew 판정에 사용합니다.
+- 시작 시 네 카메라의 모델·serial·IP·firmware를 SDK로 조회합니다. 기대 firmware 값이 비어 있으면 네 대의 버전이 서로 동일한지만 검증하고 자동 firmware update는 하지 않습니다.
 - Station A terminal NG 또는 실패는 Station B의 미시작 촬영, 저장 후 enqueue, queued job, pre-forward, active-forward 결과를 단계별로 취소합니다. 시작된 forward 자체는 강제 종료하지 않습니다.
 - Vision terminal 결과는 local spool에 먼저 기록하며 Log가 같은 session에서 재전송할 수 있습니다.
 - 정상 프로그램 종료 때 제품별 CSV와 성능 summary를 만들고, 완성 이미지는 Log가 최근 10,000장만 유지합니다.
@@ -69,7 +71,7 @@ source install/setup.bash
 ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 ```
 
-`sim`은 작은 Mono8 PNG를 만드는 fake capture/model 골격을 사용합니다. `hardware`는 필수 설정과 adapter가 완성될 때까지 `INIT_BLOCKED`가 정상입니다.
+`sim`은 작은 Mono8 PNG를 만드는 fake capture/model 골격을 사용합니다. `hardware`는 acquisition/skew/timeout/model 계약과 실장비 검증이 끝날 때까지 `INIT_BLOCKED`가 정상입니다.
 
 ## 변경 금지 원칙
 

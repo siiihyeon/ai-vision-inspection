@@ -56,7 +56,12 @@ from .capture_contract import (
     CapturePacketLossError,
     FakeCaptureBackend,
     MONO8_PNG,
-    UnimplementedCaptureBackend,
+)
+from .hikrobot_mvs import (
+    ActionGroup,
+    HikrobotMvsCaptureBackend,
+    MvsBackendSettings,
+    MvsSdkError,
 )
 from .inference_queue import (
     InferenceFailure,
@@ -170,9 +175,16 @@ class VisionNode(InspectionNodeBase):
         self.declare_parameter(
             "vision.camera_ids.station_b", Parameter.Type.STRING_ARRAY
         )
-        self.declare_parameter("vision.gige_action.device_key", 0)
-        self.declare_parameter("vision.gige_action.group_key", 0)
-        self.declare_parameter("vision.gige_action.group_mask", 0)
+        self.declare_parameter("vision.gige_action.device_key", 1)
+        self.declare_parameter("vision.gige_action.station_a.group_key", 1)
+        self.declare_parameter("vision.gige_action.station_a.group_mask", 1)
+        self.declare_parameter("vision.gige_action.station_b.group_key", 2)
+        self.declare_parameter("vision.gige_action.station_b.group_mask", 2)
+        self.declare_parameter(
+            "vision.gige_action.broadcast_address", "255.255.255.255"
+        )
+        self.declare_parameter("vision.gige_action.ack_timeout_ms", 100)
+        self.declare_parameter("vision.gige_action.scheduled", False)
         self.declare_parameter("vision.camera_network_map_json", "{}")
         self.declare_parameter("vision.frame_arrival_skew_limit_us", 0)
         self.declare_parameter("vision.capture.acquisition_timeout_ms", 0)
@@ -180,7 +192,20 @@ class VisionNode(InspectionNodeBase):
         self.declare_parameter("vision.gige.packet_size", 1500)
         self.declare_parameter("vision.gige.packet_delay_ticks", 5000)
         self.declare_parameter("vision.ptp.enabled", False)
-        self.declare_parameter("vision.ptp.validation_completed", False)
+        self.declare_parameter("vision.camera.expected_model", "MV-CS050-10GC")
+        self.declare_parameter("vision.camera.expected_firmware_version", "")
+        self.declare_parameter(
+            "vision.mvs.python_import_dir",
+            "/opt/MVS/Samples/64/Python/MvImport",
+        )
+        self.declare_parameter("vision.mvs.runtime_root", "/opt/MVS/lib")
+        self.declare_parameter("vision.mvs.sdk_image_buffer_nodes", 8)
+        self.declare_parameter("vision.gige.packet_resend.enabled", True)
+        self.declare_parameter("vision.gige.packet_resend.max_percent", 10)
+        self.declare_parameter("vision.gige.packet_resend.timeout_ms", 50)
+        self.declare_parameter("vision.gige.packet_resend.max_retry_times", 3)
+        self.declare_parameter("vision.gige.packet_resend.interval_ms", 10)
+        self.declare_parameter("vision.image.png_compression_level", 3)
         self.declare_parameter("vision.camera.disconnect_pause_after_ms", 5000)
         self.declare_parameter("vision.camera.reconnect_interval_ms", 1000)
         self.declare_parameter("vision.camera.reconnect_max_attempts", 5)
@@ -197,7 +222,7 @@ class VisionNode(InspectionNodeBase):
         self.declare_parameter("vision.model.runtime", "PYTORCH_TORCHSCRIPT")
         self.declare_parameter("vision.model.cuda_required", True)
         self.declare_parameter("vision.model.warmup_runs", 10)
-        self.declare_parameter("vision.image.sensor_width", 2248)
+        self.declare_parameter("vision.image.sensor_width", 2448)
         self.declare_parameter("vision.image.sensor_height", 2048)
         self.declare_parameter("vision.image.canonical_pixel_format", MONO8_PNG)
         self.declare_parameter(
@@ -252,16 +277,17 @@ class VisionNode(InspectionNodeBase):
         self._blocking_pool = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="vision-blocking"
         )
-        self.capture_backend = capture_backend or (
-            FakeCaptureBackend(
+        if capture_backend is not None:
+            self.capture_backend = capture_backend
+        elif self.profile == "sim":
+            self.capture_backend = FakeCaptureBackend(
                 data_root=Path(
                     str(self.get_parameter("vision.data_root").value)
                     or "/tmp/inspection/vision_fake"
                 )
             )
-            if self.profile == "sim"
-            else UnimplementedCaptureBackend()
-        )
+        else:
+            self.capture_backend = self._build_hardware_capture_backend()
         self._capture_results: IdempotencyStore[dict[str, object]] = IdempotencyStore()
         self._capture_identities: dict[str, tuple[str, int]] = {}
         self._completed_captures: dict[
@@ -328,18 +354,135 @@ class VisionNode(InspectionNodeBase):
         self._publish_queue_state(VisionQueueState.ACCEPTING, "")
         self.get_logger().info("VisionNode v2 communication skeleton started")
 
+    def _build_hardware_capture_backend(self) -> HikrobotMvsCaptureBackend:
+        try:
+            network_map = json.loads(
+                str(self.get_parameter("vision.camera_network_map_json").value)
+            )
+        except (TypeError, ValueError):
+            network_map = {}
+        if not isinstance(network_map, dict):
+            network_map = {}
+        settings = MvsBackendSettings(
+            station_camera_ids={
+                1: tuple(self.get_parameter("vision.camera_ids.station_a").value),
+                2: tuple(self.get_parameter("vision.camera_ids.station_b").value),
+            },
+            camera_network_map={
+                str(serial): str(address)
+                for serial, address in network_map.items()
+            },
+            action_device_key=int(
+                self.get_parameter("vision.gige_action.device_key").value
+            ),
+            action_groups={
+                1: ActionGroup(
+                    group_key=int(
+                        self.get_parameter(
+                            "vision.gige_action.station_a.group_key"
+                        ).value
+                    ),
+                    group_mask=int(
+                        self.get_parameter(
+                            "vision.gige_action.station_a.group_mask"
+                        ).value
+                    ),
+                ),
+                2: ActionGroup(
+                    group_key=int(
+                        self.get_parameter(
+                            "vision.gige_action.station_b.group_key"
+                        ).value
+                    ),
+                    group_mask=int(
+                        self.get_parameter(
+                            "vision.gige_action.station_b.group_mask"
+                        ).value
+                    ),
+                ),
+            },
+            data_root=Path(str(self.get_parameter("vision.data_root").value)),
+            acquisition_timeout_ms=int(
+                self.get_parameter("vision.capture.acquisition_timeout_ms").value
+            ),
+            packet_size=int(self.get_parameter("vision.gige.packet_size").value),
+            packet_delay_ticks=int(
+                self.get_parameter("vision.gige.packet_delay_ticks").value
+            ),
+            action_ack_timeout_ms=int(
+                self.get_parameter("vision.gige_action.ack_timeout_ms").value
+            ),
+            broadcast_address=str(
+                self.get_parameter("vision.gige_action.broadcast_address").value
+            ),
+            expected_model=str(
+                self.get_parameter("vision.camera.expected_model").value
+            ),
+            expected_firmware_version=str(
+                self.get_parameter(
+                    "vision.camera.expected_firmware_version"
+                ).value
+            ),
+            mvs_python_import_dir=Path(
+                str(self.get_parameter("vision.mvs.python_import_dir").value)
+            ),
+            mvs_runtime_root=Path(
+                str(self.get_parameter("vision.mvs.runtime_root").value)
+            ),
+            sdk_image_buffer_nodes=int(
+                self.get_parameter("vision.mvs.sdk_image_buffer_nodes").value
+            ),
+            packet_resend_enabled=bool(
+                self.get_parameter("vision.gige.packet_resend.enabled").value
+            ),
+            packet_resend_max_percent=int(
+                self.get_parameter(
+                    "vision.gige.packet_resend.max_percent"
+                ).value
+            ),
+            packet_resend_timeout_ms=int(
+                self.get_parameter("vision.gige.packet_resend.timeout_ms").value
+            ),
+            packet_resend_max_retry_times=int(
+                self.get_parameter(
+                    "vision.gige.packet_resend.max_retry_times"
+                ).value
+            ),
+            packet_resend_interval_ms=int(
+                self.get_parameter("vision.gige.packet_resend.interval_ms").value
+            ),
+            reconnect_interval_ms=int(
+                self.get_parameter("vision.camera.reconnect_interval_ms").value
+            ),
+            reconnect_max_attempts=int(
+                self.get_parameter("vision.camera.reconnect_max_attempts").value
+            ),
+            disconnect_pause_after_ms=int(
+                self.get_parameter(
+                    "vision.camera.disconnect_pause_after_ms"
+                ).value
+            ),
+            png_compression_level=int(
+                self.get_parameter("vision.image.png_compression_level").value
+            ),
+        )
+        return HikrobotMvsCaptureBackend(settings)
+
     def required_hardware_parameters(self) -> tuple[str, ...]:
         return (
             "vision.camera_ids.station_a",
             "vision.camera_ids.station_b",
             "vision.gige_action.device_key",
-            "vision.gige_action.group_key",
-            "vision.gige_action.group_mask",
+            "vision.gige_action.station_a.group_key",
+            "vision.gige_action.station_a.group_mask",
+            "vision.gige_action.station_b.group_key",
+            "vision.gige_action.station_b.group_mask",
+            "vision.gige_action.broadcast_address",
+            "vision.gige_action.ack_timeout_ms",
             "vision.camera_network_map_json",
             "vision.frame_arrival_skew_limit_us",
             "vision.capture.acquisition_timeout_ms",
             "vision.gige.packet_delay_ticks",
-            "vision.ptp.validation_completed",
             "vision.queue.capacity",
             "vision.worker_count",
             "vision.inference.station_a.total_timeout_ms",
@@ -350,6 +493,9 @@ class VisionNode(InspectionNodeBase):
             "vision.model.sha256",
             "vision.result_spool_path",
             "vision.image.canonical_pixel_format",
+            "vision.camera.expected_model",
+            "vision.mvs.python_import_dir",
+            "vision.mvs.runtime_root",
         )
 
     def validate_hardware_profile(self) -> list[str]:
@@ -395,14 +541,14 @@ class VisionNode(InspectionNodeBase):
         spool_path = str(self.get_parameter("vision.result_spool_path").value)
         if spool_path and not Path(spool_path).is_absolute():
             missing.append("vision.result_spool_path must be absolute")
-        if int(self.get_parameter("vision.image.sensor_width").value) != 2248:
-            missing.append("vision.image.sensor_width must be 2248")
+        if int(self.get_parameter("vision.image.sensor_width").value) != 2448:
+            missing.append("vision.image.sensor_width must be 2448")
         if int(self.get_parameter("vision.image.sensor_height").value) != 2048:
             missing.append("vision.image.sensor_height must be 2048")
         if int(self.get_parameter("vision.gige.packet_size").value) != 1500:
             missing.append("vision.gige.packet_size must remain 1500")
-        if not bool(self.get_parameter("vision.ptp.validation_completed").value):
-            missing.append("vision.ptp.validation_completed must be confirmed")
+        if bool(self.get_parameter("vision.gige_action.scheduled").value):
+            missing.append("vision.gige_action.scheduled must remain false")
         warning_ratio = float(self.get_parameter("vision.disk.warning_ratio").value)
         stop_ratio = float(self.get_parameter("vision.disk.stop_ratio").value)
         if warning_ratio != 0.90 or stop_ratio != 0.95:
@@ -424,15 +570,62 @@ class VisionNode(InspectionNodeBase):
         if previous_spool is not None:
             previous_spool.close()
         if self.profile == "hardware":
+            try:
+                self.capture_backend.initialize_with_reconnect()
+                inventory = tuple(
+                    {
+                        "serial": entry.serial,
+                        "station_id": entry.station_id,
+                        "ip_address": entry.ip_address,
+                        "model_name": entry.model_name,
+                        "firmware_version": entry.firmware_version,
+                    }
+                    for entry in self.capture_backend.inventory
+                )
+                self._emit_durable_event(
+                    "VISION_CAMERA_INVENTORY_VALIDATED",
+                    {
+                        "mvs_sdk_version": self.capture_backend.sdk_version,
+                        "common_firmware_version": (
+                            self.capture_backend.firmware_version
+                        ),
+                        "expected_firmware_version": str(
+                            self.get_parameter(
+                                "vision.camera.expected_firmware_version"
+                            ).value
+                        ),
+                        "firmware_expectation_configured": bool(
+                            str(
+                                self.get_parameter(
+                                    "vision.camera.expected_firmware_version"
+                                ).value
+                            )
+                        ),
+                        "skew_clock": "HOST_MONOTONIC_ARRIVAL",
+                        "scheduled_action": False,
+                        "cameras": inventory,
+                    },
+                )
+            except (MvsSdkError, OSError, ValueError) as exc:
+                return NodeInitializationOutcome(
+                    success=False,
+                    error_code=int(ErrorCode.NODE_INIT_FAILED),
+                    reason=f"MVS camera initialization failed: {exc}",
+                    retryable=True,
+                )
+            finally:
+                # 모델 입출력 계약이 주입되기 전에는 READY를 허용하지 않습니다.
+                self.capture_backend.deinitialize()
             return NodeInitializationOutcome(
                 success=False,
                 error_code=int(ErrorCode.IMPLEMENTATION_PENDING),
                 reason=(
-                    "MVS Action1 adapter and TorchScript preprocessing/output "
-                    "decoder are awaiting hardware/model injection"
+                    "MVS Action1 inventory validated; TorchScript preprocessing/"
+                    "output decoder is awaiting model injection"
                 ),
                 retryable=True,
             )
+        self.capture_backend.initialize()
         if self.worker_pool is None:
             worker_count = int(self.get_parameter("vision.worker_count").value)
             self.worker_pool = WorkerPool(
@@ -456,7 +649,7 @@ class VisionNode(InspectionNodeBase):
             reason="sim Mono8 capture and batch model skeleton initialized",
         )
 
-    def _run_blocking(self, fn, *args) -> Future:
+    def _run_blocking(self, fn, *args, **kwargs) -> Future:
         """블로킹 호출을 스레드 풀에 넘기고 rclpy Future로 결과를 받습니다.
 
         rclpy executor에는 asyncio 이벤트 루프가 없어 asyncio.to_thread를
@@ -465,7 +658,7 @@ class VisionNode(InspectionNodeBase):
         """
 
         rclpy_future = Future()
-        pool_future = self._blocking_pool.submit(fn, *args)
+        pool_future = self._blocking_pool.submit(fn, *args, **kwargs)
 
         def _relay(done_future) -> None:
             try:
@@ -486,6 +679,7 @@ class VisionNode(InspectionNodeBase):
         """
 
         self._stop_workers_and_flush()
+        self.capture_backend.close()
         self._blocking_pool.shutdown(wait=False, cancel_futures=True)
         if self._result_spool is not None:
             self._result_spool.close()
@@ -978,6 +1172,7 @@ class VisionNode(InspectionNodeBase):
         last_reason = "capture did not start"
         for attempt in range(1, max_attempts + 1):
             attempt_error = ErrorCode.CAPTURE_FAILED
+            batch: CaptureBatch | None = None
             if goal_handle.is_cancel_requested:
                 return None, ErrorCode.CAPTURE_CANCELED, "capture canceled"
             self._publish_capture_feedback(
@@ -1002,7 +1197,8 @@ class VisionNode(InspectionNodeBase):
             )
             try:
                 capture_started_ns = time.monotonic_ns()
-                batch = await self.capture_backend.capture_station(
+                batch = await self._run_blocking(
+                    self.capture_backend.capture_station,
                     product_id=request.product_id,
                     station_id=request.station_id,
                     capture_id=request.capture_id,
@@ -1048,7 +1244,7 @@ class VisionNode(InspectionNodeBase):
                     != int(self.get_parameter("vision.image.sensor_height").value)
                     for image in batch.images
                 ):
-                    raise ValueError("canonical image resolution is not 2248x2048")
+                    raise ValueError("canonical image resolution is not 2448x2048")
                 if skew_limit > 0 and batch.frame_arrival_skew_us > skew_limit:
                     attempt_error = ErrorCode.CAPTURE_SKEW_EXCEEDED
                     raise ValueError("frame_arrival_skew_us exceeded configured limit")
@@ -1118,6 +1314,15 @@ class VisionNode(InspectionNodeBase):
                 self.get_logger().error(
                     f"capture_id={request.capture_id} attempt={attempt} failed: {exc}"
                 )
+                if batch is not None:
+                    self._emit_capture_discarded(
+                        request.product_id,
+                        request.fifo_sequence,
+                        request.station_id,
+                        request.capture_id,
+                        batch,
+                        last_reason,
+                    )
                 # 같은 capture_id로 station 필수 카메라 전체를 다음 attempt에 재촬영합니다.
                 if attempt < max_attempts:
                     self._publish_capture_feedback(

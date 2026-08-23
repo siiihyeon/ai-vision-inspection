@@ -4,20 +4,37 @@
     vision.camera_ids.station_a: ["DA9880512", "DA9880516", "DA7552836"]
     vision.camera_ids.station_b: ["DA7838410"]
     vision.camera_network_map_json: '{"DA9880512":"192.168.10.13","DA9880516":"192.168.10.11","DA7552836":"192.168.10.14","DA7838410":"192.168.10.12"}'
-    vision.gige_action.device_key: 0       # TODO(HARDWARE_REQUIRED): MVS 확인
-    vision.gige_action.group_key: 0        # TODO(HARDWARE_REQUIRED): MVS 확인
-    vision.gige_action.group_mask: 0       # TODO(HARDWARE_REQUIRED): MVS 확인
+    # MVS Action1: 모든 카메라는 DeviceKey=1, station별 key/mask로 분리합니다.
+    vision.gige_action.device_key: 1
+    vision.gige_action.station_a.group_key: 1
+    vision.gige_action.station_a.group_mask: 1
+    vision.gige_action.station_b.group_key: 2
+    vision.gige_action.station_b.group_mask: 2
+    vision.gige_action.broadcast_address: "255.255.255.255"
+    vision.gige_action.ack_timeout_ms: 100
+    vision.gige_action.scheduled: false     # 즉시 Action; PTP clock에 의존하지 않음
     vision.frame_arrival_skew_limit_us: 0  # TODO(HARDWARE_REQUIRED): 실측 분포
     vision.capture.acquisition_timeout_ms: 0  # TODO(HARDWARE_REQUIRED): 실측
     vision.capture.max_attempts: 2
     vision.gige.packet_size: 1500
     vision.gige.packet_delay_ticks: 5000  # 초기값, packet loss/skew 시험 후 조정
-    vision.ptp.enabled: false             # 전체 장비 지원 확인 전에는 사용 금지
-    vision.ptp.validation_completed: false  # TODO(HARDWARE_REQUIRED): 지원/미지원 검증
+    vision.gige.packet_resend.enabled: true
+    vision.gige.packet_resend.max_percent: 10
+    vision.gige.packet_resend.timeout_ms: 50
+    vision.gige.packet_resend.max_retry_times: 3
+    vision.gige.packet_resend.interval_ms: 10
+    vision.ptp.enabled: false             # skew 판정은 항상 host monotonic arrival 사용
+    vision.camera.expected_model: "MV-CS050-10GC"
+    # 비어 있으면 자동 조회한 네 카메라 firmware가 서로 같은지만 검증합니다.
+    vision.camera.expected_firmware_version: ""
+    vision.mvs.python_import_dir: "/opt/MVS/Samples/64/Python/MvImport"
+    vision.mvs.runtime_root: "/opt/MVS/lib"
+    vision.mvs.sdk_image_buffer_nodes: 8
     vision.camera.disconnect_pause_after_ms: 5000
     vision.camera.reconnect_interval_ms: 1000
     vision.camera.reconnect_max_attempts: 5
-    vision.image.sensor_width: 2248
+    vision.image.sensor_width: 2448
     vision.image.sensor_height: 2048
     vision.image.canonical_pixel_format: "MONO8_PNG"
+    vision.image.png_compression_level: 3
     vision.data_root: "/var/lib/inspection/images"

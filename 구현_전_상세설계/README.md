@@ -16,7 +16,8 @@
 
 - Camera: Station A `DA9880512`, `DA9880516`, `DA7552836`; Station B `DA7838410`.
 - IP: `.13`, `.11`, `.14`, `.12` in `192.168.10.0/24`.
-- 입력 `2248×2048`, raw/store `Mono8`, canonical 1-channel PNG. RGB 변환은 하지 않습니다.
+- 입력 전체 ROI `2448×2048@(0,0)`, raw/store `Mono8`, canonical 1-channel PNG. RGB 변환은 하지 않습니다.
+- Action1은 DeviceKey 1, A key/mask 1/1, B 2/2의 즉시 command이며 PTP 상태와 무관하게 host monotonic arrival skew를 사용합니다.
 - packet loss는 frame별 미복구 count가 반드시 0이어야 합니다. 재전송 count는 별도 telemetry로 보존합니다.
 - 같은 capture ID, station 전체를 최대 2 attempts. 완성 파일은 Vision이 삭제하지 않고 Log만 최근 10,000장 정책으로 삭제합니다.
 - disk 90% warning, 95% 신규 촬영 중지와 PAUSE.
@@ -27,7 +28,7 @@
 - 실제 resize/normalization/input-output decoder는 추후 주입합니다. 전처리 파일은 보존하지 않습니다.
 - CUDA 필수, CPU fallback 금지. CUDA OOM은 현재 제품 실패 후 PAUSE/재초기화입니다.
 - RTX 5070 Laptop GPU 8,151 MiB 기준으로 batch 3의 실제 VRAM/latency를 시험합니다. 현재 골격이 안전 용량을 보장하는 것은 아닙니다.
-- warmup 기본 10회, NVML GPU/VRAM sample 200 ms, model lock/worker 수는 실험 후 확정합니다.
+- warmup 기본 10회, NVML GPU/VRAM sample 200 ms입니다. 최초값은 queue 16, model lock 활성화, worker 1이며 실험 후 조정합니다.
 
 ## 종료, replay, 보고서
 
@@ -46,9 +47,8 @@
 
 ## 실제 장비 전에 남은 결정/시험
 
-- MVS SDK/firmware, Action1 device/group key/mask, acquisition timeout
-- exposure/gain/ROI, packet delay 조정, A/B 동시 촬영 packet loss/skew
-- PTP 지원 여부. 전체 경로가 지원하고 lock을 검증할 때만 사용하며 아니면 host arrival monotonic skew 사용
+- 자동 조회되는 네 카메라 firmware 확인과 필요 시 승인 `.dav` 수동 적용, acquisition timeout
+- exposure/gain, packet delay 조정, A/B 동시 촬영 packet loss/host arrival skew
 - 실제 모델 input shape, 종횡비 resize/padding, normalization, output/threshold
-- 최대 제품 유입속도, queue capacity, worker/model lock, A/B timeout
+- 최대 제품 유입속도, queue/worker/model lock 초기값 조정, A/B timeout
 - Mega serial 방식과 firmware protocol은 Vision 내부 알고리즘에는 필요 없지만 전체 라인 Sensor3/재시작 잔류 판정 통합에는 반드시 필요

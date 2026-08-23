@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import struct
 import time
 import uuid
@@ -185,7 +186,13 @@ def _validate_canonical_png(
 
 
 class CaptureBackend(Protocol):
-    async def capture_station(
+    def initialize(self) -> None:
+        """카메라 검색, 설정 검증, grabbing 시작을 완료합니다."""
+
+    def close(self) -> None:
+        """열린 카메라 및 SDK 자원을 해제합니다."""
+
+    def capture_station(
         self,
         *,
         product_id: str,
@@ -198,8 +205,77 @@ class CaptureBackend(Protocol):
 
 
 class UnimplementedCaptureBackend:
-    async def capture_station(self, **_kwargs) -> CaptureBatch:
+    def initialize(self) -> None:
+        raise NotImplementedError("capture backend is not implemented")
+
+    def close(self) -> None:
+        return None
+
+    def capture_station(self, **_kwargs) -> CaptureBatch:
         raise NotImplementedError("HIKROBOT MVS GigE Action Command adapter is not implemented")
+
+
+def write_mono8_png_atomic(
+    path: Path,
+    pixels: bytes,
+    width: int,
+    height: int,
+    *,
+    compression_level: int = 3,
+) -> tuple[str, int]:
+    """Mono8 buffer를 동일 filesystem의 임시 파일을 거쳐 원자적으로 저장합니다.
+
+    반환값은 완성 파일의 ``(sha256, size_bytes)``입니다. 예외가 발생하면
+    ``.part`` 임시 파일만 정리하며, 기존 완성 파일은 덮어쓰지 않습니다.
+    """
+
+    if width < 1 or height < 1 or len(pixels) != width * height:
+        raise ValueError("Mono8 buffer length does not match image dimensions")
+    if not 0 <= compression_level <= 9:
+        raise ValueError("PNG compression level must be between 0 and 9")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise FileExistsError(f"refusing to overwrite completed image: {path}")
+
+    scanlines = bytearray((width + 1) * height)
+    for row_index in range(height):
+        destination = row_index * (width + 1)
+        source = row_index * width
+        scanlines[destination] = 0  # PNG filter type: None
+        scanlines[destination + 1 : destination + 1 + width] = pixels[
+            source : source + width
+        ]
+    compressed = zlib.compress(bytes(scanlines), level=compression_level)
+
+    def chunk(chunk_type: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + chunk_type
+            + data
+            + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    content = (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", ihdr)
+        + chunk(b"IDAT", compressed)
+        + chunk(b"IEND", b"")
+    )
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.part")
+    try:
+        with temporary.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return hashlib.sha256(content).hexdigest(), len(content)
 
 
 def _write_fake_png(
@@ -249,7 +325,13 @@ class FakeCaptureBackend:
     def __init__(self, *, data_root: Path) -> None:
         self._data_root = data_root
 
-    async def capture_station(
+    def initialize(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def capture_station(
         self,
         *,
         product_id: str,

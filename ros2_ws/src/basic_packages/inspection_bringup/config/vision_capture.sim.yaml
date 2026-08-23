@@ -4,20 +4,35 @@
     vision.camera_ids.station_a: ["sim_station_a_camera_1", "sim_station_a_camera_2", "sim_station_a_camera_3"]
     vision.camera_ids.station_b: ["sim_station_b_camera_1"]
     vision.camera_network_map_json: "{}"
-    vision.gige_action.device_key: 0
-    vision.gige_action.group_key: 0
-    vision.gige_action.group_mask: 0
+    vision.gige_action.device_key: 1
+    vision.gige_action.station_a.group_key: 1
+    vision.gige_action.station_a.group_mask: 1
+    vision.gige_action.station_b.group_key: 2
+    vision.gige_action.station_b.group_mask: 2
+    vision.gige_action.broadcast_address: "255.255.255.255"
+    vision.gige_action.ack_timeout_ms: 100
+    vision.gige_action.scheduled: false
     vision.frame_arrival_skew_limit_us: 0
     vision.capture.acquisition_timeout_ms: 0
     vision.capture.max_attempts: 2
     vision.gige.packet_size: 1500
     vision.gige.packet_delay_ticks: 5000
+    vision.gige.packet_resend.enabled: true
+    vision.gige.packet_resend.max_percent: 10
+    vision.gige.packet_resend.timeout_ms: 50
+    vision.gige.packet_resend.max_retry_times: 3
+    vision.gige.packet_resend.interval_ms: 10
     vision.ptp.enabled: false
-    vision.ptp.validation_completed: false
+    vision.camera.expected_model: "MV-CS050-10GC"
+    vision.camera.expected_firmware_version: ""
+    vision.mvs.python_import_dir: "/opt/MVS/Samples/64/Python/MvImport"
+    vision.mvs.runtime_root: "/opt/MVS/lib"
+    vision.mvs.sdk_image_buffer_nodes: 8
     vision.camera.disconnect_pause_after_ms: 5000
     vision.camera.reconnect_interval_ms: 1000
     vision.camera.reconnect_max_attempts: 5
-    vision.image.sensor_width: 2248
+    vision.image.sensor_width: 2448
     vision.image.sensor_height: 2048
     vision.image.canonical_pixel_format: "MONO8_PNG"
+    vision.image.png_compression_level: 3
     vision.data_root: "/tmp/inspection/images"

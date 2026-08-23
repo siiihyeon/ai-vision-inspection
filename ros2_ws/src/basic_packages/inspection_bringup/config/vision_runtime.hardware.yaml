@@ -1,6 +1,6 @@
 /inspection/vision_node:
   ros__parameters:
-    vision.queue.capacity: 0                    # TODO(HARDWARE_REQUIRED): 유입/추론 실측식
+    vision.queue.capacity: 16                   # 초기값; 유입/추론 실험 후 조정
     vision.inference_queue_total_timeout_ms: 0  # station별 값으로 이전하기 위한 fallback
     vision.inference.station_a.total_timeout_ms: 0  # TODO(HARDWARE_REQUIRED): p99.9
     vision.inference.station_b.total_timeout_ms: 0  # TODO(HARDWARE_REQUIRED): p99.9
