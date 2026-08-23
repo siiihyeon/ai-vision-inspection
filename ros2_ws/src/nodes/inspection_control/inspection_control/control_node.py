@@ -60,6 +60,7 @@ class ControlNode(InspectionNodeBase):
         self._mega_lock = threading.RLock()
         self._mega_sequence = 0
         self._mega_events: dict[str, tuple[bool, str]] = {}
+        self._pending_position_requests: dict[int, dict[str, object]] = {}
         self._mega_event = threading.Condition(self._mega_lock)
         self._position_server = ActionServer(
             self,
@@ -121,6 +122,30 @@ class ControlNode(InspectionNodeBase):
         """향후 serial adapter가 debounced 센서 이벤트를 전달할 확장점."""
 
         self._sensor_publisher.publish(message)
+
+    def _publish_position_settled(
+        self,
+        request: dict[str, object],
+        *,
+        conveyor_id: int,
+        estimated_step: int,
+    ) -> None:
+        settled = PositionSettled()
+        settled.header.stamp = self.get_clock().now().to_msg()
+        settled.header.session_id = self.session_id
+        settled.header.message_id = new_uuid()
+        settled.header.correlation_id = str(request["product_id"])
+        settled.product_id = str(request["product_id"])
+        settled.station_id = int(request["station_id"])
+        settled.position_command_id = str(request["command_id"])
+        settled.conveyor_id = conveyor_id
+        settled.target_step = int(request["target_step"])
+        settled.estimated_step = estimated_step
+        settled.position_error_steps = estimated_step - settled.target_step
+        settled.position_source = PositionSettled.OPEN_LOOP_ESTIMATE
+        settled.position_verified = False
+        settled.settled_at = settled.header.stamp
+        self._position_settled_publisher.publish(settled)
 
     def handle_targeted_conveyor_command(self, message: SystemCommand) -> None:
         """Station 촬영 후 해당 층 컨베이어만 재가동하는 진입점."""
@@ -184,9 +209,28 @@ class ControlNode(InspectionNodeBase):
             if event.kind == "SENSOR" and len(event.values) >= 4:
                 self._publish_sensor_event(*event.values[:4])
             elif event.kind == "POSITION" and len(event.values) >= 3:
+                conveyor_text, step_text, sequence_text = event.values[:3]
+                try:
+                    position_sequence = int(sequence_text)
+                    estimated_step = int(step_text)
+                    conveyor_id = int(conveyor_text)
+                except ValueError:
+                    continue
                 with self._mega_event:
-                    self._mega_events["POSITION"] = (True, "|".join(event.values))
+                    self._mega_events[f"POSITION:{position_sequence}"] = (
+                        True,
+                        f"{conveyor_id}|{estimated_step}",
+                    )
+                    request = self._pending_position_requests.pop(
+                        position_sequence, None
+                    )
                     self._mega_event.notify_all()
+                if request is not None:
+                    self._publish_position_settled(
+                        request,
+                        conveyor_id=conveyor_id,
+                        estimated_step=estimated_step,
+                    )
             elif event.kind == "ACTUATION" and event.values:
                 with self._mega_event:
                     self._mega_events["ACTUATION"] = (event.values[0] == "OK", "")
@@ -252,13 +296,29 @@ class ControlNode(InspectionNodeBase):
                 if request.conveyor_id == int(ConveyorId.UPPER)
                 else int(self.get_parameter("control.position.lower_steps").value)
             )
+            sequence = 0
             try:
-                self._send_mega("POSITION", request.conveyor_id, target_step)
+                sequence = self._next_sequence()
+                with self._mega_lock:
+                    self._pending_position_requests[sequence] = {
+                        "product_id": request.product_id,
+                        "station_id": request.station_id,
+                        "command_id": request.command.command_id,
+                        "target_step": target_step,
+                    }
+                    self._mega.write(
+                        encode_frame(
+                            "C", sequence, "POSITION", request.conveyor_id, target_step
+                        )
+                    )
                 if not self._wait_for_mega(
-                    "POSITION", int(self.get_parameter("control.position.timeout_ms").value) / 1000
+                    f"POSITION:{sequence}",
+                    int(self.get_parameter("control.position.timeout_ms").value) / 1000,
                 ):
                     raise TimeoutError("position feedback timeout")
             except (RuntimeError, TimeoutError) as exc:
+                with self._mega_lock:
+                    self._pending_position_requests.pop(sequence, None)
                 return self._finish_position(goal_handle, result, False, ErrorCode.POSITION_FAILED, str(exc))
             values = {"success": True, "product_id": request.product_id, "station_id": request.station_id,
                       "position_command_id": request.command.command_id, "estimated_step": target_step,
