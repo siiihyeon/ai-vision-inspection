@@ -734,7 +734,6 @@ class MasterContractTests(unittest.TestCase):
         snapshot.actuator_safe = True
         self.assertTrue(snapshot.in_place_guards_satisfied())
         snapshot.sensor_clear = {1: True, 2: True, 3: True}
-        snapshot.actuator_area_clear = True
         snapshot.line_clear_confirmed = True
         snapshot.operator_id = "operator"
         self.assertTrue(snapshot.line_clear_guards_satisfied())

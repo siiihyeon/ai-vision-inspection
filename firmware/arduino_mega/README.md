@@ -1,6 +1,8 @@
-# Arduino Mega firmware placeholder
+# Arduino Mega firmware
 
-사용자 승인에 따라 폴더만 포함합니다. 현재 실행 가능한 firmware는 없습니다.
+`arduino_mega.ino`는 ControlNode와 CRC-16 줄 기반으로 통신하며 센서 이벤트,
+컨베이어 RUN/STOP/POSITION, NG 서보 분류를 수행합니다. 상세 패킷은
+`PROTOCOL.md`에 있습니다.
 
 ## 코드를 만들기 전에 반드시 결정할 사항
 
@@ -20,4 +22,5 @@
 - camera hardware/global trigger pulse를 생성하지 않습니다. Trigger는 VisionNode의 MVS GigE Action Command입니다.
 - protocol/핀맵 미확정 상태에서 임의 번호를 production default로 넣지 않습니다.
 
-최종 구현 시 firmware source, protocol specification, pin-map, simulator와 HIL test 절차를 이 폴더에 함께 추가합니다.
+`arduino_mega.ino` 상단의 핀맵은 승인된 배선도 값으로 반드시 채워야 합니다.
+현재 `255`로 두어 미확정 배선에서 입력과 출력이 비활성화됩니다.

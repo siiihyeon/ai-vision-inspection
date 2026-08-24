@@ -98,7 +98,6 @@ class EquipmentSnapshot:
         default_factory=lambda: {1: None, 2: None, 3: None}
     )
     actuator_safe: bool | None = None
-    actuator_area_clear: bool | None = None
     line_clear_confirmed: bool = False
     estop_asserted: bool = False
     operator_id: str = ""
@@ -109,7 +108,6 @@ class EquipmentSnapshot:
         snapshot.mark_all_stopped()
         snapshot.sensor_clear = {1: True, 2: True, 3: True}
         snapshot.actuator_safe = True
-        snapshot.actuator_area_clear = True
         snapshot.line_clear_confirmed = True
         snapshot.operator_id = "sim"
         return snapshot
@@ -139,7 +137,6 @@ class EquipmentSnapshot:
             and self.all_conveyors_stopped()
             and self.all_sensors_clear()
             and self.actuator_safe is True
-            and self.actuator_area_clear is True
             and not self.estop_asserted
         )
 

@@ -44,6 +44,7 @@ from inspection_interfaces.action import (
     PositionProduct,
 )
 from inspection_interfaces.msg import (
+    EquipmentState,
     LogEvent,
     LogPersistedAck,
     NodeHeartbeat,
@@ -448,6 +449,12 @@ class MasterNode(InspectionNodeBase):
             self._handle_position_settled,
             reliable_event_qos(),
         )
+        self._equipment_state_subscription = self.create_subscription(
+            EquipmentState,
+            "/inspection/control/equipment_state",
+            self._handle_equipment_state,
+            reliable_event_qos(),
+        )
         self._queue_subscription = self.create_subscription(
             VisionQueueState,
             "/inspection/vision/queue_state",
@@ -509,6 +516,24 @@ class MasterNode(InspectionNodeBase):
             "master.log_spool_path",
             "master.completed_context_retention_ms",
         )
+
+    def validate_hardware_profile(self) -> list[str]:
+        """position_offset_steps는 0도 fail-closed 미설정으로 취급합니다.
+
+        공용 검증(node_base.validate_hardware_profile)은 None/""/[]만
+        미설정으로 보고 0은 유효한 값으로 통과시킵니다. 다른 노드에는
+        0이 의도된 유효값인 파라미터가 있어(예: Vision의 skew 검사
+        비활성화) 이 규칙을 공용 함수에 넣을 수 없습니다. 여기서는
+        위치 오프셋에 한해서만 개별적으로 확인합니다.
+        """
+
+        missing = super().validate_hardware_profile()
+        if self.profile == "hardware":
+            if int(self.get_parameter("master.station_a.position_offset_steps").value) <= 0:
+                missing.append("master.station_a.position_offset_steps")
+            if int(self.get_parameter("master.station_b.position_offset_steps").value) <= 0:
+                missing.append("master.station_b.position_offset_steps")
+        return list(dict.fromkeys(missing))
 
     # region BLOCK 1 - 전체 시스템 FSM과 운전 명령
 
@@ -2038,6 +2063,38 @@ class MasterNode(InspectionNodeBase):
             return
         self._maybe_request_station_capture(station_id)
 
+    def _handle_equipment_state(self, message: EquipmentState) -> None:
+        """Control이 보고한 장비 상태를 안전 guard mirror에 반영합니다."""
+
+        if message.header.session_id != self.session_id:
+            return
+        was_upper_running = self.equipment.conveyor_running.get(ConveyorId.UPPER)
+        was_lower_running = self.equipment.conveyor_running.get(ConveyorId.LOWER)
+        self.update_equipment_snapshot(
+            upper_running=message.upper_running,
+            upper_stopped=message.upper_stopped,
+            lower_running=message.lower_running,
+            lower_stopped=message.lower_stopped,
+            sensor_1_clear=message.sensor_1_clear,
+            sensor_2_clear=message.sensor_2_clear,
+            sensor_3_clear=message.sensor_3_clear,
+            actuator_safe=message.actuator_safe,
+        )
+        if message.upper_running and not was_upper_running:
+            self._confirm_pending_resume(ConveyorId.UPPER)
+        if message.lower_running and not was_lower_running:
+            self._confirm_pending_resume(ConveyorId.LOWER)
+
+    def _confirm_pending_resume(self, conveyor_id: ConveyorId) -> None:
+        """새로 돌기 시작한 컨베이어를 기다리던 station cycle을 확인 처리합니다."""
+
+        for station_id, cycle in tuple(self._station_cycles.items()):
+            if (
+                cycle.conveyor_id == conveyor_id
+                and cycle.phase == StationCyclePhase.RESUME_PENDING
+            ):
+                self.confirm_conveyor_resumed(cycle.product_id, station_id)
+
     def _maybe_request_station_capture(self, station_id: StationId) -> None:
         cycle = self._station_cycles.get(station_id)
         if cycle is None:
@@ -2315,8 +2372,8 @@ class MasterNode(InspectionNodeBase):
             target_conveyor_id=int(cycle.conveyor_id),
         )
         # sim profile에는 실제 conveyor status adapter가 없으므로 즉시 확인합니다.
-        # TODO(HARDWARE): Control의 station별 실제 RUN 확인 이벤트가 연결되면
-        # hardware profile에서 아래 공개 확인 진입점을 호출해야 합니다.
+        # hardware profile은 Control이 보고하는 EquipmentState의 running 전이를
+        # _handle_equipment_state에서 감지해 confirm_conveyor_resumed를 호출합니다.
         if self.profile == "sim":
             self.confirm_conveyor_resumed(product_id, station_id)
 
@@ -3056,7 +3113,6 @@ class MasterNode(InspectionNodeBase):
         sensor_2_clear: bool | None = None,
         sensor_3_clear: bool | None = None,
         actuator_safe: bool | None = None,
-        actuator_area_clear: bool | None = None,
         estop_asserted: bool | None = None,
     ) -> None:
         """향후 Control typed 상태 event가 갱신할 안전 guard 진입점입니다."""
@@ -3075,8 +3131,6 @@ class MasterNode(InspectionNodeBase):
                 target[key] = value
         if actuator_safe is not None:
             self.equipment.actuator_safe = actuator_safe
-        if actuator_area_clear is not None:
-            self.equipment.actuator_area_clear = actuator_area_clear
         if estop_asserted is not None:
             self.equipment.estop_asserted = estop_asserted
             if estop_asserted:

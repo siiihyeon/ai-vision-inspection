@@ -1,0 +1,9 @@
+CommonHeader header
+bool upper_running
+bool upper_stopped
+bool lower_running
+bool lower_stopped
+bool sensor_1_clear
+bool sensor_2_clear
+bool sensor_3_clear
+bool actuator_safe
