@@ -251,8 +251,8 @@ for config in (sim, hardware):
     require('system.expected_interface_version: "2.0.0"' in config, "interface version config mismatch")
     require("comm.master_heartbeat_period_ms: 500" in config, "Master heartbeat period mismatch")
     require(config.count("comm.node_heartbeat_period_ms: 500") == 3, "worker heartbeat period mismatch")
-    require("comm.master_heartbeat_timeout_ms: 2000" in config, "heartbeat timeout mismatch")
-    require("comm.node_heartbeat_timeout_ms: 2000" in config, "worker heartbeat timeout mismatch")
+    require("comm.master_heartbeat_timeout_ms: 5000" in config, "heartbeat timeout mismatch")
+    require("comm.node_heartbeat_timeout_ms: 5000" in config, "worker heartbeat timeout mismatch")
     require("system.init_timeout_ms: 10000" in config, "worker init timeout mismatch")
     require("retry.init_interval_ms: 1000" in config, "worker init retry interval mismatch")
     require(

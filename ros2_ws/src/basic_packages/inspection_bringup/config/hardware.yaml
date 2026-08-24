@@ -1,12 +1,12 @@
 /**:
   ros__parameters:
     profile: hardware
-    comm.master_heartbeat_timeout_ms: 2000
+    comm.master_heartbeat_timeout_ms: 5000
 
 /inspection/master_node:
   ros__parameters:
     comm.master_heartbeat_period_ms: 500
-    comm.node_heartbeat_timeout_ms: 2000
+    comm.node_heartbeat_timeout_ms: 5000
     system.expected_interface_version: "2.0.0"
     system.config_version: "dev-001"
     system.init_timeout_ms: 10000
@@ -28,6 +28,7 @@
     master.action.capture_timeout_ms: 30000
     master.action.actuation_timeout_ms: 10000
     master.action.conveyor_resume_timeout_ms: 10000
+    master.action.conveyor_run_timeout_ms: 10000
     master.pause_stop_timeout_ms: 10000
     master.shutdown_stop_timeout_ms: 10000
     master.log_spool_path: ""
