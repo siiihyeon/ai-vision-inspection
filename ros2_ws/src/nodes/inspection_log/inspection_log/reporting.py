@@ -119,16 +119,16 @@ def generate_session_report(
             a_version,
             a_sha,
             a_fingerprint,
-            b_version or a_version,
-            b_sha or a_sha,
-            b_fingerprint or a_fingerprint,
+            b_version,
+            b_sha,
+            b_fingerprint,
         )
     ) and all(
         left == right
         for left, right in (
-            (a_version, b_version or a_version),
-            (a_sha, b_sha or a_sha),
-            (a_fingerprint, b_fingerprint or a_fingerprint),
+            (a_version, b_version),
+            (a_sha, b_sha),
+            (a_fingerprint, b_fingerprint),
         )
     )
     gpu_document = None
@@ -173,7 +173,11 @@ def generate_session_report(
     _atomic_json(summary_path, summary)
 
     written_tuning_path: Path | None = None
-    if auto_apply_timeouts and tuning_values and same_identity:
+    if (
+        auto_apply_timeouts
+        and set(tuning_values) == {"station_a", "station_b"}
+        and same_identity
+    ):
         _atomic_json(
             timeout_tuning_path,
             {

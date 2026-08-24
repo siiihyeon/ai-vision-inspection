@@ -4,7 +4,7 @@
 
 ## 현재 산출물의 성격
 
-이 저장소는 **Vision Node 2 정책을 반영한 interface 2.1 공정 구현**입니다. Ubuntu MVS 5.0.2 Action1 adapter, Mono8 촬영 계약, packet-loss 검증, station batch worker, A terminal NG의 B 취소, Sensor3 lock, Vision durable 결과/replay, Log 보고서·10,000장 보존까지 연결되어 있습니다. Mega serial protocol/TB6600·액추에이터 adapter와 모델 전처리·출력 decoder는 아직 placeholder입니다. 따라서 남은 설정과 실장비 검증 없이 생산 라인을 운전하면 안 됩니다.
+이 저장소는 **interface 2.1 공정 구현**입니다. Ubuntu MVS 5.0.2 Action1 adapter, Mono8 촬영 계약, packet-loss 검증, 4-view PatchCore artifact 전처리·CUDA 추론, A terminal NG의 B 취소, Sensor3 lock, Vision durable 결과/replay, Log 보고서·10,000장 보존까지 연결되어 있습니다. Mega serial protocol/TB6600·액추에이터 adapter, 최종 4-view artifact와 실장비 인수 시험은 아직 필요합니다. 따라서 남은 설정과 검증 없이 생산 라인을 운전하면 안 됩니다.
 
 Vision Node의 확정값, 미결정 정책, 실험값, 모든 파라미터 수정 위치는 [Vision Node 완성 결정표](ros2_ws/src/nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)를 단일 기준으로 사용합니다. 해당 표의 구현 차단 항목을 확정하면 placeholder를 실제 장비 adapter와 추론 알고리즘으로 교체할 수 있고, 이후 실장비 인수시험을 통과해야 생산 승인이 됩니다.
 

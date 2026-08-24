@@ -2,8 +2,8 @@
   ros__parameters:
     vision.queue.capacity: 16                   # 초기값; 유입/추론 실험 후 조정
     vision.inference_queue_total_timeout_ms: 0  # station별 값으로 이전하기 위한 fallback
-    vision.inference.station_a.total_timeout_ms: 0  # TODO(HARDWARE_REQUIRED): p99.9
-    vision.inference.station_b.total_timeout_ms: 0  # TODO(HARDWARE_REQUIRED): p99.9
+    vision.inference.station_a.total_timeout_ms: 3000
+    vision.inference.station_b.total_timeout_ms: 1500
     vision.result_spool_path: "/var/lib/inspection/spool/vision.sqlite3"
     vision.shutdown.queue_drain_timeout_ms: 3000
     vision.gpu.sample_interval_ms: 200

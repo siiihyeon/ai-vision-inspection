@@ -1,4 +1,4 @@
-"""VisionNode: GigE Action capture와 파일경로 FIFO 추론의 연결 골격."""
+"""VisionNode: GigE Action capture와 4-view PatchCore 추론 runtime."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import ipaddress
 import json
 import math
 import shutil
+import subprocess
 import threading
 import time
 from collections import deque
@@ -48,6 +49,7 @@ from inspection_interfaces.msg import (
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.parameter import Parameter
+from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
 
 from .capture_contract import (
@@ -59,6 +61,7 @@ from .capture_contract import (
 )
 from .hikrobot_mvs import (
     ActionGroup,
+    CameraAcquisitionSettings,
     HikrobotMvsCaptureBackend,
     MvsBackendSettings,
     MvsSdkError,
@@ -72,7 +75,13 @@ from .inference_queue import (
     InferenceTiming,
 )
 from .gpu_monitor import GpuMonitor
-from .model_backend import FakeStationModel
+from .model_backend import (
+    ARTIFACT_RUNTIME,
+    EXPECTED_STATION_VIEWS,
+    ArtifactContractError,
+    FakeStationModel,
+    PatchCoreArtifactModel,
+)
 
 
 def _fake_load_image(path: Path):
@@ -186,6 +195,9 @@ class VisionNode(InspectionNodeBase):
         self.declare_parameter("vision.gige_action.ack_timeout_ms", 100)
         self.declare_parameter("vision.gige_action.scheduled", False)
         self.declare_parameter("vision.camera_network_map_json", "{}")
+        self.declare_parameter("vision.camera_acquisition_map_json", "{}")
+        self.declare_parameter("vision.nic.ipv4", "")
+        self.declare_parameter("vision.nic.prefix_length", 0)
         self.declare_parameter("vision.frame_arrival_skew_limit_us", 0)
         self.declare_parameter("vision.capture.acquisition_timeout_ms", 0)
         self.declare_parameter("vision.capture.max_attempts", 2)
@@ -219,7 +231,7 @@ class VisionNode(InspectionNodeBase):
         self.declare_parameter("vision.model.path", "")
         self.declare_parameter("vision.model.version", "Model_v_1")
         self.declare_parameter("vision.model.sha256", "")
-        self.declare_parameter("vision.model.runtime", "PYTORCH_TORCHSCRIPT")
+        self.declare_parameter("vision.model.runtime", ARTIFACT_RUNTIME)
         self.declare_parameter("vision.model.cuda_required", True)
         self.declare_parameter("vision.model.warmup_runs", 10)
         self.declare_parameter("vision.image.sensor_width", 2448)
@@ -255,6 +267,8 @@ class VisionNode(InspectionNodeBase):
         capacity = int(self.get_parameter("vision.queue.capacity").value)
         self.inference_queue = InferenceQueue(max(capacity, 1))
         self.worker_pool: WorkerPool | None = None
+        self._model_backend = None
+        self._oom_reinitialization_required = False
         self._worker_stopped = False
         self._session_metrics_emitted = False
         self._disk_warning_active = False
@@ -267,12 +281,7 @@ class VisionNode(InspectionNodeBase):
         self._result_spool_path = str(
             self.get_parameter("vision.result_spool_path").value
         )
-        self._gpu_monitor = GpuMonitor(
-            interval_seconds=max(
-                int(self.get_parameter("vision.gpu.sample_interval_ms").value), 1
-            )
-            / 1000.0
-        )
+        self._gpu_monitor = self._new_gpu_monitor()
         # 블로킹 호출을 executor 스레드 밖으로 넘기기 위한 전용 풀입니다.
         self._blocking_pool = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="vision-blocking"
@@ -352,7 +361,7 @@ class VisionNode(InspectionNodeBase):
             reliable_event_qos(),
         )
         self._publish_queue_state(VisionQueueState.ACCEPTING, "")
-        self.get_logger().info("VisionNode v2 communication skeleton started")
+        self.get_logger().info("VisionNode v2 PatchCore runtime started")
 
     def _build_hardware_capture_backend(self) -> HikrobotMvsCaptureBackend:
         try:
@@ -363,6 +372,31 @@ class VisionNode(InspectionNodeBase):
             network_map = {}
         if not isinstance(network_map, dict):
             network_map = {}
+        try:
+            acquisition_map = json.loads(
+                str(
+                    self.get_parameter(
+                        "vision.camera_acquisition_map_json"
+                    ).value
+                )
+            )
+        except (TypeError, ValueError):
+            acquisition_map = {}
+        if not isinstance(acquisition_map, dict):
+            acquisition_map = {}
+        try:
+            acquisition_settings = {
+                str(serial): CameraAcquisitionSettings(
+                    exposure_time_us=float(values["exposure_time_us"]),
+                    gain_db=float(values["gain_db"]),
+                )
+                for serial, values in acquisition_map.items()
+                if isinstance(values, dict)
+                and "exposure_time_us" in values
+                and "gain_db" in values
+            }
+        except (TypeError, ValueError):
+            acquisition_settings = {}
         settings = MvsBackendSettings(
             station_camera_ids={
                 1: tuple(self.get_parameter("vision.camera_ids.station_a").value),
@@ -372,6 +406,7 @@ class VisionNode(InspectionNodeBase):
                 str(serial): str(address)
                 for serial, address in network_map.items()
             },
+            camera_acquisition_settings=acquisition_settings,
             action_device_key=int(
                 self.get_parameter("vision.gige_action.device_key").value
             ),
@@ -480,6 +515,9 @@ class VisionNode(InspectionNodeBase):
             "vision.gige_action.broadcast_address",
             "vision.gige_action.ack_timeout_ms",
             "vision.camera_network_map_json",
+            "vision.camera_acquisition_map_json",
+            "vision.nic.ipv4",
+            "vision.nic.prefix_length",
             "vision.frame_arrival_skew_limit_us",
             "vision.capture.acquisition_timeout_ms",
             "vision.gige.packet_delay_ticks",
@@ -535,6 +573,46 @@ class VisionNode(InspectionNodeBase):
                     ipaddress.ip_address(str(address))
         except (TypeError, ValueError):
             missing.append("vision.camera_network_map_json is invalid")
+        try:
+            acquisition_map = json.loads(
+                str(
+                    self.get_parameter(
+                        "vision.camera_acquisition_map_json"
+                    ).value
+                )
+            )
+            if not isinstance(acquisition_map, dict) or set(acquisition_map) != set(
+                station_a + station_b
+            ):
+                missing.append(
+                    "vision.camera_acquisition_map_json camera set mismatch"
+                )
+            else:
+                for serial, values in acquisition_map.items():
+                    if not isinstance(values, dict) or set(values) != {
+                        "exposure_time_us",
+                        "gain_db",
+                    }:
+                        raise ValueError(serial)
+                    exposure = float(values["exposure_time_us"])
+                    gain = float(values["gain_db"])
+                    if not math.isfinite(exposure) or exposure <= 0:
+                        raise ValueError(serial)
+                    if not math.isfinite(gain) or gain < 0:
+                        raise ValueError(serial)
+        except (TypeError, ValueError):
+            missing.append("vision.camera_acquisition_map_json is invalid")
+        if str(self.get_parameter("vision.model.runtime").value) != ARTIFACT_RUNTIME:
+            missing.append(f"vision.model.runtime must be {ARTIFACT_RUNTIME}")
+        try:
+            nic_address = ipaddress.ip_address(
+                str(self.get_parameter("vision.nic.ipv4").value)
+            )
+            prefix = int(self.get_parameter("vision.nic.prefix_length").value)
+            if nic_address.version != 4 or prefix != 24:
+                raise ValueError("dedicated camera NIC must be IPv4 /24")
+        except ValueError:
+            missing.append("vision.nic must be a valid IPv4 /24 configuration")
         data_root = str(self.get_parameter("vision.data_root").value)
         if data_root and not Path(data_root).is_absolute():
             missing.append("vision.data_root must be absolute")
@@ -571,6 +649,7 @@ class VisionNode(InspectionNodeBase):
             previous_spool.close()
         if self.profile == "hardware":
             try:
+                nic_name = self._validate_host_camera_nic()
                 self.capture_backend.initialize_with_reconnect()
                 inventory = tuple(
                     {
@@ -603,50 +682,199 @@ class VisionNode(InspectionNodeBase):
                         ),
                         "skew_clock": "HOST_MONOTONIC_ARRIVAL",
                         "scheduled_action": False,
+                        "host_camera_nic": nic_name,
+                        "host_camera_ipv4": str(
+                            self.get_parameter("vision.nic.ipv4").value
+                        ),
                         "cameras": inventory,
                     },
                 )
-            except (MvsSdkError, OSError, ValueError) as exc:
+                self._initialize_worker_runtime(production=True)
+            except (
+                ArtifactContractError,
+                MvsSdkError,
+                OSError,
+                RuntimeError,
+                ValueError,
+            ) as exc:
+                self.capture_backend.deinitialize()
                 return NodeInitializationOutcome(
                     success=False,
                     error_code=int(ErrorCode.NODE_INIT_FAILED),
-                    reason=f"MVS camera initialization failed: {exc}",
+                    reason=f"Vision hardware initialization failed: {exc}",
                     retryable=True,
                 )
-            finally:
-                # 모델 입출력 계약이 주입되기 전에는 READY를 허용하지 않습니다.
-                self.capture_backend.deinitialize()
+            self._oom_reinitialization_required = False
             return NodeInitializationOutcome(
-                success=False,
-                error_code=int(ErrorCode.IMPLEMENTATION_PENDING),
-                reason=(
-                    "MVS Action1 inventory validated; TorchScript preprocessing/"
-                    "output decoder is awaiting model injection"
-                ),
-                retryable=True,
+                success=True,
+                reason="MVS Action1 and four-view PatchCore artifact initialized",
+                status_details={
+                    "model_version": self._model_backend.identity.version,
+                    "model_sha256": self._model_backend.identity.sha256,
+                    "model_runtime": self._model_backend.identity.runtime,
+                    "library_compatibility_warnings": list(
+                        self._model_backend.identity.library_compatibility_warnings
+                    ),
+                },
             )
         self.capture_backend.initialize()
-        if self.worker_pool is None:
-            worker_count = int(self.get_parameter("vision.worker_count").value)
-            self.worker_pool = WorkerPool(
-                queue=self.inference_queue,
-                model=FakeStationModel(),
-                worker_count=max(worker_count, 1),
-                load_image=_fake_load_image,
-                infer=_infer_station,
-                on_success=self._on_inference_success,
-                on_failure=self._on_inference_failure,
-                on_timing=self._on_inference_timing,
-                on_canceled=self._on_inference_canceled,
-                serialize_model_access=bool(
-                    self.get_parameter("vision.model.serialize_access").value
-                ),
-            )
-            self.worker_pool.start()
-        self._gpu_monitor.start()
+        self._initialize_worker_runtime(production=False)
         return NodeInitializationOutcome(
             success=True,
             reason="sim Mono8 capture and batch model skeleton initialized",
+        )
+
+    def _validate_host_camera_nic(self) -> str:
+        """전용 camera NIC의 고정 IPv4와 MTU 1500을 OS 상태에서 확인합니다."""
+
+        expected_ip = str(self.get_parameter("vision.nic.ipv4").value)
+        expected_prefix = int(
+            self.get_parameter("vision.nic.prefix_length").value
+        )
+        try:
+            completed = subprocess.run(
+                ["ip", "-j", "-4", "address", "show"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            interfaces = json.loads(completed.stdout)
+        except (
+            FileNotFoundError,
+            json.JSONDecodeError,
+            subprocess.SubprocessError,
+        ) as exc:
+            raise OSError(
+                f"cannot inspect host camera NIC: {type(exc).__name__}"
+            ) from exc
+        if not isinstance(interfaces, list) or not all(
+            isinstance(interface, dict) for interface in interfaces
+        ):
+            raise OSError("host camera NIC inventory has an invalid shape")
+        for interface in interfaces:
+            addresses = interface.get("addr_info", [])
+            if any(
+                address.get("family") == "inet"
+                and address.get("local") == expected_ip
+                and int(address.get("prefixlen", -1)) == expected_prefix
+                for address in addresses
+            ):
+                if int(interface.get("mtu", 0)) != 1500:
+                    raise OSError(
+                        f"camera NIC {interface.get('ifname', '')} MTU must be 1500"
+                    )
+                if "UP" not in set(interface.get("flags", [])):
+                    raise OSError(
+                        f"camera NIC {interface.get('ifname', '')} is not UP"
+                    )
+                return str(interface.get("ifname", ""))
+        raise OSError(
+            f"host camera NIC address {expected_ip}/{expected_prefix} is not configured"
+        )
+
+    def _initialize_worker_runtime(self, *, production: bool) -> None:
+        """초기화/재초기화 때 queue, model, worker를 새 객체로 교체합니다."""
+
+        previous_pool = self.worker_pool
+        if previous_pool is not None:
+            previous_pool.stop(
+                soft_timeout_seconds=max(
+                    int(
+                        self.get_parameter(
+                            "vision.shutdown.queue_drain_timeout_ms"
+                        ).value
+                    ),
+                    0,
+                )
+                / 1000.0
+            )
+        previous_model = self._model_backend
+        if previous_model is not None and hasattr(previous_model, "close"):
+            previous_model.close()
+
+        capacity = max(int(self.get_parameter("vision.queue.capacity").value), 1)
+        replacement_queue = InferenceQueue(capacity)
+        if production:
+            station_a = tuple(
+                self.get_parameter("vision.camera_ids.station_a").value
+            )
+            station_b = tuple(
+                self.get_parameter("vision.camera_ids.station_b").value
+            )
+            views = EXPECTED_STATION_VIEWS[1] + EXPECTED_STATION_VIEWS[2]
+            serial_to_view = dict(zip(station_a + station_b, views, strict=True))
+            model = PatchCoreArtifactModel.load(
+                artifact_path=Path(
+                    str(self.get_parameter("vision.model.path").value)
+                ),
+                expected_version=str(
+                    self.get_parameter("vision.model.version").value
+                ),
+                expected_sha256=str(
+                    self.get_parameter("vision.model.sha256").value
+                ),
+                serial_to_view=serial_to_view,
+                diagnostic_root=Path(
+                    str(self.get_parameter("vision.data_root").value)
+                )
+                / "diagnostics",
+                warmup_runs=int(
+                    self.get_parameter("vision.model.warmup_runs").value
+                ),
+                cuda_required=bool(
+                    self.get_parameter("vision.model.cuda_required").value
+                ),
+            )
+            load_image = model.load_image
+        else:
+            model = FakeStationModel()
+            load_image = _fake_load_image
+        replacement_pool = WorkerPool(
+            queue=replacement_queue,
+            model=model,
+            worker_count=max(
+                int(self.get_parameter("vision.worker_count").value), 1
+            ),
+            load_image=load_image,
+            infer=_infer_station,
+            on_success=self._on_inference_success,
+            on_failure=self._on_inference_failure,
+            on_timing=self._on_inference_timing,
+            on_canceled=self._on_inference_canceled,
+            serialize_model_access=bool(
+                self.get_parameter("vision.model.serialize_access").value
+            ),
+        )
+        replacement_pool.start()
+        self.inference_queue = replacement_queue
+        self.worker_pool = replacement_pool
+        self._model_backend = model
+        self._worker_stopped = False
+
+    def on_initialization_succeeded(
+        self, previous_session_id: str, new_session_id: str
+    ) -> None:
+        if previous_session_id == new_session_id:
+            return
+        # Durable spool은 session을 넘어 보존합니다. 아래 항목만 session-local입니다.
+        self._capture_results = IdempotencyStore()
+        self._capture_identities.clear()
+        self._completed_captures.clear()
+        self._canceled_station_scopes.clear()
+        self._inference_timings.clear()
+        self._session_metrics_emitted = False
+        self._gpu_monitor.stop()
+        self._gpu_monitor = self._new_gpu_monitor()
+        self._gpu_monitor.start()
+
+    def _new_gpu_monitor(self) -> GpuMonitor:
+        return GpuMonitor(
+            interval_seconds=max(
+                int(self.get_parameter("vision.gpu.sample_interval_ms").value),
+                1,
+            )
+            / 1000.0
         )
 
     def _run_blocking(self, fn, *args, **kwargs) -> Future:
@@ -775,7 +1003,7 @@ class VisionNode(InspectionNodeBase):
         message.model_version = result.model_version
         message.completed_at = message.header.stamp
         timing = self._inference_timings.pop(job.inference_job_id, None)
-        self._emit_durable_event(
+        durable = self._emit_durable_event(
             "VISION_STATION_RESULT_DURABLE",
             {
                 "product_id": job.product_id,
@@ -792,6 +1020,9 @@ class VisionNode(InspectionNodeBase):
                 "config_fingerprint": self._timeout_tuning_fingerprint(),
                 "view_verdicts": list(result.view_verdicts),
                 "view_scores": list(result.view_scores),
+                "view_raw_scores": list(result.view_raw_scores),
+                "view_names": list(result.view_names),
+                "diagnostic_paths": list(result.diagnostic_paths),
                 "camera_ids": list(job.camera_ids),
                 "image_paths": list(job.image_paths),
                 "capture_completed_monotonic_ns": job.capture_completed_monotonic_ns,
@@ -805,6 +1036,12 @@ class VisionNode(InspectionNodeBase):
             },
             product_id=job.product_id,
         )
+        if not durable:
+            self.set_health_state(NodeHealthState.DEGRADED)
+            self.get_logger().error(
+                "StationResult suppressed because durable spool commit failed"
+            )
+            return
         self._station_result_publisher.publish(message)
 
     def _emit_gpu_metrics_snapshot(self) -> None:
@@ -865,6 +1102,7 @@ class VisionNode(InspectionNodeBase):
         error_codes = {
             InferenceFailureKind.TIMEOUT: ErrorCode.INFERENCE_TIMEOUT,
             InferenceFailureKind.FILE_READ: ErrorCode.INFERENCE_FILE_READ_FAILED,
+            InferenceFailureKind.PREPROCESSING: ErrorCode.INFERENCE_FAILED,
             InferenceFailureKind.MODEL: ErrorCode.INFERENCE_FAILED,
             InferenceFailureKind.CUDA_OOM: ErrorCode.GPU_OUT_OF_MEMORY,
         }
@@ -872,7 +1110,7 @@ class VisionNode(InspectionNodeBase):
         message.reason = failure.reason
         message.failed_at = message.header.stamp
         self._inference_timings.pop(job.inference_job_id, None)
-        self._emit_durable_event(
+        durable = self._emit_durable_event(
             "VISION_STATION_FAILURE_DURABLE",
             {
                 "product_id": job.product_id,
@@ -891,9 +1129,22 @@ class VisionNode(InspectionNodeBase):
             product_id=job.product_id,
             severity=LogEvent.ERROR,
         )
-        self._station_failure_publisher.publish(message)
+        if durable:
+            self._station_failure_publisher.publish(message)
+        else:
+            self.set_health_state(NodeHealthState.DEGRADED)
+            self.get_logger().error(
+                "StationInferenceFailed suppressed because durable spool commit failed"
+            )
         if failure.kind == InferenceFailureKind.CUDA_OOM:
             self.set_health_state(NodeHealthState.DEGRADED)
+            self._oom_reinitialization_required = True
+            self.inference_queue.cancel_all_waiting()
+            self.inference_queue.close()
+            if self._model_backend is not None and hasattr(
+                self._model_backend, "handle_cuda_oom"
+            ):
+                self._model_backend.handle_cuda_oom()
 
     def _accept_capture_goal(self, goal_request) -> GoalResponse:
         cameras = tuple(goal_request.required_camera_ids)
@@ -1170,8 +1421,10 @@ class VisionNode(InspectionNodeBase):
         )
         last_error = ErrorCode.CAPTURE_FAILED
         last_reason = "capture did not start"
+        last_attempt_was_mvs_disconnect = False
         for attempt in range(1, max_attempts + 1):
             attempt_error = ErrorCode.CAPTURE_FAILED
+            last_attempt_was_mvs_disconnect = False
             batch: CaptureBatch | None = None
             if goal_handle.is_cancel_requested:
                 return None, ErrorCode.CAPTURE_CANCELED, "capture canceled"
@@ -1299,6 +1552,7 @@ class VisionNode(InspectionNodeBase):
                 )
                 return batch, ErrorCode.NONE, ""
             except Exception as exc:
+                last_attempt_was_mvs_disconnect = isinstance(exc, MvsSdkError)
                 if attempt_error != ErrorCode.CAPTURE_SKEW_EXCEEDED:
                     attempt_error = (
                         ErrorCode.IMPLEMENTATION_PENDING
@@ -1335,6 +1589,30 @@ class VisionNode(InspectionNodeBase):
                         0.0,
                         "retrying all required cameras with the same capture_id",
                     )
+        if last_attempt_was_mvs_disconnect:
+            self.set_health_state(NodeHealthState.DEGRADED)
+            self._emit_durable_event(
+                "VISION_CAMERA_DISCONNECT_PERSISTENT",
+                {
+                    "product_id": request.product_id,
+                    "fifo_sequence": request.fifo_sequence,
+                    "station_id": request.station_id,
+                    "capture_id": request.capture_id,
+                    "reconnect_attempts_per_capture_attempt": int(
+                        self.get_parameter(
+                            "vision.camera.reconnect_max_attempts"
+                        ).value
+                    ),
+                    "pause_after_ms": int(
+                        self.get_parameter(
+                            "vision.camera.disconnect_pause_after_ms"
+                        ).value
+                    ),
+                    "reason": last_reason,
+                },
+                product_id=request.product_id,
+                severity=LogEvent.ERROR,
+            )
         return None, last_error, last_reason
 
     def _capture_success_values(
@@ -1485,12 +1763,27 @@ class VisionNode(InspectionNodeBase):
         }
         if any(str(document.get(key, "")) != value for key, value in expected.items()):
             raise ValueError("generated timeout tuning model fingerprint mismatch")
+        configured_samples = int(
+            self.get_parameter("vision.timeout_tuning.minimum_samples").value
+        )
+        configured_factor = float(
+            self.get_parameter("vision.timeout_tuning.safety_factor").value
+        )
+        timeout_document = document.get("timeouts_ms")
+        if (
+            int(document.get("schema_version", 0)) != 1
+            or int(document.get("minimum_samples", 0)) < configured_samples
+            or float(document.get("safety_factor", math.nan)) != configured_factor
+            or not isinstance(timeout_document, dict)
+            or set(timeout_document) != {"station_a", "station_b"}
+        ):
+            raise ValueError("generated timeout tuning eligibility contract mismatch")
         updates = []
         for station_name, parameter_name in (
             ("station_a", "vision.inference.station_a.total_timeout_ms"),
             ("station_b", "vision.inference.station_b.total_timeout_ms"),
         ):
-            candidate = document.get("timeouts_ms", {}).get(station_name)
+            candidate = timeout_document.get(station_name)
             if candidate is not None and int(candidate) > 0:
                 updates.append(Parameter(parameter_name, value=int(candidate)))
         if updates:
@@ -1662,7 +1955,7 @@ class VisionNode(InspectionNodeBase):
         *,
         product_id: str = "",
         severity: int = LogEvent.INFO,
-    ) -> None:
+    ) -> bool:
         log_id = new_uuid()
         envelope = {
             "schema_version": 2,
@@ -1686,15 +1979,19 @@ class VisionNode(InspectionNodeBase):
             self.get_logger().error(
                 f"Vision durable event serialization failed: {type(exc).__name__}"
             )
-            return
-        if self._result_spool is not None:
-            try:
-                self._result_spool.enqueue(record)
-            except Exception as exc:
-                self.get_logger().error(
-                    f"Vision result spool enqueue failed: {type(exc).__name__}"
-                )
+            return False
+        if self._result_spool is None:
+            self.get_logger().error("Vision durable spool is not initialized")
+            return False
+        try:
+            self._result_spool.enqueue(record)
+        except Exception as exc:
+            self.get_logger().error(
+                f"Vision result spool enqueue failed: {type(exc).__name__}"
+            )
+            return False
         self._publish_spool_record(record)
+        return True
 
     def _publish_spool_record(self, record: SpoolRecord) -> None:
         try:
@@ -1711,8 +2008,12 @@ class VisionNode(InspectionNodeBase):
         message.revision = record.revision
         message.severity = int(envelope.get("severity", LogEvent.INFO))
         message.event_type = str(envelope.get("event_type", "UNKNOWN"))
-        message.source_node = NodeId.VISION.value
-        message.producer_instance_id = self.node_instance_id
+        message.source_node = str(
+            envelope.get("source_node", NodeId.VISION.value)
+        )
+        message.producer_instance_id = str(
+            envelope.get("producer_instance_id", self.node_instance_id)
+        )
         message.product_id = str(envelope.get("product_id", ""))
         message.payload_json = record.payload_json
         message.payload_digest = record.payload_digest
@@ -1724,8 +2025,9 @@ class VisionNode(InspectionNodeBase):
             return
         if message.producer_node != NodeId.VISION.value:
             return
-        if message.producer_instance_id != self.node_instance_id:
-            return
+        # 이전 process instance가 남긴 spool도 현재 process가 소유합니다.
+        # Log가 ACK한 실제 spool PK만 acknowledge하므로 instance 불일치를
+        # 이유로 영구 보존하지 않습니다.
         if len(message.acked_log_ids) != len(message.acked_revisions):
             self.get_logger().error("Vision LogPersistedAck arrays have unequal lengths")
             return
@@ -1756,7 +2058,7 @@ class VisionNode(InspectionNodeBase):
 
 
 def main(args: list[str] | None = None) -> None:
-    rclpy.init(args=args)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     spin_node(VisionNode())
 
 

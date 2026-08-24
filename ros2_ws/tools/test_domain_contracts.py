@@ -78,6 +78,7 @@ from inspection_vision.capture_contract import (  # noqa: E402
 )
 from inspection_vision.hikrobot_mvs import (  # noqa: E402
     ActionGroup,
+    CameraAcquisitionSettings,
     CameraInventoryEntry,
     MvsBackendSettings,
     MvsSdkError,
@@ -1131,6 +1132,72 @@ class VisionContractTests(unittest.TestCase):
         self.assertEqual(attempts, 1)
         self.assertEqual(failures, [InferenceFailureKind.MODEL])
 
+    def test_preprocessing_failure_is_not_retried_or_misclassified(self) -> None:
+        class ForegroundMissing(RuntimeError):
+            is_preprocessing_failure = True
+
+        queue = InferenceQueue(capacity=1)
+        attempts = 0
+        completed = threading.Event()
+        failures: list[InferenceFailureKind] = []
+
+        def load(_path: Path) -> bytes:
+            nonlocal attempts
+            attempts += 1
+            raise ForegroundMissing("no foreground")
+
+        pool: WorkerPool[object, bytes, str] = WorkerPool(
+            queue=queue,
+            model=object(),
+            worker_count=1,
+            load_image=load,
+            infer=lambda _model, _images: "PASS",
+            on_success=lambda _job, _result: None,
+            on_failure=lambda _job, failure: (
+                failures.append(failure.kind),
+                completed.set(),
+            ),
+        )
+        self.assertTrue(queue.try_enqueue(self._job(1)))
+        pool.start()
+        self.assertTrue(completed.wait(1.0))
+        pool.stop()
+        self.assertEqual(attempts, 1)
+        self.assertEqual(failures, [InferenceFailureKind.PREPROCESSING])
+
+    def test_cuda_out_of_memory_is_fail_closed_and_not_retried(self) -> None:
+        class FakeOutOfMemoryError(RuntimeError):
+            pass
+
+        queue = InferenceQueue(capacity=1)
+        attempts = 0
+        completed = threading.Event()
+        failures: list[InferenceFailureKind] = []
+
+        def infer(_model: object, _images: tuple[bytes, ...]) -> str:
+            nonlocal attempts
+            attempts += 1
+            raise FakeOutOfMemoryError("synthetic allocation failure")
+
+        pool: WorkerPool[object, bytes, str] = WorkerPool(
+            queue=queue,
+            model=object(),
+            worker_count=1,
+            load_image=lambda _path: b"mono",
+            infer=infer,
+            on_success=lambda _job, _result: None,
+            on_failure=lambda _job, failure: (
+                failures.append(failure.kind),
+                completed.set(),
+            ),
+        )
+        self.assertTrue(queue.try_enqueue(self._job(1)))
+        pool.start()
+        self.assertTrue(completed.wait(1.0))
+        pool.stop()
+        self.assertEqual(attempts, 1)
+        self.assertEqual(failures, [InferenceFailureKind.CUDA_OOM])
+
     def test_capture_batch_validates_mono_png_digest_and_host_skew(self) -> None:
         png = make_png(MONO8_PNG)
         with tempfile.TemporaryDirectory() as directory:
@@ -1276,13 +1343,18 @@ class VisionContractTests(unittest.TestCase):
                 "A3": "192.168.10.14",
                 "B1": "192.168.10.12",
             },
+            camera_acquisition_settings={
+                serial: CameraAcquisitionSettings(5000.0, 0.0)
+                for serial in ("A1", "A2", "A3", "B1")
+            },
             action_device_key=1,
             action_groups={1: ActionGroup(1, 1), 2: ActionGroup(2, 2)},
             data_root=Path(tempfile.gettempdir()).resolve() / "inspection-images",
-            acquisition_timeout_ms=1000,
+            acquisition_timeout_ms=250,
         )
         settings.validate()
         self.assertEqual(settings.packet_size, 1500)
+        self.assertEqual(settings.acquisition_timeout_ms, 250)
         self.assertEqual(settings.action_groups[1], ActionGroup(1, 1))
         self.assertEqual(settings.action_groups[2], ActionGroup(2, 2))
 
@@ -1308,9 +1380,15 @@ class VisionContractTests(unittest.TestCase):
             "vision.gige_action.station_a.group_key: 1",
             "vision.gige_action.station_b.group_key: 2",
             'vision.camera.expected_firmware_version: ""',
+            'vision.nic.ipv4: "192.168.10.10"',
+            "vision.nic.prefix_length: 24",
+            "vision.frame_arrival_skew_limit_us: 50000",
+            "vision.capture.acquisition_timeout_ms: 250",
         ):
             self.assertIn(expected_line, capture_config)
         self.assertIn("vision.queue.capacity: 16", runtime_config)
+        self.assertIn("vision.inference.station_a.total_timeout_ms: 3000", runtime_config)
+        self.assertIn("vision.inference.station_b.total_timeout_ms: 1500", runtime_config)
         self.assertIn("vision.worker_count: 1", model_config)
         self.assertIn("vision.model.serialize_access: true", model_config)
 
@@ -1401,11 +1479,41 @@ class LogContractTests(unittest.TestCase):
                 minimum_samples=1,
                 safety_factor=1.2,
             )
+            self.assertIsNone(tuned.tuning_path)
+            self.assertFalse((root / "tuning.json").exists())
+
+            station_b_payload = dict(result_payload)
+            station_b_payload.update(
+                {
+                    "station_id": 2,
+                    "capture_id": "capture-b",
+                    "frame_batch_id": "batch-b",
+                    "inference_job_id": "job-b",
+                    "enqueue_to_result_ms": 2.0,
+                }
+            )
+            repository.append_event(
+                self._durable_event(
+                    event_type="VISION_STATION_RESULT_DURABLE",
+                    payload=station_b_payload,
+                    log_id="vision-result-b",
+                )
+            )
+            tuned = generate_session_report(
+                repository,
+                session_id="session-1",
+                report_root=root / "reports-auto-complete",
+                timeout_tuning_path=root / "tuning.json",
+                auto_apply_timeouts=True,
+                minimum_samples=1,
+                safety_factor=1.2,
+            )
             self.assertEqual(tuned.tuning_path, root / "tuning.json")
             tuning_document = json.loads(
                 (root / "tuning.json").read_text(encoding="utf-8")
             )
             self.assertEqual(tuning_document["timeouts_ms"]["station_a"], 4)
+            self.assertEqual(tuning_document["timeouts_ms"]["station_b"], 3)
             repository.close()
 
     def test_repository_replacement_can_close_previous_connection(self) -> None:

@@ -10,7 +10,9 @@ Vision Node를 완성하기 위한 확정·미결정·실험 항목과 파라미
 source /opt/ros/jazzy/setup.bash
 python3 tools/verify_skeleton.py
 python3 tools/test_domain_contracts.py
-colcon build --symlink-install
+python3 tools/test_vision_algorithms.py
+colcon build --symlink-install --cmake-force-configure \
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
 source install/setup.bash
 ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 ```

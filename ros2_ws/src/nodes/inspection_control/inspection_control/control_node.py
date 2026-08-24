@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import rclpy
+from rclpy.signals import SignalHandlerOptions
 from inspection_common import (
     ConveyorId,
     ErrorCode,
@@ -285,7 +286,7 @@ class ControlNode(InspectionNodeBase):
 
 
 def main(args: list[str] | None = None) -> None:
-    rclpy.init(args=args)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     spin_node(ControlNode())
 
 

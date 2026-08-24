@@ -24,6 +24,7 @@ class InferenceFailureKind(str, Enum):
 
     TIMEOUT = "TIMEOUT"
     FILE_READ = "FILE_READ"
+    PREPROCESSING = "PREPROCESSING"
     MODEL = "MODEL"
     CUDA_OOM = "CUDA_OOM"
 
@@ -354,10 +355,19 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
             )
             return
         except Exception as exc:
+            failure_kind = (
+                InferenceFailureKind.PREPROCESSING
+                if bool(getattr(exc, "is_preprocessing_failure", False))
+                else InferenceFailureKind.FILE_READ
+            )
             self._fail(
                 job,
-                InferenceFailureKind.FILE_READ,
-                f"image read failed after retry: {type(exc).__name__}",
+                failure_kind,
+                (
+                    f"preprocessing failed: {type(exc).__name__}"
+                    if failure_kind == InferenceFailureKind.PREPROCESSING
+                    else f"image read failed after retry: {type(exc).__name__}"
+                ),
             )
             return
         load_completed_ns = time.monotonic_ns()
@@ -417,7 +427,11 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
     def _load_with_one_retry(self, job: InferenceJob, path: Path) -> LoadedT:
         try:
             return self._load_image(path)
-        except Exception:
+        except Exception as exc:
+            # 같은 canonical image를 다시 읽어도 바뀌지 않는 전처리 계약 실패는
+            # retry 대상이 아닙니다. I/O의 일시 오류만 한 번 재시도합니다.
+            if bool(getattr(exc, "is_preprocessing_failure", False)):
+                raise
             if job.expired():
                 raise InferenceDeadlineExceeded
             return self._load_image(path)

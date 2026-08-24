@@ -10,6 +10,7 @@ from __future__ import annotations
 import ctypes
 import importlib
 import ipaddress
+import math
 import os
 import sys
 import threading
@@ -57,9 +58,22 @@ class CameraInventoryEntry:
 
 
 @dataclass(frozen=True, slots=True)
+class CameraAcquisitionSettings:
+    exposure_time_us: float
+    gain_db: float
+
+    def validate(self, serial: str) -> None:
+        if not math.isfinite(self.exposure_time_us) or self.exposure_time_us <= 0:
+            raise ValueError(f"{serial}: exposure_time_us must be positive")
+        if not math.isfinite(self.gain_db) or self.gain_db < 0:
+            raise ValueError(f"{serial}: gain_db must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
 class MvsBackendSettings:
     station_camera_ids: Mapping[int, tuple[str, ...]]
     camera_network_map: Mapping[str, str]
+    camera_acquisition_settings: Mapping[str, CameraAcquisitionSettings]
     action_device_key: int
     action_groups: Mapping[int, ActionGroup]
     data_root: Path
@@ -95,6 +109,12 @@ class MvsBackendSettings:
             raise ValueError("MVS camera serials must be unique")
         if set(self.camera_network_map) != set(all_serials):
             raise ValueError("MVS camera network map must cover exactly four cameras")
+        if set(self.camera_acquisition_settings) != set(all_serials):
+            raise ValueError(
+                "MVS acquisition settings must cover exactly four cameras"
+            )
+        for serial, acquisition in self.camera_acquisition_settings.items():
+            acquisition.validate(serial)
         for address in self.camera_network_map.values():
             ipaddress.ip_address(str(address))
         if not 1 <= self.action_device_key <= 0xFFFFFFFF:
@@ -333,6 +353,18 @@ class _CameraSession:
             f"{self.serial}: {name}={value}",
         )
 
+    def _float(self, name: str, value: float) -> None:
+        _check_mvs(
+            self.camera.MV_CC_SetFloatValue(name, float(value)),
+            f"{self.serial}: {name}={value}",
+        )
+
+    def _boolean(self, name: str, value: bool) -> None:
+        _check_mvs(
+            self.camera.MV_CC_SetBoolValue(name, bool(value)),
+            f"{self.serial}: {name}={value}",
+        )
+
     def open(self) -> None:
         group = self.settings.action_groups[self.record.identity.station_id]
         _check_mvs(
@@ -348,6 +380,20 @@ class _CameraSession:
             )
             self.opened = True
             self._enum("TriggerMode", "Off")
+            acquisition = self.settings.camera_acquisition_settings[self.serial]
+            # 운영 계약: 자동 보정뿐 아니라 가능한 모든 영상 보정을 끕니다.
+            self._enum("ExposureAuto", "Off")
+            self._float("ExposureTime", acquisition.exposure_time_us)
+            self._enum("GainAuto", "Off")
+            self._float("Gain", acquisition.gain_db)
+            self._enum("BalanceWhiteAuto", "Off")
+            for correction in (
+                "GammaEnable",
+                "SaturationEnable",
+                "SharpnessEnable",
+                "BlackLevelEnable",
+            ):
+                self._boolean(correction, False)
             self._integer("OffsetX", 0)
             self._integer("OffsetY", 0)
             self._integer("Width", 2448)
@@ -387,12 +433,22 @@ class _CameraSession:
                 ),
                 f"{self.serial}: MV_CC_SetImageNodeNum",
             )
-            _check_mvs(
+            strategy_result = int(
                 self.camera.MV_CC_SetGrabStrategy(
                     self.modules.params.MV_GrabStrategy_OneByOne
-                ),
-                f"{self.serial}: MV_CC_SetGrabStrategy",
+                )
             )
+            # MVS Linux Python wrapper는 일부 GigE firmware에서 명시적
+            # OneByOne 설정에 MV_E_SUPPORT를 반환합니다. 기본 전략도
+            # OneByOne이므로 이 한 코드만 허용하고 나머지는 fail-closed합니다.
+            not_supported = int(
+                getattr(self.modules.errors, "MV_E_SUPPORT", 0x80000001)
+            )
+            if (strategy_result & 0xFFFFFFFF) != (not_supported & 0xFFFFFFFF):
+                _check_mvs(
+                    strategy_result,
+                    f"{self.serial}: MV_CC_SetGrabStrategy",
+                )
             _check_mvs(
                 self.camera.MV_CC_StartGrabbing(),
                 f"{self.serial}: MV_CC_StartGrabbing",

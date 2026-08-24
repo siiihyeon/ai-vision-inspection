@@ -3910,8 +3910,14 @@ class MasterNode(InspectionNodeBase):
         message.revision = record.revision
         message.severity = int(envelope.get("severity", LogEvent.INFO))
         message.event_type = str(envelope.get("event_type", "UNKNOWN"))
-        message.source_node = NodeId.MASTER.value
-        message.producer_instance_id = self.node_instance_id
+        message.source_node = str(
+            envelope.get("source_node", NodeId.MASTER.value)
+        )
+        # Process 재시작 전 spool record도 원본 envelope와 같은 producer로
+        # 전달해야 Log의 중복 필드 무결성 검증을 통과합니다.
+        message.producer_instance_id = str(
+            envelope.get("producer_instance_id", self.node_instance_id)
+        )
         message.product_id = str(envelope.get("product_id", ""))
         message.payload_json = record.payload_json
         message.payload_digest = record.payload_digest
@@ -3925,8 +3931,8 @@ class MasterNode(InspectionNodeBase):
             return
         if message.producer_node != NodeId.MASTER.value:
             return
-        if message.producer_instance_id != self.node_instance_id:
-            return
+        # producer_instance_id는 재시작 전 원본 값일 수 있습니다. 신뢰된
+        # LogNode의 ACK에서 실제 spool PK(log_id, revision)만 제거합니다.
         if len(message.acked_log_ids) != len(message.acked_revisions):
             self.get_logger().error("LogPersistedAck identity arrays have other lengths")
             return

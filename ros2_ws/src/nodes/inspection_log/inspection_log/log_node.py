@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import rclpy
+from rclpy.signals import SignalHandlerOptions
 from inspection_common import ErrorCode, NodeId, new_uuid
 from inspection_common.node_base import (
     InspectionNodeBase,
@@ -322,7 +323,7 @@ class LogNode(InspectionNodeBase):
 
 
 def main(args: list[str] | None = None) -> None:
-    rclpy.init(args=args)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     spin_node(LogNode())
 
 

@@ -26,7 +26,7 @@ Vision Node의 모든 미결정값과 수정 위치는 [Vision Node 완성 결�
 
 ## 모델과 GPU
 
-- A/B 동일 PyTorch TorchScript `.pt`, 이름 `Model_v_1`, 한 session 동안 version/SHA-256 고정.
+- A/B는 하나의 versioned PatchCore v2 bundle을 사용하되 네 view별 memory bank와 threshold를 독립 보관하고, 한 session 동안 version/통합 SHA-256을 고정합니다.
 - 실제 resize/normalization/input-output decoder는 추후 주입합니다. 전처리 파일은 보존하지 않습니다.
 - CUDA 필수, CPU fallback 금지. CUDA OOM은 현재 제품 실패 후 PAUSE/재초기화입니다.
 - RTX 5070 Laptop GPU 8,151 MiB 기준으로 batch 3의 실제 VRAM/latency를 시험합니다. 현재 골격이 안전 용량을 보장하는 것은 아닙니다.
