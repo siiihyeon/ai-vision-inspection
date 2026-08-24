@@ -746,3 +746,156 @@ class ProductResultReorderBuffer:
             raise ValueError("first_sequence must be positive")
         self._next_sequence = first_sequence
         self._pending.clear()
+
+
+class StationMessageOutcome(StrEnum):
+    """station result/failure를 원장에 반영하기 전 내린 판단입니다."""
+
+    INVALID_STATION_ID = "INVALID_STATION_ID"
+    EXPIRED_PRODUCT = "EXPIRED_PRODUCT"
+    CAPTURE_OWNER_CONFLICT = "CAPTURE_OWNER_CONFLICT"
+    UNKNOWN_PRODUCT = "UNKNOWN_PRODUCT"
+    UNREGISTERED_CAPTURE = "UNREGISTERED_CAPTURE"
+    REMOVED_PRODUCT = "REMOVED_PRODUCT"
+    SUPERSEDED_CAPTURE = "SUPERSEDED_CAPTURE"
+    LATE_AFTER_LOCK = "LATE_AFTER_LOCK"
+    CONTRACT_INCOMPLETE = "CONTRACT_INCOMPLETE"
+    ACCEPTED = "ACCEPTED"
+
+
+class StationContractDefect(StrEnum):
+    """CONTRACT_INCOMPLETE의 세부 사유입니다."""
+
+    NONE = "NONE"
+    SCORE_NOT_FINITE = "SCORE_NOT_FINITE"
+    PAYLOAD_INCOMPLETE = "PAYLOAD_INCOMPLETE"
+
+
+@dataclass(frozen=True, slots=True)
+class StationMessageFacts:
+    """ROS 메시지에서 판단에 필요한 값만 뽑아낸 순수 데이터입니다.
+
+    score는 호출자가 finite 검사를 마친 값을 넘깁니다. NaN/inf는 None입니다.
+    """
+
+    product_id: str
+    fifo_sequence: int
+    station_id_raw: int
+    capture_id: str
+    frame_batch_id: str
+    inference_job_id: str
+    result_revision: int
+    verdict_raw: int | None = None
+    score: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StationMessageDecision:
+    """판단 결과입니다. 부작용 실행은 호출한 ROS 콜백이 담당합니다."""
+
+    outcome: StationMessageOutcome
+    station_id: StationId | None = None
+    context: ProductContext | None = None
+    verdict: Verdict | None = None
+    active_capture_id: str = ""
+    defect: StationContractDefect = StationContractDefect.NONE
+
+
+def classify_station_message(
+    ledger: ProductLedger,
+    facts: StationMessageFacts,
+    *,
+    expects_verdict: bool,
+) -> StationMessageDecision:
+    """원장을 읽어 이 메시지를 어떻게 처리할지만 결정합니다.
+
+    원장을 변경하지 않고 로그도 남기지 않습니다. 실제 반영과 로그 발행,
+    FAULT_STOP 전이는 호출한 ROS 콜백이 outcome을 보고 수행합니다.
+
+    `expects_verdict`는 StationResult(True)와 StationInferenceFailed(False)를
+    구분합니다. 실패 메시지에는 verdict/score가 없으므로 그 검사를 건너뜁니다.
+
+    station_id 파싱을 원장 조회보다 먼저 수행합니다. 형식이 깨진 메시지는
+    원장을 조회할 가치가 없고, "메시지가 오염됐다"가 "제품을 못 찾겠다"보다
+    조치 가능한 진단 정보이기 때문입니다.
+    """
+
+    try:
+        station_id = StationId(facts.station_id_raw)
+    except ValueError:
+        return StationMessageDecision(StationMessageOutcome.INVALID_STATION_ID)
+
+    verdict: Verdict | None = None
+    if expects_verdict and facts.verdict_raw is not None:
+        try:
+            verdict = Verdict(facts.verdict_raw)
+        except ValueError:
+            verdict = None
+
+    context = ledger.get(facts.product_id, facts.fifo_sequence)
+    if context is None:
+        if ledger.is_retired_product(
+            facts.product_id, facts.fifo_sequence
+        ) or ledger.is_retired_capture(facts.capture_id):
+            return StationMessageDecision(
+                StationMessageOutcome.EXPIRED_PRODUCT, station_id=station_id
+            )
+        if ledger.capture_owner(facts.capture_id) is not None:
+            return StationMessageDecision(
+                StationMessageOutcome.CAPTURE_OWNER_CONFLICT, station_id=station_id
+            )
+        return StationMessageDecision(
+            StationMessageOutcome.UNKNOWN_PRODUCT, station_id=station_id
+        )
+
+    if ledger.capture_owner(facts.capture_id) != (context.product_id, station_id):
+        return StationMessageDecision(
+            StationMessageOutcome.UNREGISTERED_CAPTURE,
+            station_id=station_id,
+            context=context,
+        )
+    if context.removed:
+        return StationMessageDecision(
+            StationMessageOutcome.REMOVED_PRODUCT,
+            station_id=station_id,
+            context=context,
+        )
+    active_capture_id = context.station(station_id).capture_id
+    if active_capture_id != facts.capture_id:
+        return StationMessageDecision(
+            StationMessageOutcome.SUPERSEDED_CAPTURE,
+            station_id=station_id,
+            context=context,
+            active_capture_id=active_capture_id,
+        )
+    if context.locked is not None:
+        return StationMessageDecision(
+            StationMessageOutcome.LATE_AFTER_LOCK,
+            station_id=station_id,
+            context=context,
+        )
+
+    defect = StationContractDefect.NONE
+    if expects_verdict and facts.score is None:
+        defect = StationContractDefect.SCORE_NOT_FINITE
+    elif (
+        (expects_verdict and verdict is None)
+        or facts.result_revision < 1
+        or not facts.frame_batch_id
+        or not facts.inference_job_id
+    ):
+        defect = StationContractDefect.PAYLOAD_INCOMPLETE
+    if defect is not StationContractDefect.NONE:
+        return StationMessageDecision(
+            StationMessageOutcome.CONTRACT_INCOMPLETE,
+            station_id=station_id,
+            context=context,
+            defect=defect,
+        )
+
+    return StationMessageDecision(
+        StationMessageOutcome.ACCEPTED,
+        station_id=station_id,
+        context=context,
+        verdict=verdict,
+    )

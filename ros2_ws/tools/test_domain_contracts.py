@@ -42,13 +42,18 @@ from inspection_master.operation_runtime import (  # noqa: E402
     finite_float_or_none,
 )
 from inspection_master.product_flow import (  # noqa: E402
+    LockedProduct,
     ProductLedger,
     ProductResultReorderBuffer,
     SensorEventOutcome,
     SensorEventRegistry,
+    StationContractDefect,
     StationDecision,
+    StationMessageFacts,
+    StationMessageOutcome,
     StationProcessState,
     StationResultConflict,
+    classify_station_message,
 )
 from inspection_master.system_fsm import (  # noqa: E402
     InvalidSystemTransition,
@@ -736,6 +741,173 @@ class MasterContractTests(unittest.TestCase):
         snapshot.conveyor_running[ConveyorId.UPPER] = True
         snapshot.conveyor_stopped[ConveyorId.UPPER] = False
         self.assertFalse(snapshot.line_clear_guards_satisfied())
+
+
+class StationMessageClassificationTests(unittest.TestCase):
+    """ROS 없이 station result/failure 가드 체인을 직접 검증합니다."""
+
+    CAPTURE_ID = "capture-a-product-1"
+
+    def _facts(self, **overrides) -> StationMessageFacts:
+        values: dict[str, object] = {
+            "product_id": "product-1",
+            "fifo_sequence": 1,
+            "station_id_raw": int(StationId.A),
+            "capture_id": self.CAPTURE_ID,
+            "frame_batch_id": "batch-a",
+            "inference_job_id": "job-a",
+            "result_revision": 1,
+            "verdict_raw": int(Verdict.PASS),
+            "score": 0.5,
+        }
+        values.update(overrides)
+        return StationMessageFacts(**values)  # type: ignore[arg-type]
+
+    def _ledger_with_active_capture(self, capture_id: str | None = None):
+        """Station A 촬영이 진행 중인 제품 하나를 가진 원장을 만듭니다."""
+
+        active_capture_id = capture_id or self.CAPTURE_ID
+        ledger = ProductLedger()
+        context = ledger.register("product-1", 1)
+        context.record_sensor(1, "sensor1-product-1", 100)
+        context.begin_station_cycle(
+            StationId.A,
+            position_command_id="position-a",
+            target_step=100,
+            capture_id=active_capture_id,
+        )
+        ledger.register_capture(active_capture_id, "product-1", StationId.A)
+        return ledger, context
+
+    def _classify(self, ledger, facts, *, expects_verdict: bool = True):
+        return classify_station_message(
+            ledger, facts, expects_verdict=expects_verdict
+        )
+
+    def test_accepted_when_every_guard_passes(self) -> None:
+        ledger, context = self._ledger_with_active_capture()
+        decision = self._classify(ledger, self._facts())
+        self.assertEqual(decision.outcome, StationMessageOutcome.ACCEPTED)
+        self.assertEqual(decision.station_id, StationId.A)
+        self.assertIs(decision.context, context)
+        self.assertEqual(decision.verdict, Verdict.PASS)
+
+    def test_invalid_station_id_is_reported_before_the_ledger_is_read(self) -> None:
+        ledger = ProductLedger()
+        decision = self._classify(ledger, self._facts(station_id_raw=7))
+        self.assertEqual(decision.outcome, StationMessageOutcome.INVALID_STATION_ID)
+        self.assertIsNone(decision.station_id)
+        self.assertIsNone(decision.context)
+
+    def test_retired_product_is_expired_not_unknown(self) -> None:
+        ledger, _ = self._ledger_with_active_capture()
+        ledger.clear_active(now_ns=1)
+        ledger.prune_removed(cutoff_ns=2)
+        self.assertIsNone(ledger.get("product-1", 1))
+        decision = self._classify(ledger, self._facts())
+        self.assertEqual(decision.outcome, StationMessageOutcome.EXPIRED_PRODUCT)
+
+    def test_missing_product_with_registered_capture_is_owner_conflict(self) -> None:
+        ledger = ProductLedger()
+        ledger.register_capture(self.CAPTURE_ID, "another-product", StationId.A)
+        decision = self._classify(ledger, self._facts())
+        self.assertEqual(
+            decision.outcome, StationMessageOutcome.CAPTURE_OWNER_CONFLICT
+        )
+
+    def test_missing_product_without_capture_owner_is_unknown(self) -> None:
+        decision = self._classify(ProductLedger(), self._facts())
+        self.assertEqual(decision.outcome, StationMessageOutcome.UNKNOWN_PRODUCT)
+
+    def test_capture_not_registered_to_this_product_and_station(self) -> None:
+        ledger = ProductLedger()
+        context = ledger.register("product-1", 1)
+        context.record_sensor(1, "sensor1-product-1", 100)
+        decision = self._classify(ledger, self._facts())
+        self.assertEqual(
+            decision.outcome, StationMessageOutcome.UNREGISTERED_CAPTURE
+        )
+
+    def test_product_removed_from_the_active_fifo_is_ignored(self) -> None:
+        ledger, _ = self._ledger_with_active_capture()
+        ledger.clear_active(now_ns=1)
+        decision = self._classify(ledger, self._facts())
+        self.assertEqual(decision.outcome, StationMessageOutcome.REMOVED_PRODUCT)
+
+    def test_result_for_a_superseded_capture_reports_the_active_capture_id(
+        self,
+    ) -> None:
+        ledger, _ = self._ledger_with_active_capture()
+        ledger.register_capture("capture-a-old", "product-1", StationId.A)
+        decision = self._classify(ledger, self._facts(capture_id="capture-a-old"))
+        self.assertEqual(decision.outcome, StationMessageOutcome.SUPERSEDED_CAPTURE)
+        self.assertEqual(decision.active_capture_id, self.CAPTURE_ID)
+
+    def test_result_arriving_after_sensor3_lock_is_late(self) -> None:
+        ledger, context = self._ledger_with_active_capture()
+        context.locked = LockedProduct(
+            product_id="product-1",
+            fifo_sequence=1,
+            verdict=Verdict.FORCED_NG,
+            station_a_completed=False,
+            station_b_completed=False,
+            reason="station result incomplete at Sensor3",
+            sensor3_event_id="sensor3-product-1",
+        )
+        decision = self._classify(ledger, self._facts())
+        self.assertEqual(decision.outcome, StationMessageOutcome.LATE_AFTER_LOCK)
+
+    def test_non_finite_score_is_reported_as_its_own_defect(self) -> None:
+        ledger, _ = self._ledger_with_active_capture()
+        decision = self._classify(ledger, self._facts(score=None))
+        self.assertEqual(decision.outcome, StationMessageOutcome.CONTRACT_INCOMPLETE)
+        self.assertEqual(decision.defect, StationContractDefect.SCORE_NOT_FINITE)
+
+    def test_incomplete_payload_fields_are_contract_defects(self) -> None:
+        ledger, _ = self._ledger_with_active_capture()
+        for override in (
+            {"frame_batch_id": ""},
+            {"inference_job_id": ""},
+            {"result_revision": 0},
+            {"verdict_raw": 99},
+        ):
+            with self.subTest(override=override):
+                decision = self._classify(ledger, self._facts(**override))
+                self.assertEqual(
+                    decision.outcome, StationMessageOutcome.CONTRACT_INCOMPLETE
+                )
+                self.assertEqual(
+                    decision.defect, StationContractDefect.PAYLOAD_INCOMPLETE
+                )
+
+    def test_failure_messages_do_not_require_verdict_or_score(self) -> None:
+        """StationInferenceFailed에는 verdict/score가 없으므로 검사하지 않습니다."""
+
+        ledger, _ = self._ledger_with_active_capture()
+        decision = self._classify(
+            ledger,
+            self._facts(verdict_raw=None, score=None),
+            expects_verdict=False,
+        )
+        self.assertEqual(decision.outcome, StationMessageOutcome.ACCEPTED)
+        self.assertIsNone(decision.verdict)
+
+    def test_classification_never_mutates_the_ledger(self) -> None:
+        """판정은 읽기 전용입니다. 콜백이 반영하기 전에는 원장이 그대로여야 합니다."""
+
+        ledger, context = self._ledger_with_active_capture()
+        before = context.revision
+        for facts in (
+            self._facts(),
+            self._facts(station_id_raw=7),
+            self._facts(score=None),
+            self._facts(capture_id="capture-a-old"),
+        ):
+            self._classify(ledger, facts)
+        self.assertEqual(context.revision, before)
+        self.assertIsNone(context.station(StationId.A).decision)
+        self.assertFalse(context.station(StationId.A).failed)
+        self.assertFalse(context.station(StationId.A).conflicted)
 
 
 class VisionContractTests(unittest.TestCase):

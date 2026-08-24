@@ -251,8 +251,8 @@ for config in (sim, hardware):
     require('system.expected_interface_version: "2.0.0"' in config, "interface version config mismatch")
     require("comm.master_heartbeat_period_ms: 500" in config, "Master heartbeat period mismatch")
     require(config.count("comm.node_heartbeat_period_ms: 500") == 3, "worker heartbeat period mismatch")
-    require("comm.master_heartbeat_timeout_ms: 2000" in config, "heartbeat timeout mismatch")
-    require("comm.node_heartbeat_timeout_ms: 2000" in config, "worker heartbeat timeout mismatch")
+    require("comm.master_heartbeat_timeout_ms: 5000" in config, "heartbeat timeout mismatch")
+    require("comm.node_heartbeat_timeout_ms: 5000" in config, "worker heartbeat timeout mismatch")
     require("system.init_timeout_ms: 10000" in config, "worker init timeout mismatch")
     require("retry.init_interval_ms: 1000" in config, "worker init retry interval mismatch")
     require(
@@ -306,7 +306,7 @@ operation_runtime = (SOURCE / "nodes" / "inspection_master" / "inspection_master
 vision = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "vision_node.py").read_text(encoding="utf-8")
 queue = (SOURCE / "nodes" / "inspection_vision" / "inspection_vision" / "inference_queue.py").read_text(encoding="utf-8")
 log_storage = (SOURCE / "nodes" / "inspection_log" / "inspection_log" / "storage.py").read_text(encoding="utf-8")
-for token in ("ProductResultReorderBuffer", "lock_product_at_sensor3", "StationInferenceFailed", "ENQUEUE_BLOCKED"):
+for token in ("ProductResultReorderBuffer", "lock_at_sensor3", "StationInferenceFailed", "ENQUEUE_BLOCKED"):
     require(token in master + product_flow, f"Master ownership contract missing: {token}")
 for token in (
     "START_REQUEST",
