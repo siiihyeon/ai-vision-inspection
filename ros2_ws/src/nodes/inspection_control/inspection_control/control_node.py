@@ -264,9 +264,17 @@ class ControlNode(InspectionNodeBase):
                         conveyor_id=conveyor_id,
                         estimated_step=estimated_step,
                     )
-            elif event.kind == "ACTUATION" and event.values:
+            elif event.kind == "ACTUATION" and len(event.values) >= 2:
+                status_text, sequence_text = event.values[:2]
+                try:
+                    actuation_sequence = int(sequence_text)
+                except ValueError:
+                    continue
                 with self._mega_event:
-                    self._mega_events["ACTUATION"] = (event.values[0] == "OK", "")
+                    self._mega_events[f"ACTUATION:{actuation_sequence}"] = (
+                        status_text == "OK",
+                        "",
+                    )
                     self._mega_event.notify_all()
 
     def _publish_sensor_event(self, sensor_id: str, edge: str, sequence: str, step: str) -> None:
@@ -457,10 +465,10 @@ class ControlNode(InspectionNodeBase):
             values = replay.result
         elif self.profile == "hardware":
             try:
-                self._send_mega("ACTUATE", request.actuator_command)
+                sequence = self._send_mega("ACTUATE", request.actuator_command)
                 success = await self._run_blocking(
                     self._wait_for_mega,
-                    "ACTUATION",
+                    f"ACTUATION:{sequence}",
                     int(self.get_parameter("control.actuator.timeout_ms").value) / 1000,
                 )
             except (RuntimeError, TimeoutError):

@@ -204,6 +204,11 @@ enum ServoState : uint8_t {
 ServoState servoState = SERVO_READY;
 unsigned long servoStateStartMs = 0;
 
+// startRejectCycle() runs non-blocking, so the originating ACTUATE
+// command's sequence must be cached here to echo it back once the
+// reject cycle actually completes in updateServo().
+long pendingActuationSequence = 0;
+
 
 // ============================================================
 // 8. Serial protocol
@@ -290,9 +295,9 @@ void sendPositionSettled(uint8_t conveyorId, long movedSteps) {
 }
 
 
-void sendActuationEvent(const char* status) {
+void sendActuationEvent(const char* status, long sequence) {
   char body[64];
-  snprintf(body, sizeof(body), "E|ACTUATION|%s", status);
+  snprintf(body, sizeof(body), "E|ACTUATION|%s|%ld", status, sequence);
   sendFrame(body);
 }
 
@@ -531,7 +536,7 @@ void updateUltrasonicSensors() {
 // 12. Non-blocking MG996R reject cycle
 // ============================================================
 
-bool startRejectCycle() {
+bool startRejectCycle(long sequence) {
   if (servoState != SERVO_READY) {
     return false;
   }
@@ -539,6 +544,7 @@ bool startRejectCycle() {
   sorterServo.write(SERVO_FORWARD);
   servoState = SERVO_FORWARD_MOVE;
   servoStateStartMs = millis();
+  pendingActuationSequence = sequence;
 
   return true;
 }
@@ -572,7 +578,7 @@ void updateServo() {
         sorterServo.write(SERVO_STOP);
         servoState = SERVO_READY;
 
-        sendActuationEvent("OK");
+        sendActuationEvent("OK", pendingActuationSequence);
       }
       break;
   }
@@ -708,7 +714,7 @@ void handleCommand(char* line) {
     int actuatorCommand = atoi(commandText);
 
     if (actuatorCommand == 1) {
-      if (startRejectCycle()) {
+      if (startRejectCycle(sequence)) {
         acknowledge(sequence, "OK");
       } else {
         acknowledge(sequence, "BUSY");
@@ -717,7 +723,7 @@ void handleCommand(char* line) {
     else if (actuatorCommand == 2) {
       // Normal product: intentionally no servo motion.
       acknowledge(sequence, "OK");
-      sendActuationEvent("OK");
+      sendActuationEvent("OK", sequence);
     }
     else {
       acknowledge(sequence, "ERR");
