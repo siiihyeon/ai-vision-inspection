@@ -67,6 +67,7 @@ class ControlNode(InspectionNodeBase):
         self._blocking_pool = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="control-blocking"
         )
+        self._mega_prune_timer = self.create_timer(1.0, self._prune_stale_mega_events)
         self._position_server = ActionServer(
             self,
             PositionProduct,
@@ -200,6 +201,23 @@ class ControlNode(InspectionNodeBase):
                 self._mega_event.wait(max(0.01, deadline - time.monotonic()))
         return False
 
+    def _prune_stale_mega_events(self) -> None:
+        """수거되지 않은 mega 이벤트가 무한정 쌓이는 것을 막습니다.
+
+        RUN 명령처럼 응답을 기다리지 않는 호출은 ACK를 아무도 pop하지
+        않아 계속 쌓이므로, 오래된 항목을 조용히 정리합니다. 정상 흐름
+        (RUN 명령마다 매번 발생)과 실제 이상 상황을 구분할 수 없어
+        로그는 남기지 않습니다. position/actuator 타임아웃(기본 10초)
+        보다 넉넉하게 잡아, 정상적으로 응답을 기다리는 중인 항목을
+        먼저 지워버리지 않습니다.
+        """
+
+        cutoff = time.monotonic() - 15.0
+        with self._mega_event:
+            stale = [key for key, value in self._mega_events.items() if value[2] < cutoff]
+            for key in stale:
+                del self._mega_events[key]
+
     def _run_blocking(self, fn, *args) -> Future:
         """블로킹 호출을 스레드 풀에 넘기고 rclpy Future로 결과를 받습니다.
 
@@ -233,7 +251,9 @@ class ControlNode(InspectionNodeBase):
                 continue
             if fields[0] == "A" and len(fields) >= 3:
                 with self._mega_event:
-                    self._mega_events[f"ACK:{fields[1]}"] = (fields[2] == "OK", fields[2])
+                    self._mega_events[f"ACK:{fields[1]}"] = (
+                        fields[2] == "OK", fields[2], time.monotonic(),
+                    )
                     self._mega_event.notify_all()
                 continue
             event = parse_event(fields)
@@ -253,6 +273,7 @@ class ControlNode(InspectionNodeBase):
                     self._mega_events[f"POSITION:{position_sequence}"] = (
                         True,
                         f"{conveyor_id}|{estimated_step}",
+                        time.monotonic(),
                     )
                     request = self._pending_position_requests.pop(
                         position_sequence, None
@@ -274,6 +295,7 @@ class ControlNode(InspectionNodeBase):
                     self._mega_events[f"ACTUATION:{actuation_sequence}"] = (
                         status_text == "OK",
                         "",
+                        time.monotonic(),
                     )
                     self._mega_event.notify_all()
 
