@@ -67,20 +67,29 @@ feedback은 각 노드 담당 구현과 통합 시험이 필요합니다.
 
 ## 하드웨어 통합 전 남은 Control → Master 계약
 
-현재 Master의 장비 상태 반영 함수는 구현되어 있지만 이를 호출할 typed ROS
-message는 아직 없습니다. Control 담당자와 다음 계약을 확정한 뒤 별도 통합
-작업으로 연결합니다.
+`EquipmentState`는 이미 구현되어 연결되어 있습니다. Control이 상태가 바뀔
+때만 발행하고, Master `_handle_equipment_state`가 안전 guard mirror 갱신과
+station별 재가동 확인(`_confirm_pending_resume` → `confirm_conveyor_resumed`)에
+사용합니다. 필드는 상·하층 실제 RUN/STOP, Sensor1/2/3 CLEAR, 액추에이터 안전
+위치뿐이며, 작업 구역 CLEAR와 E-stop은 보고할 센서가 없어 포함하지 않습니다.
+
+다음 계약은 아직 Control 담당자와 확정되지 않았습니다.
 
 | 계약 | 포함해야 할 정보 | 사용 목적 |
 |---|---|---|
-| `EquipmentState` 성격의 상태 message | 상·하층 실제 RUN/STOP, Sensor1/2/3 CLEAR, 액추에이터 안전 위치·작업 구역 CLEAR, E-stop | START·PAUSE·RESET·LINE_CLEAR guard |
-| `EquipmentCommandResult` 성격의 완료 event | 원본 `command_id`, 명령 종류, 대상 컨베이어, 성공 여부, 실제 상태, 오류 코드·사유 | 전체 RUN/STOP/RESET 및 촬영 후 층별 재가동 확인 |
+| `EquipmentCommandResult` 성격의 완료 event | 원본 `command_id`, 명령 종류, 대상 컨베이어, 성공 여부, 실제 상태, 오류 코드·사유 | 전체 RUN/STOP/RESET 확인, 촬영 후 층별 재가동 확인 |
 
 단순 현재 상태만 보고 층별 재가동을 확정하면 다른 명령의 결과를 잘못 연결할
 수 있으므로 완료 event에는 원본 `command_id` 상관관계가 필요합니다.
 Control의 장시간 Position·Actuation 실행 루프는 cancel 요청을 주기적으로
 확인하고, RESET 또는 `command_epoch` 변경 시 이전 명령을 폐기해야 합니다.
 Action server가 cancel 요청을 수락했다는 사실만으로 물리 정지를 확정하면 안 됩니다.
+
+> **알려진 공백**: `EquipmentState`의 running 전이는 station별 재가동
+> 확인에는 쓰이지만, 시스템 전체 START 확인(`confirm_all_conveyors_running`)에는
+> 아직 연결되지 않았습니다. hardware profile은 지금도 START 시마다
+> `master.action.conveyor_run_timeout_ms` 타임아웃에만 의존합니다
+> (`_request_conveyor_run`). 연결 여부는 별도 결정 필요.
 
 ## 개발용 터미널 명령
 

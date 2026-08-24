@@ -2372,8 +2372,8 @@ class MasterNode(InspectionNodeBase):
             target_conveyor_id=int(cycle.conveyor_id),
         )
         # sim profile에는 실제 conveyor status adapter가 없으므로 즉시 확인합니다.
-        # TODO(HARDWARE): Control의 station별 실제 RUN 확인 이벤트가 연결되면
-        # hardware profile에서 아래 공개 확인 진입점을 호출해야 합니다.
+        # hardware profile은 Control이 보고하는 EquipmentState의 running 전이를
+        # _handle_equipment_state에서 감지해 confirm_conveyor_resumed를 호출합니다.
         if self.profile == "sim":
             self.confirm_conveyor_resumed(product_id, station_id)
 
