@@ -59,6 +59,7 @@ class ControlNode(InspectionNodeBase):
             PositionSettled, "control/position_settled", reliable_event_qos()
         )
         self._mega = None
+        self._mega_thread: threading.Thread | None = None
         self._mega_lock = threading.RLock()
         self._mega_sequence = 0
         self._mega_events: dict[str, tuple[bool, str]] = {}
@@ -110,12 +111,16 @@ class ControlNode(InspectionNodeBase):
             if serial is None:
                 return NodeInitializationOutcome(False, "pyserial is not installed")
             try:
-                self._mega = serial.Serial(
-                    str(self.get_parameter("control.mega.port").value),
-                    int(self.get_parameter("control.mega.baud_rate").value),
-                    timeout=0.1,
-                )
-                threading.Thread(target=self._read_mega, daemon=True).start()
+                if self._mega_thread is None or not self._mega_thread.is_alive():
+                    self._mega = serial.Serial(
+                        str(self.get_parameter("control.mega.port").value),
+                        int(self.get_parameter("control.mega.baud_rate").value),
+                        timeout=0.1,
+                    )
+                    self._mega_thread = threading.Thread(
+                        target=self._read_mega, daemon=True
+                    )
+                    self._mega_thread.start()
                 sequence = self._send_mega("HELLO", 2)
                 if not await self._run_blocking(
                     self._wait_for_mega, f"ACK:{sequence}", 2.0
