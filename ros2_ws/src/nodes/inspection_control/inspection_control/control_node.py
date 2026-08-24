@@ -44,8 +44,6 @@ class ControlNode(InspectionNodeBase):
         self.declare_parameter("control.tb6600.lower_config", "")
         self.declare_parameter("control.sensor_config", "")
         self.declare_parameter("control.actuator_config", "")
-        self.declare_parameter("control.position.upper_steps", 0)
-        self.declare_parameter("control.position.lower_steps", 0)
         self.declare_parameter("control.position.timeout_ms", 10000)
         self.declare_parameter("control.actuator.timeout_ms", 10000)
 
@@ -359,11 +357,15 @@ class ControlNode(InspectionNodeBase):
                 canceled=True,
             )
         if self.profile == "hardware":
-            target_step = request.target_step or (
-                int(self.get_parameter("control.position.upper_steps").value)
-                if request.conveyor_id == int(ConveyorId.UPPER)
-                else int(self.get_parameter("control.position.lower_steps").value)
-            )
+            target_step = request.target_step
+            if target_step <= 0:
+                return self._finish_position(
+                    goal_handle,
+                    result,
+                    False,
+                    ErrorCode.POSITION_FAILED,
+                    "target_step was not provided by Master (position offset not configured)",
+                )
             sequence = 0
             try:
                 sequence = self._next_sequence()
