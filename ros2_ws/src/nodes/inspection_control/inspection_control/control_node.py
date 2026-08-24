@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import rclpy
 from .mega_protocol import decode_frame, encode_frame, parse_event
+from concurrent.futures import ThreadPoolExecutor
 from inspection_common import (
     ConveyorId,
     ErrorCode,
@@ -22,6 +23,7 @@ from inspection_interfaces.action import ActuateProduct, PositionProduct
 from inspection_interfaces.msg import PositionSettled, SensorEvent, SystemCommand
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.task import Future
 import threading
 import time
 
@@ -62,6 +64,9 @@ class ControlNode(InspectionNodeBase):
         self._mega_events: dict[str, tuple[bool, str]] = {}
         self._pending_position_requests: dict[int, dict[str, object]] = {}
         self._mega_event = threading.Condition(self._mega_lock)
+        self._blocking_pool = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="control-blocking"
+        )
         self._position_server = ActionServer(
             self,
             PositionProduct,
@@ -111,7 +116,9 @@ class ControlNode(InspectionNodeBase):
                 )
                 threading.Thread(target=self._read_mega, daemon=True).start()
                 sequence = self._send_mega("HELLO", 2)
-                if not self._wait_for_mega(f"ACK:{sequence}", 2.0):
+                if not await self._run_blocking(
+                    self._wait_for_mega, f"ACK:{sequence}", 2.0
+                ):
                     return NodeInitializationOutcome(False, "Mega HELLO timeout")
             except (OSError, RuntimeError) as exc:
                 return NodeInitializationOutcome(False, f"Mega connection failed: {exc}", True)
@@ -192,6 +199,32 @@ class ControlNode(InspectionNodeBase):
                     return self._mega_events.pop(key)[0]
                 self._mega_event.wait(max(0.01, deadline - time.monotonic()))
         return False
+
+    def _run_blocking(self, fn, *args) -> Future:
+        """블로킹 호출을 스레드 풀에 넘기고 rclpy Future로 결과를 받습니다.
+
+        rclpy executor에는 asyncio 이벤트 루프가 없어 asyncio.to_thread를
+        쓸 수 없습니다. rclpy Future는 executor가 직접 깨우므로 await 시
+        executor 스레드가 정상 반납됩니다.
+        """
+
+        rclpy_future = Future()
+        pool_future = self._blocking_pool.submit(fn, *args)
+
+        def _relay(done_future) -> None:
+            try:
+                rclpy_future.set_result(done_future.result())
+            except Exception as exc:  # 호출부 await에서 다시 발생시킵니다.
+                rclpy_future.set_exception(exc)
+
+        pool_future.add_done_callback(_relay)
+        return rclpy_future
+
+    def destroy_node(self) -> bool:
+        """종료 시 블로킹 스레드 풀을 정리합니다."""
+
+        self._blocking_pool.shutdown(wait=False, cancel_futures=True)
+        return super().destroy_node()
 
     def _read_mega(self) -> None:
         while self._mega is not None:
@@ -311,7 +344,8 @@ class ControlNode(InspectionNodeBase):
                             "C", sequence, "POSITION", request.conveyor_id, target_step
                         )
                     )
-                if not self._wait_for_mega(
+                if not await self._run_blocking(
+                    self._wait_for_mega,
                     f"POSITION:{sequence}",
                     int(self.get_parameter("control.position.timeout_ms").value) / 1000,
                 ):
@@ -424,7 +458,11 @@ class ControlNode(InspectionNodeBase):
         elif self.profile == "hardware":
             try:
                 self._send_mega("ACTUATE", request.actuator_command)
-                success = self._wait_for_mega("ACTUATION", int(self.get_parameter("control.actuator.timeout_ms").value) / 1000)
+                success = await self._run_blocking(
+                    self._wait_for_mega,
+                    "ACTUATION",
+                    int(self.get_parameter("control.actuator.timeout_ms").value) / 1000,
+                )
             except (RuntimeError, TimeoutError):
                 success = False
             values = {"success": success, "product_id": request.product_id,
