@@ -10,6 +10,7 @@ Control은 Mega, sensor 원신호, TB6600 실제 동작과 actuator 완료의 �
 - serial adapter가 호출할 `publish_sensor_observation()`
 - `SystemCommand.target_conveyor_id`로 지정한 상·하층 개별 재가동 확장점
 - hardware 필수 설정 누락과 adapter 미구현 시 READY 차단
+- Mega의 `E|STATE` 이벤트를 `EquipmentState`로 옮기는 발행 경로 (변경 시에만 발행)
 
 ## 반드시 결정할 전장/프로토콜
 

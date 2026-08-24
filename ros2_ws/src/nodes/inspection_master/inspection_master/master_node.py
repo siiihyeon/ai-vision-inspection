@@ -44,6 +44,7 @@ from inspection_interfaces.action import (
     PositionProduct,
 )
 from inspection_interfaces.msg import (
+    EquipmentState,
     LogEvent,
     LogPersistedAck,
     NodeHeartbeat,
@@ -446,6 +447,12 @@ class MasterNode(InspectionNodeBase):
             PositionSettled,
             "/inspection/control/position_settled",
             self._handle_position_settled,
+            reliable_event_qos(),
+        )
+        self._equipment_state_subscription = self.create_subscription(
+            EquipmentState,
+            "/inspection/control/equipment_state",
+            self._handle_equipment_state,
             reliable_event_qos(),
         )
         self._queue_subscription = self.create_subscription(
@@ -2055,6 +2062,38 @@ class MasterNode(InspectionNodeBase):
             self._fault_stop(f"PositionSettled application failed: {exc}")
             return
         self._maybe_request_station_capture(station_id)
+
+    def _handle_equipment_state(self, message: EquipmentState) -> None:
+        """Control이 보고한 장비 상태를 안전 guard mirror에 반영합니다."""
+
+        if message.header.session_id != self.session_id:
+            return
+        was_upper_running = self.equipment.conveyor_running.get(ConveyorId.UPPER)
+        was_lower_running = self.equipment.conveyor_running.get(ConveyorId.LOWER)
+        self.update_equipment_snapshot(
+            upper_running=message.upper_running,
+            upper_stopped=message.upper_stopped,
+            lower_running=message.lower_running,
+            lower_stopped=message.lower_stopped,
+            sensor_1_clear=message.sensor_1_clear,
+            sensor_2_clear=message.sensor_2_clear,
+            sensor_3_clear=message.sensor_3_clear,
+            actuator_safe=message.actuator_safe,
+        )
+        if message.upper_running and not was_upper_running:
+            self._confirm_pending_resume(ConveyorId.UPPER)
+        if message.lower_running and not was_lower_running:
+            self._confirm_pending_resume(ConveyorId.LOWER)
+
+    def _confirm_pending_resume(self, conveyor_id: ConveyorId) -> None:
+        """새로 돌기 시작한 컨베이어를 기다리던 station cycle을 확인 처리합니다."""
+
+        for station_id, cycle in tuple(self._station_cycles.items()):
+            if (
+                cycle.conveyor_id == conveyor_id
+                and cycle.phase == StationCyclePhase.RESUME_PENDING
+            ):
+                self.confirm_conveyor_resumed(cycle.product_id, station_id)
 
     def _maybe_request_station_capture(self, station_id: StationId) -> None:
         cycle = self._station_cycles.get(station_id)

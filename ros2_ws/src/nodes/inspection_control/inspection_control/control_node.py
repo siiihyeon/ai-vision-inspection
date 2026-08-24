@@ -20,7 +20,12 @@ from inspection_common.node_base import (
     spin_node,
 )
 from inspection_interfaces.action import ActuateProduct, PositionProduct
-from inspection_interfaces.msg import PositionSettled, SensorEvent, SystemCommand
+from inspection_interfaces.msg import (
+    EquipmentState,
+    PositionSettled,
+    SensorEvent,
+    SystemCommand,
+)
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.task import Future
@@ -55,6 +60,9 @@ class ControlNode(InspectionNodeBase):
         )
         self._position_settled_publisher = self.create_publisher(
             PositionSettled, "control/position_settled", reliable_event_qos()
+        )
+        self._equipment_state_publisher = self.create_publisher(
+            EquipmentState, "control/equipment_state", reliable_event_qos()
         )
         self._mega = None
         self._mega_thread: threading.Thread | None = None
@@ -301,6 +309,24 @@ class ControlNode(InspectionNodeBase):
                         time.monotonic(),
                     )
                     self._mega_event.notify_all()
+            elif event.kind == "STATE" and len(event.values) >= 6:
+                try:
+                    upper_state = int(event.values[0])
+                    lower_state = int(event.values[1])
+                    sensor_1_clear = event.values[2] == "1"
+                    sensor_2_clear = event.values[3] == "1"
+                    sensor_3_clear = event.values[4] == "1"
+                    actuator_safe = event.values[5] == "1"
+                except ValueError:
+                    continue
+                self._publish_equipment_state(
+                    upper_state,
+                    lower_state,
+                    sensor_1_clear,
+                    sensor_2_clear,
+                    sensor_3_clear,
+                    actuator_safe,
+                )
 
     def _publish_sensor_event(self, sensor_id: str, edge: str, sequence: str, step: str) -> None:
         message = SensorEvent()
@@ -314,6 +340,35 @@ class ControlNode(InspectionNodeBase):
         message.estimated_step = int(step)
         message.observed_at = message.header.stamp
         self.publish_sensor_observation(message)
+
+    def _publish_equipment_state(
+        self,
+        upper_state: int,
+        lower_state: int,
+        sensor_1_clear: bool,
+        sensor_2_clear: bool,
+        sensor_3_clear: bool,
+        actuator_safe: bool,
+    ) -> None:
+        """Mega의 E|STATE 이벤트를 EquipmentState 토픽으로 옮깁니다.
+
+        upper_state/lower_state는 Mega의 ConveyorState enum 값과
+        동일합니다: 0=RUNNING, 1=POSITIONING, 2=WAIT_CAMERA, 3=STOPPED.
+        """
+
+        message = EquipmentState()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.session_id = self.session_id
+        message.header.message_id = new_uuid()
+        message.upper_running = upper_state == 0
+        message.upper_stopped = upper_state == 3
+        message.lower_running = lower_state == 0
+        message.lower_stopped = lower_state == 3
+        message.sensor_1_clear = sensor_1_clear
+        message.sensor_2_clear = sensor_2_clear
+        message.sensor_3_clear = sensor_3_clear
+        message.actuator_safe = actuator_safe
+        self._equipment_state_publisher.publish(message)
 
     def _accept_equipment_goal(self, goal_request) -> GoalResponse:
         return (

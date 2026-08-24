@@ -194,6 +194,17 @@ enum ServoState : uint8_t {
 ServoState servoState = SERVO_READY;
 unsigned long servoStateStartMs = 0;
 
+// Tracks the equipment state last reported to the host, so
+// updateEquipmentStateReport() only sends E|STATE when something
+// actually changed instead of on a fixed period.
+bool equipmentStateReported = false;
+int lastReportedUpperState = -1;
+int lastReportedLowerState = -1;
+bool lastReportedSensor1Clear = false;
+bool lastReportedSensor2Clear = false;
+bool lastReportedSensor3Clear = false;
+bool lastReportedServoReady = false;
+
 // startRejectCycle() runs non-blocking, so the originating ACTUATE
 // command's sequence must be cached here to echo it back once the
 // reject cycle actually completes in updateServo().
@@ -289,6 +300,58 @@ void sendActuationEvent(const char* status, long sequence) {
   char body[64];
   snprintf(body, sizeof(body), "E|ACTUATION|%s|%ld", status, sequence);
   sendFrame(body);
+}
+
+
+void sendEquipmentState() {
+  // E|STATE|upper_state|lower_state|s1_clear|s2_clear|s3_clear|servo_ready
+  // Conveyor states use the same numbering as enum ConveyorState above.
+  char body[96];
+  snprintf(
+    body,
+    sizeof(body),
+    "E|STATE|%d|%d|%d|%d|%d|%d",
+    (int)conveyors[0].state,
+    (int)conveyors[1].state,
+    sensors[0].lastDistanceCm >= RELEASE_DISTANCE_CM ? 1 : 0,
+    sensors[1].lastDistanceCm >= RELEASE_DISTANCE_CM ? 1 : 0,
+    sensors[2].lastDistanceCm >= RELEASE_DISTANCE_CM ? 1 : 0,
+    servoState == SERVO_READY ? 1 : 0
+  );
+  sendFrame(body);
+}
+
+
+void updateEquipmentStateReport() {
+  int upperState = (int)conveyors[0].state;
+  int lowerState = (int)conveyors[1].state;
+  bool sensor1Clear = sensors[0].lastDistanceCm >= RELEASE_DISTANCE_CM;
+  bool sensor2Clear = sensors[1].lastDistanceCm >= RELEASE_DISTANCE_CM;
+  bool sensor3Clear = sensors[2].lastDistanceCm >= RELEASE_DISTANCE_CM;
+  bool servoReady = servoState == SERVO_READY;
+
+  bool changed =
+    !equipmentStateReported ||
+    upperState != lastReportedUpperState ||
+    lowerState != lastReportedLowerState ||
+    sensor1Clear != lastReportedSensor1Clear ||
+    sensor2Clear != lastReportedSensor2Clear ||
+    sensor3Clear != lastReportedSensor3Clear ||
+    servoReady != lastReportedServoReady;
+
+  if (!changed) {
+    return;
+  }
+
+  sendEquipmentState();
+
+  equipmentStateReported = true;
+  lastReportedUpperState = upperState;
+  lastReportedLowerState = lowerState;
+  lastReportedSensor1Clear = sensor1Clear;
+  lastReportedSensor2Clear = sensor2Clear;
+  lastReportedSensor3Clear = sensor3Clear;
+  lastReportedServoReady = servoReady;
 }
 
 
@@ -847,4 +910,6 @@ void loop() {
   updateUltrasonicSensors();
 
   updateServo();
+
+  updateEquipmentStateReport();
 }
