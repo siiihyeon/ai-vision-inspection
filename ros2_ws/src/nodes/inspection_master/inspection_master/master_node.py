@@ -143,6 +143,7 @@ class MasterNode(InspectionNodeBase):
         self.declare_parameter("master.action.capture_timeout_ms", 30000)
         self.declare_parameter("master.action.actuation_timeout_ms", 10000)
         self.declare_parameter("master.action.conveyor_resume_timeout_ms", 10000)
+        self.declare_parameter("master.action.conveyor_run_timeout_ms", 10000)
         self.declare_parameter("master.pause_stop_timeout_ms", 10000)
         self.declare_parameter("master.shutdown_stop_timeout_ms", 10000)
         self.declare_parameter(
@@ -214,6 +215,9 @@ class MasterNode(InspectionNodeBase):
         )
         self.conveyor_resume_timeout_ms = int(
             self.get_parameter("master.action.conveyor_resume_timeout_ms").value
+        )
+        self.conveyor_run_timeout_ms = int(
+            self.get_parameter("master.action.conveyor_run_timeout_ms").value
         )
         self.pause_stop_timeout_ms = int(
             self.get_parameter("master.pause_stop_timeout_ms").value
@@ -354,6 +358,7 @@ class MasterNode(InspectionNodeBase):
         self._queue_recovered_pending = False
         self._pause_deadline_ns = 0
         self._shutdown_deadline_ns = 0
+        self._run_confirmation_deadline_ns = 0
         self._next_context_prune_ns = time.monotonic_ns() + 60_000_000_000
         self.shutdown_phase = ShutdownPhase.IDLE
         self._log_spool: DurableLogSpool | None = None
@@ -687,6 +692,7 @@ class MasterNode(InspectionNodeBase):
         if transition is None:
             return False
         self._pending_run_confirmation = False
+        self._run_confirmation_deadline_ns = 0
         self.equipment.mark_all_running()
         if previous_state == SystemState.READY:
             # 빈 라인 확인은 신규 RUN 시작에 한 번만 소비합니다.
@@ -2971,10 +2977,15 @@ class MasterNode(InspectionNodeBase):
         """정합성 검증을 통과한 뒤 Control에 운전 재개를 요청합니다."""
 
         self._publish_system_command(SystemCommand.RESUME, reason)
-        # TODO(HARDWARE): Control의 상·하층 실제 RUN 확인 이벤트가 연결되면
-        # hardware profile에서 confirm_all_conveyors_running()을 호출합니다.
         if self.profile == "sim":
             self.confirm_all_conveyors_running()
+            return
+        # TODO(HARDWARE): Control의 상·하층 실제 RUN 확인 이벤트가 연결되면
+        # confirm_all_conveyors_running()을 호출합니다. 그때까지는 아래
+        # 타임아웃이 유일한 안전망입니다.
+        self._run_confirmation_deadline_ns = (
+            time.monotonic_ns() + self.conveyor_run_timeout_ms * 1_000_000
+        )
 
     def _verify_resume_conditions(self) -> bool:
         """재개 전에 노드·FIFO·센서·컨베이어 정합성을 검사합니다."""
@@ -3692,6 +3703,13 @@ class MasterNode(InspectionNodeBase):
             self.report_pause_failed(
                 "conveyor stop confirmation timed out", timed_out=True
             )
+        if (
+            self._run_confirmation_deadline_ns
+            and now_ns > self._run_confirmation_deadline_ns
+            and self._pending_run_confirmation
+        ):
+            self._run_confirmation_deadline_ns = 0
+            self.report_run_failed("conveyor RUN confirmation timed out")
         if (
             self._shutdown_deadline_ns
             and now_ns > self._shutdown_deadline_ns
