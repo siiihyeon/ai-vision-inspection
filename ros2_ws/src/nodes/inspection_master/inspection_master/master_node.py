@@ -3074,7 +3074,6 @@ class MasterNode(InspectionNodeBase):
         sensor_2_clear: bool | None = None,
         sensor_3_clear: bool | None = None,
         actuator_safe: bool | None = None,
-        actuator_area_clear: bool | None = None,
         estop_asserted: bool | None = None,
     ) -> None:
         """향후 Control typed 상태 event가 갱신할 안전 guard 진입점입니다."""
@@ -3093,8 +3092,6 @@ class MasterNode(InspectionNodeBase):
                 target[key] = value
         if actuator_safe is not None:
             self.equipment.actuator_safe = actuator_safe
-        if actuator_area_clear is not None:
-            self.equipment.actuator_area_clear = actuator_area_clear
         if estop_asserted is not None:
             self.equipment.estop_asserted = estop_asserted
             if estop_asserted:
