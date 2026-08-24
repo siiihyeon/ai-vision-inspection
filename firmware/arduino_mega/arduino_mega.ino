@@ -79,15 +79,6 @@ const long CONV2_SPEED = -3000;
 const long CONV_MAX_SPEED = 10000;
 const long CONV_ACCELERATION = 10000;
 
-// Component-test code actually used 7700 steps.
-// Keep each conveyor independent because the required camera offset
-// may be different after final mechanical assembly.
-const long CONV1_CAMERA_OFFSET_STEPS = 7700;
-
-// TODO: calibrate this value for the lower conveyor.
-// 7700 is only a safe initial value copied from the upper test.
-const long CONV2_CAMERA_OFFSET_STEPS = 7700;
-
 
 // ============================================================
 // 3. Ultrasonic parameters
@@ -141,7 +132,6 @@ struct ConveyorController {
   AccelStepper* motor;
   uint8_t enablePin;
   long runSpeed;
-  long cameraOffsetSteps;
   uint8_t conveyorId;
   ConveyorState state;
   long positionCommandSequence;
@@ -149,8 +139,8 @@ struct ConveyorController {
 };
 
 ConveyorController conveyors[2] = {
-  { &conveyor1, CONV1_EN, CONV1_SPEED, CONV1_CAMERA_OFFSET_STEPS, 1, CONV_RUNNING, 0, 0 },
-  { &conveyor2, CONV2_EN, CONV2_SPEED, CONV2_CAMERA_OFFSET_STEPS, 2, CONV_RUNNING, 0, 0 }
+  { &conveyor1, CONV1_EN, CONV1_SPEED, 1, CONV_RUNNING, 0, 0 },
+  { &conveyor2, CONV2_EN, CONV2_SPEED, 2, CONV_RUNNING, 0, 0 }
 };
 
 

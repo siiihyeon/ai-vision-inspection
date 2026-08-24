@@ -19,8 +19,8 @@
     master.sensor_ids.sensor_3: "SENSOR_3"
     master.sensor.accepted_edge: 1
     master.hardware_mapping_confirmed: false
-    master.station_a.position_offset_steps: 0
-    master.station_b.position_offset_steps: 0
+    master.station_a.position_offset_steps: 15100
+    master.station_b.position_offset_steps: 7700
     master.position_tolerance_steps: 0
     master.camera_ids.station_a: []
     master.camera_ids.station_b: []
