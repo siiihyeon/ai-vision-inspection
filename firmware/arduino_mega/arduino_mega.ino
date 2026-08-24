@@ -7,8 +7,8 @@
 // Workflow
 // 1) HC-SR04 #1 detects product
 //    -> report SENSOR_1
-//    -> Conveyor 1 automatically moves a fixed number of steps
-//    -> stop at camera position
+//    -> Master (via Control Node) sends POSITION|1|step_count
+//    -> Conveyor 1 moves to the camera position and stops
 //    -> report POSITION settled
 //
 // 2) Master finishes capture
@@ -726,9 +726,9 @@ void handleCommand(char* line) {
   }
 
   // ----------------------------------------------------------
-  // Optional manual POSITION command.
-  // Not used in the normal autonomous workflow.
-  // Kept only for maintenance/backward compatibility.
+  // POSITION command.
+  // Master decides when a conveyor moves; this is the only command
+  // that starts a positioning cycle.
   //
   // C|seq|POSITION|conveyor_id|steps
   // ----------------------------------------------------------

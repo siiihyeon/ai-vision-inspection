@@ -322,7 +322,7 @@ class ControlNode(InspectionNodeBase):
                 return self._finish_position(goal_handle, result, False, ErrorCode.POSITION_FAILED, str(exc))
             values = {"success": True, "product_id": request.product_id, "station_id": request.station_id,
                       "position_command_id": request.command.command_id, "estimated_step": target_step,
-                      "position_error_steps": 0, "position_source": PositionSettled.ENCODER_ESTIMATE,
+                      "position_error_steps": 0, "position_source": PositionSettled.OPEN_LOOP_ESTIMATE,
                       "error_code": int(ErrorCode.NONE), "reason": "Mega position settled"}
             self._position_results.remember(request.command.command_id, request.command.payload_digest, values)
             self._apply_position_values(result, values)
