@@ -20,7 +20,7 @@ from inspection_common.node_base import (
     reliable_event_qos,
     spin_node,
 )
-from inspection_interfaces.action import ActuateProduct, PositionProduct
+from inspection_interfaces.action import ActuateProduct
 from inspection_interfaces.msg import (
     EquipmentState,
     PositionSettled,
@@ -50,12 +50,10 @@ class ControlNode(InspectionNodeBase):
         self.declare_parameter("control.tb6600.lower_config", "")
         self.declare_parameter("control.sensor_config", "")
         self.declare_parameter("control.actuator_config", "")
-        self.declare_parameter("control.position.timeout_ms", 10000)
         self.declare_parameter("control.actuator.timeout_ms", 10000)
         self.declare_parameter("control.station_a.position_offset_steps", 0)
         self.declare_parameter("control.station_b.position_offset_steps", 0)
 
-        self._position_results: IdempotencyStore[dict[str, object]] = IdempotencyStore()
         self._actuation_results: IdempotencyStore[dict[str, object]] = IdempotencyStore()
         self._equipment_action_group = MutuallyExclusiveCallbackGroup()
         self._sensor_publisher = self.create_publisher(
@@ -72,21 +70,11 @@ class ControlNode(InspectionNodeBase):
         self._mega_lock = threading.RLock()
         self._mega_sequence = 0
         self._mega_events: dict[str, tuple[bool, str]] = {}
-        self._pending_position_requests: dict[int, dict[str, object]] = {}
         self._mega_event = threading.Condition(self._mega_lock)
         self._blocking_pool = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="control-blocking"
         )
         self._mega_prune_timer = self.create_timer(1.0, self._prune_stale_mega_events)
-        self._position_server = ActionServer(
-            self,
-            PositionProduct,
-            "control/position_product",
-            execute_callback=self._execute_position,
-            goal_callback=self._accept_equipment_goal,
-            cancel_callback=self._cancel_equipment_goal,
-            callback_group=self._equipment_action_group,
-        )
         self._actuate_server = ActionServer(
             self,
             ActuateProduct,
@@ -169,25 +157,19 @@ class ControlNode(InspectionNodeBase):
 
         self._sensor_publisher.publish(message)
 
-    def _publish_position_settled(
-        self,
-        request: dict[str, object],
-        *,
-        conveyor_id: int,
-        estimated_step: int,
-    ) -> None:
+    def _publish_position_settled(self, *, conveyor_id: int, estimated_step: int) -> None:
+        """Mega가 자율로 이동·정지한 결과를 그대로 옮깁니다.
+
+        Master가 이동을 명령하지 않으므로 product_id/station_id는 없습니다.
+        conveyor_id만으로 Master가 어느 station cycle인지 매칭합니다.
+        """
+
         settled = PositionSettled()
         settled.header.stamp = self.get_clock().now().to_msg()
         settled.header.session_id = self.session_id
         settled.header.message_id = new_uuid()
-        settled.header.correlation_id = str(request["product_id"])
-        settled.product_id = str(request["product_id"])
-        settled.station_id = int(request["station_id"])
-        settled.position_command_id = str(request["command_id"])
         settled.conveyor_id = conveyor_id
-        settled.target_step = int(request["target_step"])
         settled.estimated_step = estimated_step
-        settled.position_error_steps = estimated_step - settled.target_step
         settled.position_source = PositionSettled.OPEN_LOOP_ESTIMATE
         settled.position_verified = False
         settled.settled_at = settled.header.stamp
@@ -328,29 +310,16 @@ class ControlNode(InspectionNodeBase):
             if event.kind == "SENSOR" and len(event.values) >= 4:
                 self._publish_sensor_event(*event.values[:4])
             elif event.kind == "POSITION" and len(event.values) >= 3:
-                conveyor_text, step_text, sequence_text = event.values[:3]
+                conveyor_text, step_text, _sequence_text = event.values[:3]
                 try:
-                    position_sequence = int(sequence_text)
                     estimated_step = int(step_text)
                     conveyor_id = int(conveyor_text)
                 except ValueError:
                     continue
-                with self._mega_event:
-                    self._mega_events[f"POSITION:{position_sequence}"] = (
-                        True,
-                        f"{conveyor_id}|{estimated_step}",
-                        time.monotonic(),
-                    )
-                    request = self._pending_position_requests.pop(
-                        position_sequence, None
-                    )
-                    self._mega_event.notify_all()
-                if request is not None:
-                    self._publish_position_settled(
-                        request,
-                        conveyor_id=conveyor_id,
-                        estimated_step=estimated_step,
-                    )
+                self._publish_position_settled(
+                    conveyor_id=conveyor_id,
+                    estimated_step=estimated_step,
+                )
             elif event.kind == "ACTUATION" and len(event.values) >= 2:
                 status_text, sequence_text = event.values[:2]
                 try:
@@ -434,151 +403,6 @@ class ControlNode(InspectionNodeBase):
 
     def _cancel_equipment_goal(self, _goal_handle) -> CancelResponse:
         return CancelResponse.ACCEPT
-
-    async def _execute_position(self, goal_handle) -> PositionProduct.Result:
-        request = goal_handle.request
-        result = PositionProduct.Result()
-        valid, code, reason = self.validate_command_header(request.command)
-        if not valid:
-            return self._finish_position(goal_handle, result, False, code, reason)
-
-        replay = self._position_results.inspect(
-            request.command.command_id, request.command.payload_digest
-        )
-        if replay.kind.value == "CONFLICT":
-            return self._finish_position(
-                goal_handle,
-                result,
-                False,
-                ErrorCode.COMMAND_CONFLICT,
-                "same command_id received with another digest",
-            )
-        if replay.result is not None:
-            self._apply_position_values(result, replay.result)
-            goal_handle.succeed() if result.success else goal_handle.abort()
-            return result
-        if goal_handle.is_cancel_requested:
-            return self._finish_position(
-                goal_handle,
-                result,
-                False,
-                ErrorCode.CONTROL_FAILED,
-                "position canceled",
-                canceled=True,
-            )
-        if self.profile == "hardware":
-            target_step = request.target_step
-            if target_step <= 0:
-                return self._finish_position(
-                    goal_handle,
-                    result,
-                    False,
-                    ErrorCode.POSITION_FAILED,
-                    "target_step was not provided by Master (position offset not configured)",
-                )
-            sequence = 0
-            try:
-                sequence = self._next_sequence()
-                with self._mega_lock:
-                    self._pending_position_requests[sequence] = {
-                        "product_id": request.product_id,
-                        "station_id": request.station_id,
-                        "command_id": request.command.command_id,
-                        "target_step": target_step,
-                    }
-                    self._mega.write(
-                        encode_frame(
-                            "C", sequence, "POSITION", request.conveyor_id, target_step
-                        )
-                    )
-                if not await self._run_blocking(
-                    self._wait_for_mega,
-                    f"POSITION:{sequence}",
-                    int(self.get_parameter("control.position.timeout_ms").value) / 1000,
-                ):
-                    raise TimeoutError("position feedback timeout")
-            except (RuntimeError, TimeoutError, OSError) as exc:
-                with self._mega_lock:
-                    self._pending_position_requests.pop(sequence, None)
-                return self._finish_position(goal_handle, result, False, ErrorCode.POSITION_FAILED, str(exc))
-            values = {"success": True, "product_id": request.product_id, "station_id": request.station_id,
-                      "position_command_id": request.command.command_id, "estimated_step": target_step,
-                      "position_error_steps": 0, "position_source": PositionSettled.OPEN_LOOP_ESTIMATE,
-                      "error_code": int(ErrorCode.NONE), "reason": "Mega position settled"}
-            self._position_results.remember(request.command.command_id, request.command.payload_digest, values)
-            self._apply_position_values(result, values)
-            goal_handle.succeed()
-            return result
-
-        values: dict[str, object] = {
-            "success": True,
-            "product_id": request.product_id,
-            "station_id": request.station_id,
-            "position_command_id": request.command.command_id,
-            "estimated_step": request.target_step,
-            "position_error_steps": 0,
-            "position_source": PositionSettled.OPEN_LOOP_ESTIMATE,
-            "error_code": int(ErrorCode.NONE),
-            "reason": "sim open-loop estimate settled",
-        }
-        self._position_results.remember(
-            request.command.command_id, request.command.payload_digest, values
-        )
-        self._apply_position_values(result, values)
-        settled = PositionSettled()
-        settled.header.stamp = self.get_clock().now().to_msg()
-        settled.header.session_id = self.session_id
-        settled.header.message_id = new_uuid()
-        settled.header.correlation_id = request.command.command_id
-        settled.product_id = request.product_id
-        settled.station_id = request.station_id
-        settled.position_command_id = request.command.command_id
-        settled.conveyor_id = request.conveyor_id
-        settled.target_step = request.target_step
-        settled.estimated_step = request.target_step
-        settled.position_error_steps = 0
-        settled.position_source = PositionSettled.OPEN_LOOP_ESTIMATE
-        settled.position_verified = False
-        settled.settled_at = settled.header.stamp
-        self._position_settled_publisher.publish(settled)
-        goal_handle.succeed()
-        return result
-
-    def _finish_position(
-        self,
-        goal_handle,
-        result,
-        success: bool,
-        code: ErrorCode,
-        reason: str,
-        *,
-        canceled: bool = False,
-    ) -> PositionProduct.Result:
-        result.success = success
-        result.product_id = goal_handle.request.product_id
-        result.station_id = goal_handle.request.station_id
-        result.position_command_id = goal_handle.request.command.command_id
-        result.error_code = int(code)
-        result.reason = reason
-        if success:
-            goal_handle.succeed()
-        elif canceled:
-            goal_handle.canceled()
-        else:
-            goal_handle.abort()
-        return result
-
-    @staticmethod
-    def _apply_position_values(result, values: dict[str, object]) -> None:
-        result.success = bool(values["success"])
-        result.product_id = str(values["product_id"])
-        result.station_id = int(values["station_id"])
-        result.position_command_id = str(values["position_command_id"])
-        result.estimated_step = int(values["estimated_step"])
-        result.position_error_steps = int(values["position_error_steps"])
-        result.position_source = int(values["position_source"])
-        result.error_code = int(values["error_code"])
-        result.reason = str(values["reason"])
 
     async def _execute_actuation(self, goal_handle) -> ActuateProduct.Result:
         request = goal_handle.request
