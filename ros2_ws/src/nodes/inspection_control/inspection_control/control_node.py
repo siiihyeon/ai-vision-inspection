@@ -123,10 +123,13 @@ class ControlNode(InspectionNodeBase):
                     )
                     self._mega_thread.start()
                 sequence = self._send_mega("HELLO", 2)
-                if not await self._run_blocking(
+                status = await self._run_blocking(
                     self._wait_for_mega, f"ACK:{sequence}", 2.0
-                ):
-                    return NodeInitializationOutcome(False, "Mega HELLO timeout")
+                )
+                if status != "OK":
+                    return NodeInitializationOutcome(
+                        False, self._mega_wait_failure("Mega HELLO", status)
+                    )
                 offsets = {
                     ConveyorId.UPPER: int(
                         self.get_parameter(
@@ -141,11 +144,15 @@ class ControlNode(InspectionNodeBase):
                 }
                 for conveyor_id, steps in offsets.items():
                     sequence = self._send_mega("SET_OFFSET", int(conveyor_id), steps)
-                    if not await self._run_blocking(
+                    status = await self._run_blocking(
                         self._wait_for_mega, f"ACK:{sequence}", 2.0
-                    ):
+                    )
+                    if status != "OK":
                         return NodeInitializationOutcome(
-                            False, f"Mega SET_OFFSET timeout ({conveyor_id.name})"
+                            False,
+                            self._mega_wait_failure(
+                                f"Mega SET_OFFSET ({conveyor_id.name})", status
+                            ),
                         )
             except (OSError, RuntimeError) as exc:
                 return NodeInitializationOutcome(False, f"Mega connection failed: {exc}", True)
@@ -229,14 +236,24 @@ class ControlNode(InspectionNodeBase):
             self._mega.write(encode_frame("C", sequence, operation, *values))
         return sequence
 
-    def _wait_for_mega(self, key: str, timeout: float) -> bool:
+    def _wait_for_mega(self, key: str, timeout: float) -> str | None:
+        """수신한 status 문자열을 그대로 돌려주고, 타임아웃이면 None입니다.
+
+        타임아웃(응답 없음)과 명시적 ERR(응답 왔지만 거부)을 호출부가
+        구분할 수 있게, 성공 여부(bool)가 아니라 원본 status를 돌려줍니다.
+        """
+
         deadline = time.monotonic() + timeout
         with self._mega_event:
             while time.monotonic() < deadline:
                 if key in self._mega_events:
-                    return self._mega_events.pop(key)[0]
+                    return self._mega_events.pop(key)[1]
                 self._mega_event.wait(max(0.01, deadline - time.monotonic()))
-        return False
+        return None
+
+    @staticmethod
+    def _mega_wait_failure(prefix: str, status: str | None) -> str:
+        return f"{prefix} timeout" if status is None else f"{prefix} rejected: {status}"
 
     def _prune_stale_mega_events(self) -> None:
         """수거되지 않은 mega 이벤트가 무한정 쌓이는 것을 막습니다.
@@ -329,7 +346,7 @@ class ControlNode(InspectionNodeBase):
                 with self._mega_event:
                     self._mega_events[f"ACTUATION:{actuation_sequence}"] = (
                         status_text == "OK",
-                        "",
+                        status_text,
                         time.monotonic(),
                     )
                     self._mega_event.notify_all()
@@ -427,19 +444,24 @@ class ControlNode(InspectionNodeBase):
         if replay.result is not None:
             values = replay.result
         elif self.profile == "hardware":
+            status: str | None = None
             try:
                 sequence = self._send_mega("ACTUATE", request.actuator_command)
-                success = await self._run_blocking(
+                status = await self._run_blocking(
                     self._wait_for_mega,
                     f"ACTUATION:{sequence}",
                     int(self.get_parameter("control.actuator.timeout_ms").value) / 1000,
                 )
             except (RuntimeError, TimeoutError, OSError):
-                success = False
+                status = None
+            success = status == "OK"
             values = {"success": success, "product_id": request.product_id,
                       "actuation_id": new_uuid() if success else "",
                       "error_code": int(ErrorCode.NONE if success else ErrorCode.ACTUATOR_FAILED),
-                      "reason": "Mega actuation completed" if success else "Mega actuation failed"}
+                      "reason": (
+                          "Mega actuation completed" if success
+                          else self._mega_wait_failure("Mega actuation", status)
+                      )}
         else:
             values = {
                 "success": True,
