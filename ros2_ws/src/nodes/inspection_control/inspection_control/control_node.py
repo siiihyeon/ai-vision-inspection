@@ -9,6 +9,7 @@ from inspection_common import (
     ConveyorId,
     ErrorCode,
     IdempotencyStore,
+    NodeHealthState,
     NodeId,
     SystemState,
     new_uuid,
@@ -187,7 +188,7 @@ class ControlNode(InspectionNodeBase):
         if self.profile == "hardware":
             try:
                 self._send_mega("RUN", int(conveyor_id))
-            except RuntimeError as exc:
+            except (RuntimeError, OSError) as exc:
                 self.get_logger().error(str(exc))
 
     def handle_all_conveyors_command(self, message: SystemCommand) -> None:
@@ -204,7 +205,7 @@ class ControlNode(InspectionNodeBase):
         for conveyor_id in (ConveyorId.UPPER, ConveyorId.LOWER):
             try:
                 self._send_mega(operation, int(conveyor_id))
-            except RuntimeError as exc:
+            except (RuntimeError, OSError) as exc:
                 self.get_logger().error(str(exc))
 
     def _next_sequence(self) -> int:
@@ -274,7 +275,18 @@ class ControlNode(InspectionNodeBase):
 
     def _read_mega(self) -> None:
         while self._mega is not None:
-            fields = decode_frame(self._mega.readline())
+            try:
+                fields = decode_frame(self._mega.readline())
+            except OSError as exc:
+                self.get_logger().error(f"Mega serial disconnected: {exc}")
+                with self._mega_lock:
+                    mega, self._mega = self._mega, None
+                try:
+                    mega.close()
+                except OSError:
+                    pass
+                self.set_health_state(NodeHealthState.DEGRADED)
+                return
             if not fields:
                 continue
             if fields[0] == "A" and len(fields) >= 3:
@@ -459,7 +471,7 @@ class ControlNode(InspectionNodeBase):
                     int(self.get_parameter("control.position.timeout_ms").value) / 1000,
                 ):
                     raise TimeoutError("position feedback timeout")
-            except (RuntimeError, TimeoutError) as exc:
+            except (RuntimeError, TimeoutError, OSError) as exc:
                 with self._mega_lock:
                     self._pending_position_requests.pop(sequence, None)
                 return self._finish_position(goal_handle, result, False, ErrorCode.POSITION_FAILED, str(exc))
@@ -572,7 +584,7 @@ class ControlNode(InspectionNodeBase):
                     f"ACTUATION:{sequence}",
                     int(self.get_parameter("control.actuator.timeout_ms").value) / 1000,
                 )
-            except (RuntimeError, TimeoutError):
+            except (RuntimeError, TimeoutError, OSError):
                 success = False
             values = {"success": success, "product_id": request.product_id,
                       "actuation_id": new_uuid() if success else "",
