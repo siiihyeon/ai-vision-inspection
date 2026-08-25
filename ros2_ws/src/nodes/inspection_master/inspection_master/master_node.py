@@ -3610,10 +3610,19 @@ class MasterNode(InspectionNodeBase):
                     station_id, "CaptureProduct timed out"
                 )
             elif cycle.phase == StationCyclePhase.WAITING_POSITION:
-                self._fault_stop(
-                    f"{cycle.conveyor_id.name} conveyor PositionSettled timed out; "
-                    "physical position is unknown"
-                )
+                if self.equipment.conveyor_running.get(cycle.conveyor_id):
+                    # 컨베이어가 여전히 RUNNING이면 자율 이동이 시작된 적이
+                    # 없다는 뜻이라 물리적으로 아무 일도 안 일어났습니다.
+                    self._pause_station_for_recovery(
+                        station_id,
+                        f"{cycle.conveyor_id.name} conveyor PositionSettled timed "
+                        "out while still RUNNING; positioning never started",
+                    )
+                else:
+                    self._fault_stop(
+                        f"{cycle.conveyor_id.name} conveyor PositionSettled timed "
+                        "out after leaving RUNNING; physical position is unknown"
+                    )
             elif cycle.phase == StationCyclePhase.RESUME_PENDING:
                 self._deferred_capture_resumes.add(
                     (cycle.product_id, station_id)

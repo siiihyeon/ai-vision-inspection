@@ -43,7 +43,9 @@ feedback은 각 노드 담당 구현과 통합 시험이 필요합니다.
   교체한 뒤 이전 자원을 명시적으로 닫는 멱등 재초기화 계약을 지켜야 합니다.
 - Position은 Action이 아닙니다. Mega가 센서 감지 후 자율로 이동·정지하고
   `PositionSettled`만 보고하며, Master는 `cycle.deadline_ns` 안에 이 이벤트가
-  안 오면 물리 위치를 신뢰할 수 없다고 보고 바로 `FAULT_STOP`합니다.
+  안 오면 `EquipmentState`로 컨베이어가 아직 RUNNING인지 봅니다 — 여전히
+  RUNNING이면 이동이 시작된 적이 없다는 뜻이라 `PAUSED`에서 복구하고,
+  RUNNING을 벗어났으면 물리 위치를 신뢰할 수 없으므로 `FAULT_STOP`합니다.
 - 액추에이터 Goal이 수락된 뒤 완료 여부를 알 수 없으면 물리 상태가 불명하므로 `FAULT_STOP`입니다.
 - 완료 제품은 활성 FIFO에서 즉시 빠지지만 late result 진단을 위해 Context를 10분 보존한 뒤 bounded tombstone으로 전환합니다.
 - Master local spool 장애 시 health를 `DEGRADED`로 내리고 내구성 보장 없이
