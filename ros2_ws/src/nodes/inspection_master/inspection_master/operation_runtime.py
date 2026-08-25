@@ -10,7 +10,6 @@ from inspection_common import ConveyorId, StationId
 
 
 class StationCyclePhase(StrEnum):
-    POSITION_GOAL = "POSITION_GOAL"
     WAITING_POSITION = "WAITING_POSITION"
     CAPTURE_GOAL = "CAPTURE_GOAL"
     WAITING_CAPTURE_RESULT = "WAITING_CAPTURE_RESULT"
@@ -60,10 +59,8 @@ class StationCycle:
     conveyor_id: ConveyorId
     position_command_id: str
     capture_id: str
-    target_step: int
-    phase: StationCyclePhase = StationCyclePhase.POSITION_GOAL
+    phase: StationCyclePhase = StationCyclePhase.WAITING_POSITION
     deadline_ns: int = 0
-    position_goal_handle: object | None = None
     capture_goal_handle: object | None = None
 
 

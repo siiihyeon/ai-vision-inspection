@@ -30,7 +30,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetNodeStatus.srv"
   "srv/OperatorCommand.srv"
   "action/InitializeNode.action"
-  "action/PositionProduct.action"
   "action/CaptureProduct.action"
   "action/ActuateProduct.action"
   DEPENDENCIES builtin_interfaces

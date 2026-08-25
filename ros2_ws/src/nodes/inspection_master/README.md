@@ -41,9 +41,11 @@ feedback은 각 노드 담당 구현과 통합 시험이 필요합니다.
 - 따라서 각 worker의 `initialize_node_resources()`는 같은 프로세스에서 여러 번
   호출되어도 안전해야 합니다. 이미 연 장치·파일·DB를 재사용하거나 새 자원으로
   교체한 뒤 이전 자원을 명시적으로 닫는 멱등 재초기화 계약을 지켜야 합니다.
-- `PositionProduct` Goal 수락 전 응답 timeout은 장비가 움직이지 않은 것으로
-  보고 `PAUSED`에서 복구하지만, Goal 수락 후 결과·위치를 신뢰할 수 없으면
-  `FAULT_STOP + LINE_CLEAR_REQUIRED`입니다.
+- Position은 Action이 아닙니다. Mega가 센서 감지 후 자율로 이동·정지하고
+  `PositionSettled`만 보고하며, Master는 `cycle.deadline_ns` 안에 이 이벤트가
+  안 오면 `EquipmentState`로 컨베이어가 아직 RUNNING인지 봅니다 — 여전히
+  RUNNING이면 이동이 시작된 적이 없다는 뜻이라 `PAUSED`에서 복구하고,
+  RUNNING을 벗어났으면 물리 위치를 신뢰할 수 없으므로 `FAULT_STOP`합니다.
 - 액추에이터 Goal이 수락된 뒤 완료 여부를 알 수 없으면 물리 상태가 불명하므로 `FAULT_STOP`입니다.
 - 완료 제품은 활성 FIFO에서 즉시 빠지지만 late result 진단을 위해 Context를 10분 보존한 뒤 bounded tombstone으로 전환합니다.
 - Master local spool 장애 시 health를 `DEGRADED`로 내리고 내구성 보장 없이
@@ -62,8 +64,10 @@ feedback은 각 노드 담당 구현과 통합 시험이 필요합니다.
 - LINE_CLEAR·제자리 복구와 종료 시 Master가 보유한 Action Goal에 취소를
   요청합니다. 취소는 best-effort이며 실제 안전 정지는 RESET·PAUSE 명령과
   Control adapter의 안전 출력이 보장해야 합니다.
-- 이미 회수된 station cycle의 늦은 `PositionSettled`는 경고 후 무시하며,
-  살아 있는 cycle과 identity·target이 충돌할 때만 `FAULT_STOP` 처리합니다.
+- 이미 회수됐거나 아직 위치 대기 단계가 아닌 station cycle에 도착한 늦은
+  `PositionSettled`는 경고 후 무시합니다. `conveyor_id`로만 매칭하며(한
+  station엔 항상 최대 하나의 cycle만 활성이므로 모호함이 없습니다),
+  Master가 명령을 보내지 않으므로 identity·target 불일치 개념이 없습니다.
 
 ## 하드웨어 통합 전 남은 Control → Master 계약
 

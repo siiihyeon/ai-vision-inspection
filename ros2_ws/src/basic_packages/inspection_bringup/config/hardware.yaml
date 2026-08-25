@@ -19,9 +19,6 @@
     master.sensor_ids.sensor_3: "SENSOR_3"
     master.sensor.accepted_edge: 1
     master.hardware_mapping_confirmed: false
-    master.station_a.position_offset_steps: 15100
-    master.station_b.position_offset_steps: 7700
-    master.position_tolerance_steps: 0
     master.camera_ids.station_a: []
     master.camera_ids.station_b: []
     master.action.position_timeout_ms: 10000
@@ -46,8 +43,9 @@
     control.tb6600.lower_config: ""
     control.sensor_config: ""
     control.actuator_config: ""
-    control.position.timeout_ms: 10000
     control.actuator.timeout_ms: 10000
+    control.station_a.position_offset_steps: 15100
+    control.station_b.position_offset_steps: 7700
 
 /inspection/vision_node:
   ros__parameters:
