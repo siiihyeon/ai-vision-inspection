@@ -883,9 +883,8 @@ void setup() {
   sorterServo.attach(SERVO_PIN);
   sorterServo.write(SERVO_STOP);
 
-  // Start both conveyors independently.
-  conveyors[0].state = CONV_RUNNING;
-  conveyors[1].state = CONV_RUNNING;
+  // Conveyors boot STOPPED (see the conveyors[] initializer) - Control
+  // must send RUN before anything moves. Do not override state here.
 
   // No plain-text Serial debug output here.
   // All PC-facing messages use CRC-framed protocol packets.
