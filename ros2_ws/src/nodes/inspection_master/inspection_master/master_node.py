@@ -34,7 +34,6 @@ from inspection_common.node_base import (
     InspectionNodeBase,
     heartbeat_qos,
     reliable_event_qos,
-    state_qos,
     spin_node,
     state_qos,
 )
