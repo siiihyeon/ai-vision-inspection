@@ -27,10 +27,9 @@ Vision의 전체 파라미터, 아직 key가 없는 모델·카메라 항목, �
 
 ## Hardware에서 아직 빈 값으로 남는 항목
 
-- 자동 조회 후 필요하면 입력할 승인 firmware 버전(`expected_firmware_version`)
 - 최종 4-view artifact bundle의 통합 SHA-256
 - queue/worker/model-lock의 생산 조정 결과
-- Mega port/baud/firmware protocol, 센서·TB6600·actuator 설정과 위치 timeout
+- Mega firmware protocol, 센서·TB6600·actuator 설정과 위치 timeout
 
 미확정 값 때문에 hardware가 `INIT_BLOCKED`되는 것은 정상입니다. 값을 임의로 채워 READY를 우회하지 마십시오.
 
@@ -45,3 +44,6 @@ sudo chown -R "$USER":"$USER" /var/lib/inspection /opt/inspection/models
 ```
 
 모델 bundle은 `/opt/inspection/models/MB_resol_180_default`에 놓고 통합 directory SHA를 `vision_model.hardware.yaml`에 입력합니다. 실제 서비스 계정을 만들면 위 소유자를 그 계정으로 바꿉니다.
+
+현재 통합 호스트에서는 Mega 포트 `/dev/ttyACM0`, baud `115200`, 카메라
+firmware `V4.0.43 250414 1530132`가 hardware profile에 고정되어 있습니다.

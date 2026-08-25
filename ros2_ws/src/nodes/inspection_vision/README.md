@@ -41,9 +41,11 @@ Vision이 삭제하지 않으며 Log Node가 보존 정책을 소유합니다.
 - acquisition timeout은 250 ms, frame arrival skew limit은 50 ms,
   packet delay는 5000 ticks입니다.
 - `ExposureAuto`, `GainAuto`, `BalanceWhiteAuto`와 gamma, saturation,
-  sharpness, black-level 보정은 초기화 때 모두 OFF로 강제합니다.
-- 기대 firmware가 비어 있어도 검증을 생략하지 않습니다. 네 카메라에서
-  조회한 실제 firmware가 모두 같아야 합니다.
+  sharpness, black-level 보정은 초기화 때 모두 OFF로 강제합니다. 지원되는
+  boolean node는 read-back까지 검증하고, Mono8에서 숨겨지는 color node는
+  `UNAVAILABLE_IN_MONO8_FEATURE_SET`으로 inventory에 명시합니다.
+- 승인 firmware는 `V4.0.43 250414 1530132`입니다. 초기화 때 네 카메라에서
+  조회한 값이 모두 이 문자열과 정확히 일치해야 합니다.
 
 ## Artifact v2 계약
 

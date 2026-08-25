@@ -29,8 +29,8 @@
     vision.gige.packet_resend.interval_ms: 10
     vision.ptp.enabled: false             # skew 판정은 항상 host monotonic arrival 사용
     vision.camera.expected_model: "MV-CS050-10GC"
-    # 비어 있으면 자동 조회한 네 카메라 firmware가 서로 같은지만 검증합니다.
-    vision.camera.expected_firmware_version: ""
+    # 2026-08-25 MVS 열거로 네 카메라에서 동일하게 확인한 승인 버전입니다.
+    vision.camera.expected_firmware_version: "V4.0.43 250414 1530132"
     vision.mvs.python_import_dir: "/opt/MVS/Samples/64/Python/MvImport"
     vision.mvs.runtime_root: "/opt/MVS/lib"
     vision.mvs.sdk_image_buffer_nodes: 8

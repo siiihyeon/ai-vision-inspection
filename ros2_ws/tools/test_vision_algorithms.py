@@ -266,6 +266,7 @@ class _ActionResultList(ctypes.Structure):
 
 class _FakeCamera:
     configured: list[tuple[str, str, object]] = []
+    inaccessible_bool_nodes: set[str] = set()
     _action_results = None
 
     @staticmethod
@@ -285,6 +286,7 @@ class _FakeCamera:
 
     def __init__(self) -> None:
         self._pixels = None
+        self._bool_values: dict[str, bool] = {}
 
     def MV_CC_CreateHandle(self, _raw) -> int:
         return 0
@@ -306,6 +308,15 @@ class _FakeCamera:
 
     def MV_CC_SetBoolValue(self, name, value) -> int:
         self.configured.append(("bool", name, value))
+        if name in self.inaccessible_bool_nodes:
+            return 0x80000106
+        self._bool_values[name] = bool(value)
+        return 0
+
+    def MV_CC_GetBoolValue(self, name, value) -> int:
+        if name in self.inaccessible_bool_nodes:
+            return 0x80000106
+        value.value = self._bool_values.get(name, False)
         return 0
 
     def MV_GIGE_SetResend(self, *_args) -> int:
@@ -393,9 +404,14 @@ class MvsFakeSdkTests(unittest.TestCase):
                 MV_MATCH_TYPE_NET_DETECT=1,
             ),
             pixels=types.SimpleNamespace(PixelType_Gvsp_Mono8=0x01080001),
-            errors=types.SimpleNamespace(MV_E_NODATA=0x80000007, MV_E_SUPPORT=0x80000001),
+            errors=types.SimpleNamespace(
+                MV_E_NODATA=0x80000007,
+                MV_E_SUPPORT=0x80000001,
+                MV_E_GC_ACCESS=0x80000106,
+            ),
         )
         _FakeCamera.configured.clear()
+        _FakeCamera.inaccessible_bool_nodes = {"SaturationEnable"}
         with tempfile.TemporaryDirectory() as directory:
             settings = MvsBackendSettings(
                 station_camera_ids={1: serials[:3], 2: serials[3:]},
@@ -441,7 +457,21 @@ class MvsFakeSdkTests(unittest.TestCase):
                 "BlackLevelEnable",
             ):
                 self.assertIn(("bool", name, False), _FakeCamera.configured)
+            for statuses in backend.correction_status_by_serial.values():
+                self.assertEqual(
+                    statuses["SaturationEnable"],
+                    "UNAVAILABLE_IN_MONO8_FEATURE_SET",
+                )
+                self.assertEqual(
+                    {
+                        statuses["GammaEnable"],
+                        statuses["SharpnessEnable"],
+                        statuses["BlackLevelEnable"],
+                    },
+                    {"OFF_VERIFIED"},
+                )
             backend.close()
+        _FakeCamera.inaccessible_bool_nodes.clear()
 
 
 if __name__ == "__main__":

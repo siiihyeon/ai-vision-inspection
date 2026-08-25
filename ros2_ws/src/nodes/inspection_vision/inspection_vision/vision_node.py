@@ -532,6 +532,7 @@ class VisionNode(InspectionNodeBase):
             "vision.result_spool_path",
             "vision.image.canonical_pixel_format",
             "vision.camera.expected_model",
+            "vision.camera.expected_firmware_version",
             "vision.mvs.python_import_dir",
             "vision.mvs.runtime_root",
         )
@@ -686,6 +687,9 @@ class VisionNode(InspectionNodeBase):
                         "host_camera_ipv4": str(
                             self.get_parameter("vision.nic.ipv4").value
                         ),
+                        "correction_status_by_serial": (
+                            self.capture_backend.correction_status_by_serial
+                        ),
                         "cameras": inventory,
                     },
                 )
@@ -712,6 +716,9 @@ class VisionNode(InspectionNodeBase):
                     "model_version": self._model_backend.identity.version,
                     "model_sha256": self._model_backend.identity.sha256,
                     "model_runtime": self._model_backend.identity.runtime,
+                    "camera_correction_status": (
+                        self.capture_backend.correction_status_by_serial
+                    ),
                     "library_compatibility_warnings": list(
                         self._model_backend.identity.library_compatibility_warnings
                     ),

@@ -1,4 +1,4 @@
-"""Ubuntu HIKROBOT MVS 5.0.2 GigE Action1 capture backend.
+"""Ubuntu HIKROBOT MVS Linux SDK GigE Action1 capture backend.
 
 공식 MVS Python wrapper는 시스템에 설치된 ``libMvCameraControl.so``를
 ``ctypes``로 로드합니다. 이 모듈은 sim/test import 시 SDK를 요구하지 않도록
@@ -247,7 +247,7 @@ def _load_mvs_modules(import_dir: Path, runtime_root: Path) -> _MvsModules:
             errors = importlib.import_module("MvErrorDefine_const")
         except Exception as exc:
             raise MvsSdkError(
-                f"MVS 5.0.2 Python binding import failed: {type(exc).__name__}"
+                f"MVS Python binding import failed: {type(exc).__name__}"
             ) from exc
         loaded_wrapper = Path(str(getattr(camera, "__file__", ""))).resolve()
         if import_dir.resolve() not in loaded_wrapper.parents:
@@ -335,6 +335,7 @@ class _CameraSession:
         self.camera = modules.camera.MvCamera()
         self.opened = False
         self.grabbing = False
+        self.correction_status: dict[str, str] = {}
         self._lock = threading.Lock()
 
     @property
@@ -365,6 +366,44 @@ class _CameraSession:
             f"{self.serial}: {name}={value}",
         )
 
+    def _disable_boolean_correction(self, name: str) -> None:
+        """지원되는 보정은 OFF를 read-back하고, 비노출 node는 명시 기록합니다."""
+
+        result = int(self.camera.MV_CC_SetBoolValue(name, False))
+        gc_access = int(
+            getattr(self.modules.errors, "MV_E_GC_ACCESS", 0x80000106)
+        )
+        if result == 0:
+            current = ctypes.c_bool(True)
+            _check_mvs(
+                self.camera.MV_CC_GetBoolValue(name, current),
+                f"{self.serial}: verify {name}=False",
+            )
+            if bool(current.value):
+                raise MvsSdkError(f"{self.serial}: {name} remained enabled")
+            self.correction_status[name] = "OFF_VERIFIED"
+            return
+        if (result & 0xFFFFFFFF) != (gc_access & 0xFFFFFFFF):
+            _check_mvs(result, f"{self.serial}: {name}=False")
+
+        # MV-CS050-10GC firmware는 Mono8 feature set에서 일부 color/gamma
+        # node를 GenICam access-condition으로 숨깁니다. 읽을 수 있다면 OFF만
+        # 허용하고, 읽기 자체도 같은 access-condition이면 비활성 feature로
+        # 구분해 inventory에 남깁니다. 다른 SDK 오류는 절대 무시하지 않습니다.
+        current = ctypes.c_bool(True)
+        read_result = int(self.camera.MV_CC_GetBoolValue(name, current))
+        if read_result == 0:
+            if bool(current.value):
+                raise MvsSdkError(
+                    f"{self.serial}: {name} is enabled but not writable"
+                )
+            self.correction_status[name] = "OFF_READ_ONLY"
+            return
+        if (read_result & 0xFFFFFFFF) == (gc_access & 0xFFFFFFFF):
+            self.correction_status[name] = "UNAVAILABLE_IN_MONO8_FEATURE_SET"
+            return
+        _check_mvs(read_result, f"{self.serial}: read {name}")
+
     def open(self) -> None:
         group = self.settings.action_groups[self.record.identity.station_id]
         _check_mvs(
@@ -380,25 +419,29 @@ class _CameraSession:
             )
             self.opened = True
             self._enum("TriggerMode", "Off")
+            # BalanceWhiteAuto는 Mono8에서 GenICam access-condition으로
+            # 숨겨집니다. 동일 color sensor의 Bayer feature set에서 먼저 OFF를
+            # 확정한 뒤 운영 출력인 Mono8로 되돌립니다.
+            self._enum("PixelFormat", "BayerRG8")
+            self._enum("BalanceWhiteAuto", "Off")
             acquisition = self.settings.camera_acquisition_settings[self.serial]
             # 운영 계약: 자동 보정뿐 아니라 가능한 모든 영상 보정을 끕니다.
             self._enum("ExposureAuto", "Off")
             self._float("ExposureTime", acquisition.exposure_time_us)
             self._enum("GainAuto", "Off")
             self._float("Gain", acquisition.gain_db)
-            self._enum("BalanceWhiteAuto", "Off")
+            self._integer("OffsetX", 0)
+            self._integer("OffsetY", 0)
+            self._integer("Width", 2448)
+            self._integer("Height", 2048)
+            self._enum("PixelFormat", "Mono8")
             for correction in (
                 "GammaEnable",
                 "SaturationEnable",
                 "SharpnessEnable",
                 "BlackLevelEnable",
             ):
-                self._boolean(correction, False)
-            self._integer("OffsetX", 0)
-            self._integer("OffsetY", 0)
-            self._integer("Width", 2448)
-            self._integer("Height", 2048)
-            self._enum("PixelFormat", "Mono8")
+                self._disable_boolean_correction(correction)
             self._integer("GevSCPSPacketSize", self.settings.packet_size)
             self._integer("GevSCPD", self.settings.packet_delay_ticks)
             if self.settings.packet_resend_enabled:
@@ -621,6 +664,7 @@ class HikrobotMvsCaptureBackend:
         self._modules: _MvsModules | None = None
         self._sessions: dict[str, _CameraSession] = {}
         self._inventory: tuple[CameraInventoryEntry, ...] = ()
+        self._correction_status_by_serial: dict[str, dict[str, str]] = {}
         self._firmware_version = ""
         self._sdk_version = ""
         self._initialized = False
@@ -642,6 +686,13 @@ class HikrobotMvsCaptureBackend:
     @property
     def sdk_version(self) -> str:
         return self._sdk_version
+
+    @property
+    def correction_status_by_serial(self) -> dict[str, dict[str, str]]:
+        return {
+            serial: dict(statuses)
+            for serial, statuses in self._correction_status_by_serial.items()
+        }
 
     def initialize(self) -> None:
         with self._lifecycle_lock:
@@ -719,6 +770,10 @@ class HikrobotMvsCaptureBackend:
             raise
         self._sessions = opened
         self._inventory = tuple(record_by_serial[serial].identity for serial in expected_serials)
+        self._correction_status_by_serial = {
+            serial: dict(opened[serial].correction_status)
+            for serial in expected_serials
+        }
         self._initialized = True
 
     def close(self) -> None:

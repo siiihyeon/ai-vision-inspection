@@ -28,17 +28,19 @@
   생성 결과에만 두고 ROS YAML이나 runtime 코드에는 복제하지 않는다.
 - [ ] 최종 bundle의 통합 SHA-256을
   `vision_model.hardware.yaml`의 `vision.model.sha256`에 입력한다.
-- [ ] 실제 네 카메라에서 model/serial/IP/firmware가 검증되는지 확인한다.
-  실제 firmware 값은 현재 미확정이며, 기대값이 비어 있으면 네 대의 동일성만
-  검증한다.
-- [ ] 카메라가 연결된 상태에서 각 보정 GenICam node가 writable이고 OFF인지
-  MVS UI와 초기화 로그 양쪽에서 확인한다.
+- [x] 2026-08-25 MVS SDK 열거에서 네 카메라의 model/serial/IP가 설정과
+  일치하고 firmware가 모두 `V4.0.43 250414 1530132`임을 확인했다.
+- [x] 2026-08-25 실카메라 초기화에서 exposure/gain/white balance 자동 기능을
+  OFF로 적용했다. Gamma·sharpness·black level은 네 대 모두 read-back OFF,
+  saturation은 Mono8 feature set에서 비활성 node임을 기록했다.
 - [ ] 케이블 disconnect/reconnect와 5초 지속 단절 PAUSE 인수 시험을 한다.
 - [ ] 컨베이어 통합 시 A→Sensor3 약 4초, B→Sensor3 최소 2초 조건과
   Sensor3 forced-NG/late-result 경로를 시험한다.
 
 ## 생산 승인 전 성능 시험
 
+- [x] 2026-08-25 1회 smoke test에서 A 3대와 B 1대 Action ACK, 2448×2048
+  Mono8, packet loss/resend 0을 확인했다. A host-arrival skew는 12.877 ms였다.
 - [ ] A 3대와 B 1대 단독/동시 trigger에서 packet loss가 계속 0인지 확인한다.
 - [ ] Host arrival skew가 50 ms 이내인지 장시간 측정한다.
 - [ ] A/B 정상 추론 각각 10,000표본으로 enqueue→terminal p99.9를 구하고

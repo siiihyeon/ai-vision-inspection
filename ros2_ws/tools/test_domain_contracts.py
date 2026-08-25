@@ -1334,6 +1334,26 @@ class VisionContractTests(unittest.TestCase):
                 expected_firmware_version="",
             )
 
+    def test_mvs_firmware_exact_expectation_is_fail_closed(self) -> None:
+        entries = self._mvs_inventory("V4.0.43 250414 1530132")
+        network_map = {entry.serial: entry.ip_address for entry in entries}
+        version = validate_camera_inventory(
+            entries,
+            expected_serials=("A1", "A2", "A3", "B1"),
+            expected_network_map=network_map,
+            expected_model="MV-CS050-10GC",
+            expected_firmware_version="V4.0.43 250414 1530132",
+        )
+        self.assertEqual(version, "V4.0.43 250414 1530132")
+        with self.assertRaisesRegex(MvsSdkError, "configured expected version"):
+            validate_camera_inventory(
+                entries,
+                expected_serials=("A1", "A2", "A3", "B1"),
+                expected_network_map=network_map,
+                expected_model="MV-CS050-10GC",
+                expected_firmware_version="V4.0.44",
+            )
+
     def test_mvs_action_groups_and_initial_operating_defaults(self) -> None:
         settings = MvsBackendSettings(
             station_camera_ids={1: ("A1", "A2", "A3"), 2: ("B1",)},
@@ -1379,13 +1399,16 @@ class VisionContractTests(unittest.TestCase):
             "vision.image.sensor_height: 2048",
             "vision.gige_action.station_a.group_key: 1",
             "vision.gige_action.station_b.group_key: 2",
-            'vision.camera.expected_firmware_version: ""',
+            'vision.camera.expected_firmware_version: "V4.0.43 250414 1530132"',
             'vision.nic.ipv4: "192.168.10.10"',
             "vision.nic.prefix_length: 24",
             "vision.frame_arrival_skew_limit_us: 50000",
             "vision.capture.acquisition_timeout_ms: 250",
         ):
             self.assertIn(expected_line, capture_config)
+        hardware_config = (config_root / "hardware.yaml").read_text(encoding="utf-8")
+        self.assertIn('control.mega.port: "/dev/ttyACM0"', hardware_config)
+        self.assertIn("control.mega.baud_rate: 115200", hardware_config)
         self.assertIn("vision.queue.capacity: 16", runtime_config)
         self.assertIn("vision.inference.station_a.total_timeout_ms: 3000", runtime_config)
         self.assertIn("vision.inference.station_b.total_timeout_ms: 1500", runtime_config)

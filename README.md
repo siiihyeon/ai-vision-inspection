@@ -36,7 +36,7 @@ Control PositionSettled
 - 제품 결과 적용 deadline은 Sensor3입니다. 명시적 station 실패는 즉시 `FORCED_NG` 후보로 기록하고, Sensor3에서만 최종 판정을 잠금합니다. Sensor3 시 미완료도 `FORCED_NG`입니다.
 - 1-channel Mono8 PNG가 canonical 파일입니다. resize/normalization은 모델 계약 주입 전까지 placeholder입니다.
 - Action1은 즉시 실행(`scheduled=false`)하며 A=`key/mask 1/1`, B=`2/2`로 분리합니다. PTP 상태와 무관하게 host monotonic frame-arrival 시각만 skew 판정에 사용합니다.
-- 시작 시 네 카메라의 모델·serial·IP·firmware를 SDK로 조회합니다. 기대 firmware 값이 비어 있으면 네 대의 버전이 서로 동일한지만 검증하고 자동 firmware update는 하지 않습니다.
+- 시작 시 네 카메라의 모델·serial·IP·firmware를 SDK로 조회합니다. hardware profile은 승인 firmware `V4.0.43 250414 1530132`와 네 대 모두 정확히 일치해야 하며 자동 firmware update는 하지 않습니다.
 - Station A terminal NG 또는 실패는 Station B의 미시작 촬영, 저장 후 enqueue, queued job, pre-forward, active-forward 결과를 단계별로 취소합니다. 시작된 forward 자체는 강제 종료하지 않습니다.
 - Vision terminal 결과는 local spool에 먼저 기록하며 Log가 같은 session에서 재전송할 수 있습니다.
 - 정상 프로그램 종료 때 제품별 CSV와 성능 summary를 만들고, 완성 이미지는 Log가 최근 10,000장만 유지합니다.
