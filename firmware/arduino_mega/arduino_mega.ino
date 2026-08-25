@@ -49,18 +49,18 @@
 #define CONV2_EN    3
 
 // HC-SR04 #1 - tested pin map
-#define TRIG1 7
-#define ECHO1 6
+#define TRIG1 25
+#define ECHO1 24
 
 // HC-SR04 #2
 // TODO: change these two values if your actual wiring is different.
-#define TRIG2 12
-#define ECHO2 11
+#define TRIG2 31
+#define ECHO2 30
 
 // HC-SR04 #3
 // TODO: change these two values if your actual wiring is different.
-#define TRIG3 14
-#define ECHO3 15
+#define TRIG3 36
+#define ECHO3 37
 
 // MG996R - tested pin map
 #define SERVO_PIN 44
