@@ -3050,9 +3050,10 @@ class MasterNode(InspectionNodeBase):
         if self.profile == "sim":
             self.confirm_all_conveyors_running()
             return
-        # TODO(HARDWARE): Control의 상·하층 실제 RUN 확인 이벤트가 연결되면
-        # confirm_all_conveyors_running()을 호출합니다. 그때까지는 아래
-        # 타임아웃이 유일한 안전망입니다.
+        # hardware profile은 Control이 보고하는 EquipmentState의 running 전이를
+        # _handle_equipment_state에서 감지해 confirm_all_conveyors_running을
+        # 호출합니다. 아래 타임아웃은 그 확인이 오지 않는 실제 고장 상황을
+        # 위한 보조 안전망입니다.
         self._run_confirmation_deadline_ns = (
             time.monotonic_ns() + self.conveyor_run_timeout_ms * 1_000_000
         )

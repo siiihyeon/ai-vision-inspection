@@ -46,8 +46,6 @@
     control.tb6600.lower_config: ""
     control.sensor_config: ""
     control.actuator_config: ""
-    control.position.upper_steps: 0
-    control.position.lower_steps: 0
     control.position.timeout_ms: 10000
     control.actuator.timeout_ms: 10000
 
