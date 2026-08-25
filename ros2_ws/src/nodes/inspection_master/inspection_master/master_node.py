@@ -2088,6 +2088,15 @@ class MasterNode(InspectionNodeBase):
             self.confirm_all_conveyors_running()
         if self.equipment.all_conveyors_stopped():
             self.confirm_all_conveyors_stopped()
+        if self.system_state == SystemState.RESETTING:
+            guards_satisfied = (
+                self.equipment.line_clear_guards_satisfied()
+                if self.recovery_policy == RecoveryPolicy.LINE_CLEAR_REQUIRED
+                else self.equipment.in_place_guards_satisfied()
+                and self._validate_fifo_alignment()
+            )
+            if guards_satisfied:
+                self.confirm_reset_completed()
 
     def _confirm_pending_resume(self, conveyor_id: ConveyorId) -> None:
         """새로 돌기 시작한 컨베이어를 기다리던 station cycle을 확인 처리합니다."""
