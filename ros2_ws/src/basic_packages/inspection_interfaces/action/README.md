@@ -2,7 +2,7 @@
 
 ## CaptureProduct
 
-성공은 frame 수신이 아니라 RGB PNG atomic 저장·digest/readability 확인과 `InferenceJob` enqueue까지 끝난 시점입니다. Queue full 동안 Action은 `ENQUEUE_BLOCKED` feedback을 반복하며 종료하지 않습니다. 취소 또는 복구 실패만 terminal failure입니다. 정상 결과는 `error_code=0`, `reason=""`입니다.
+성공은 frame 수신이 아니라 2448×2048 Mono8 PNG atomic 저장·digest/readability·packet_loss=0 확인과 `InferenceJob` enqueue까지 끝난 시점입니다. Queue full 동안 Action은 `ENQUEUE_BLOCKED` feedback을 반복하며 종료하지 않습니다. 취소 또는 복구 실패만 terminal failure입니다. 정상 결과는 `error_code=0`, `reason=""`입니다.
 
 Feedback 단계는 `VALIDATING → CAMERAS_READY → TRIGGERING → WAITING_FRAMES → VALIDATING_SKEW → SAVING_FILES → ENQUEUEING_INFERENCE`이며 재촬영은 `RETRYING`, queue 포화는 `ENQUEUE_BLOCKED`로 보고합니다. `progress`는 0.0~1.0 범위입니다.
 

@@ -259,6 +259,13 @@ class InspectionNodeBase(Node):
             reason="sim skeleton resource initialization completed",
         )
 
+    def on_initialization_succeeded(
+        self, previous_session_id: str, new_session_id: str
+    ) -> None:
+        """READY 전환 직후 자식 노드가 session 전용 메모리를 정리하는 hook."""
+
+        del previous_session_id, new_session_id
+
     def _publish_heartbeat(self) -> None:
         self._heartbeat_sequence += 1
         message = MasterHeartbeat() if self.node_id == NodeId.MASTER else NodeHeartbeat()
@@ -519,9 +526,40 @@ class InspectionNodeBase(Node):
                             resource_details=outcome.status_details,
                         )
                     else:
+                        previous_session_id = self.session_id
+                        previous_config_version = self.config_version
+                        previous_config_digest = self.config_digest
                         self.session_id = request.session_id
                         self.config_version = request.config_version
                         self.config_digest = request.config_digest
+                        try:
+                            self.on_initialization_succeeded(
+                                previous_session_id, self.session_id
+                            )
+                        except Exception as exc:
+                            self.session_id = previous_session_id
+                            self.config_version = previous_config_version
+                            self.config_digest = previous_config_digest
+                            self.get_logger().error(
+                                "post-initialization hook raised "
+                                f"{type(exc).__name__}"
+                            )
+                            self.set_health_state(NodeHealthState.INIT_BLOCKED)
+                            values = self._init_failure(
+                                ErrorCode.NODE_INIT_FAILED,
+                                "post-initialization session cleanup failed",
+                                retryable=True,
+                            )
+                            with self._initialize_lock:
+                                self._initialize_requests[request.request_id] = (
+                                    signature,
+                                    values,
+                                )
+                            self._fill_initialize_result(
+                                result, request.request_id, values
+                            )
+                            goal_handle.abort()
+                            return result
                         self.set_health_state(NodeHealthState.READY)
                         self.system_state = SystemState.READY
                         feedback.stage = "READY"
