@@ -52,6 +52,8 @@ class ControlNode(InspectionNodeBase):
         self.declare_parameter("control.actuator_config", "")
         self.declare_parameter("control.position.timeout_ms", 10000)
         self.declare_parameter("control.actuator.timeout_ms", 10000)
+        self.declare_parameter("control.station_a.position_offset_steps", 0)
+        self.declare_parameter("control.station_b.position_offset_steps", 0)
 
         self._position_results: IdempotencyStore[dict[str, object]] = IdempotencyStore()
         self._actuation_results: IdempotencyStore[dict[str, object]] = IdempotencyStore()
@@ -111,6 +113,10 @@ class ControlNode(InspectionNodeBase):
         if self.profile == "hardware":
             if int(self.get_parameter("control.mega.baud_rate").value) <= 0:
                 missing.append("control.mega.baud_rate")
+            if int(self.get_parameter("control.station_a.position_offset_steps").value) <= 0:
+                missing.append("control.station_a.position_offset_steps")
+            if int(self.get_parameter("control.station_b.position_offset_steps").value) <= 0:
+                missing.append("control.station_b.position_offset_steps")
         return list(dict.fromkeys(missing))
 
     async def initialize_node_resources(self) -> NodeInitializationOutcome:
@@ -133,6 +139,26 @@ class ControlNode(InspectionNodeBase):
                     self._wait_for_mega, f"ACK:{sequence}", 2.0
                 ):
                     return NodeInitializationOutcome(False, "Mega HELLO timeout")
+                offsets = {
+                    ConveyorId.UPPER: int(
+                        self.get_parameter(
+                            "control.station_a.position_offset_steps"
+                        ).value
+                    ),
+                    ConveyorId.LOWER: int(
+                        self.get_parameter(
+                            "control.station_b.position_offset_steps"
+                        ).value
+                    ),
+                }
+                for conveyor_id, steps in offsets.items():
+                    sequence = self._send_mega("SET_OFFSET", int(conveyor_id), steps)
+                    if not await self._run_blocking(
+                        self._wait_for_mega, f"ACK:{sequence}", 2.0
+                    ):
+                        return NodeInitializationOutcome(
+                            False, f"Mega SET_OFFSET timeout ({conveyor_id.name})"
+                        )
             except (OSError, RuntimeError) as exc:
                 return NodeInitializationOutcome(False, f"Mega connection failed: {exc}", True)
             return NodeInitializationOutcome(True, "Mega handshake completed")

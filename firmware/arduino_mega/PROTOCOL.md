@@ -5,6 +5,7 @@ Frames are ASCII lines terminated by `\n`. The final field is an uppercase CRC-1
 Host commands:
 
 - `C|sequence|HELLO|protocol_version|crc`
+- `C|sequence|SET_OFFSET|1-or-2|step_count|crc`
 - `C|sequence|RUN|1-or-2|crc` and `STOP`
 - `C|sequence|POSITION|1-or-2|step_count|crc`
 - `C|sequence|ACTUATE|1(NG)-or-2(PASS)|crc`
@@ -18,3 +19,9 @@ numbering as the Mega's internal conveyor state machine (0=running,
 through `sensor_3_clear` and `actuator_safe` are `0`/`1`.
 
 Sensor 1 and 2 only report a debounced rising edge. Master then requests `POSITION`; the corresponding conveyor stops after the requested step count and echoes the command sequence in the position event. Sensor 3 reports an edge without stopping its conveyor. `ACTUATE=1` briefly rotates the NG servo; `ACTUATE=2` is a pass-through no-op.
+
+`SET_OFFSET` stores the measured step count from sensor trigger to camera
+position for one conveyor. Control sends it once per initialization (after
+`HELLO`, before reporting READY), not per product. Conveyors boot in the
+`STOPPED` state and `cameraOffsetSteps` boots at `0`; this command only
+stores the value for later use and does not itself move anything.

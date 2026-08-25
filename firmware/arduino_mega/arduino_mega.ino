@@ -136,11 +136,12 @@ struct ConveyorController {
   ConveyorState state;
   long positionCommandSequence;
   long positionTargetSteps;
+  long cameraOffsetSteps;  // SET_OFFSET으로 Control이 전달; 0이면 아직 미설정
 };
 
 ConveyorController conveyors[2] = {
-  { &conveyor1, CONV1_EN, CONV1_SPEED, 1, CONV_RUNNING, 0, 0 },
-  { &conveyor2, CONV2_EN, CONV2_SPEED, 2, CONV_RUNNING, 0, 0 }
+  { &conveyor1, CONV1_EN, CONV1_SPEED, 1, CONV_STOPPED, 0, 0, 0 },
+  { &conveyor2, CONV2_EN, CONV2_SPEED, 2, CONV_STOPPED, 0, 0, 0 }
 };
 
 
@@ -699,6 +700,32 @@ void handleCommand(char* line) {
       acknowledge(sequence, "OK");
     } else {
       acknowledge(sequence, "ERR_VERSION");
+    }
+    return;
+  }
+
+  // ----------------------------------------------------------
+  // SET_OFFSET
+  // C|seq|SET_OFFSET|1|15100
+  // C|seq|SET_OFFSET|2|7700
+  // ----------------------------------------------------------
+  if (strcmp(operation, "SET_OFFSET") == 0) {
+    char* conveyorText = strtok_r(nullptr, "|", &savePtr);
+    char* stepsText = strtok_r(nullptr, "|", &savePtr);
+
+    if (conveyorText == nullptr || stepsText == nullptr) {
+      acknowledge(sequence, "ERR");
+      return;
+    }
+
+    int conveyorId = atoi(conveyorText);
+    long steps = atol(stepsText);
+
+    if ((conveyorId == 1 || conveyorId == 2) && steps > 0) {
+      conveyors[conveyorId - 1].cameraOffsetSteps = steps;
+      acknowledge(sequence, "OK");
+    } else {
+      acknowledge(sequence, "ERR");
     }
     return;
   }

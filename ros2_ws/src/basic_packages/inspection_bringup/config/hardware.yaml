@@ -48,6 +48,8 @@
     control.actuator_config: ""
     control.position.timeout_ms: 10000
     control.actuator.timeout_ms: 10000
+    control.station_a.position_offset_steps: 15100
+    control.station_b.position_offset_steps: 7700
 
 /inspection/vision_node:
   ros__parameters:
