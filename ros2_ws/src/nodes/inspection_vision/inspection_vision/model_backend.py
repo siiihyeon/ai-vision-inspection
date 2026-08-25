@@ -40,6 +40,20 @@ EXPECTED_STATION_VIEWS = {
     1: ("CAM_A_1", "CAM_A_2", "CAM_A_3"),
     2: ("CAM_B_1",),
 }
+PATCHCORE_PARAMETER_KEYS = {
+    "backbone",
+    "feature_layers",
+    "coreset_ratio",
+    "k",
+    "threshold_percentile",
+    "customized_margin",
+    "threshold_epsilon",
+    "input_resolution",
+    "resize_mode",
+    "construction_batch_size",
+    "distance_chunk_size",
+    "seed",
+}
 SAFE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -121,6 +135,108 @@ class PreprocessingSettings:
             )
         if settings.check_connection:
             raise ArtifactContractError(f"{view}: check_connection must remain disabled")
+        return settings
+
+
+@dataclass(frozen=True, slots=True)
+class PatchCoreViewSettings:
+    backbone: str
+    feature_layers: tuple[int, ...]
+    coreset_ratio: float
+    k: int
+    threshold_percentile: float
+    customized_margin: float
+    threshold_epsilon: float
+    input_resolution: tuple[int, int]
+    resize_mode: str
+    construction_batch_size: int
+    distance_chunk_size: int
+    seed: int
+
+    @classmethod
+    def from_payload(cls, view: str, payload: Any) -> "PatchCoreViewSettings":
+        if not isinstance(payload, dict) or set(payload) != PATCHCORE_PARAMETER_KEYS:
+            raise ArtifactContractError(f"{view}: PatchCore parameter keys differ")
+        numeric_fields = (
+            "coreset_ratio",
+            "threshold_percentile",
+            "customized_margin",
+            "threshold_epsilon",
+        )
+        integer_fields = (
+            "k",
+            "construction_batch_size",
+            "distance_chunk_size",
+            "seed",
+        )
+        if type(payload["backbone"]) is not str or type(payload["resize_mode"]) is not str:
+            raise ArtifactContractError(f"{view}: backbone/resize_mode types are invalid")
+        if any(type(payload[field]) not in {int, float} for field in numeric_fields):
+            raise ArtifactContractError(f"{view}: numeric parameter types are invalid")
+        if any(type(payload[field]) is not int for field in integer_fields):
+            raise ArtifactContractError(f"{view}: integer parameter types are invalid")
+        layers = payload["feature_layers"]
+        resolution = payload["input_resolution"]
+        if (
+            not isinstance(layers, list)
+            or not layers
+            or any(type(layer) is not int for layer in layers)
+            or len(set(layers)) != len(layers)
+        ):
+            raise ArtifactContractError(f"{view}: feature_layers are invalid")
+        if (
+            not isinstance(resolution, list)
+            or len(resolution) != 2
+            or any(type(value) is not int or value < 1 for value in resolution)
+        ):
+            raise ArtifactContractError(f"{view}: input_resolution is invalid")
+        settings = cls(
+            backbone=payload["backbone"],
+            feature_layers=tuple(layers),
+            coreset_ratio=float(payload["coreset_ratio"]),
+            k=payload["k"],
+            threshold_percentile=float(payload["threshold_percentile"]),
+            customized_margin=float(payload["customized_margin"]),
+            threshold_epsilon=float(payload["threshold_epsilon"]),
+            input_resolution=(resolution[0], resolution[1]),
+            resize_mode=payload["resize_mode"],
+            construction_batch_size=payload["construction_batch_size"],
+            distance_chunk_size=payload["distance_chunk_size"],
+            seed=payload["seed"],
+        )
+        allowed_layers = (
+            {1, 2, 3, 4}
+            if settings.backbone == "resnet34"
+            else set(range(1, 8))
+            if settings.backbone == "efficientnet_b0"
+            else set()
+        )
+        if not allowed_layers or any(layer not in allowed_layers for layer in settings.feature_layers):
+            raise ArtifactContractError(f"{view}: feature_layers do not match backbone")
+        if not math.isfinite(settings.coreset_ratio) or not 0 < settings.coreset_ratio <= 1:
+            raise ArtifactContractError(f"{view}: coreset_ratio is invalid")
+        if settings.k < 1:
+            raise ArtifactContractError(f"{view}: k is invalid")
+        if (
+            not math.isfinite(settings.threshold_percentile)
+            or not 0 <= settings.threshold_percentile <= 100
+        ):
+            raise ArtifactContractError(f"{view}: threshold_percentile is invalid")
+        if (
+            not math.isfinite(settings.customized_margin)
+            or not 0 <= settings.customized_margin <= 1
+        ):
+            raise ArtifactContractError(f"{view}: customized_margin is invalid")
+        if not math.isfinite(settings.threshold_epsilon) or settings.threshold_epsilon <= 0:
+            raise ArtifactContractError(f"{view}: threshold_epsilon is invalid")
+        if settings.resize_mode != "padding":
+            raise ArtifactContractError(f"{view}: resize_mode must be padding")
+        if (
+            settings.construction_batch_size < 1
+            or settings.distance_chunk_size < 1
+            or settings.seed < 0
+        ):
+            raise ArtifactContractError(f"{view}: batch/chunk/seed settings are invalid")
         return settings
 
 
@@ -211,22 +327,31 @@ class Mono8PatchCorePreprocessor:
         *,
         serial_to_view: Mapping[str, str],
         settings_by_view: Mapping[str, PreprocessingSettings],
-        input_resolution: Sequence[int],
-        resize_mode: str,
+        input_resolution_by_view: Mapping[str, Sequence[int]],
+        resize_mode_by_view: Mapping[str, str],
         diagnostic_root: Path,
     ) -> None:
         self.serial_to_view = dict(serial_to_view)
         self.settings_by_view = dict(settings_by_view)
         if set(self.serial_to_view.values()) != set(self.settings_by_view):
             raise ArtifactContractError("camera serial/view preprocessing mapping differs")
-        if len(input_resolution) != 2:
-            raise ArtifactContractError("input_resolution must contain height and width")
-        self.input_resolution = (int(input_resolution[0]), int(input_resolution[1]))
-        if min(self.input_resolution) < 1:
-            raise ArtifactContractError("input_resolution must be positive")
-        if resize_mode != "padding":
-            raise ArtifactContractError("production preprocessing requires padding resize mode")
-        self.resize_mode = resize_mode
+        expected_views = set(self.settings_by_view)
+        if set(input_resolution_by_view) != expected_views:
+            raise ArtifactContractError("input-resolution/view mapping differs")
+        if set(resize_mode_by_view) != expected_views:
+            raise ArtifactContractError("resize-mode/view mapping differs")
+        self.input_resolution_by_view: dict[str, tuple[int, int]] = {}
+        self.resize_mode_by_view = dict(resize_mode_by_view)
+        for view in expected_views:
+            resolution = input_resolution_by_view[view]
+            if len(resolution) != 2 or min(map(int, resolution)) < 1:
+                raise ArtifactContractError(f"{view}: input_resolution is invalid")
+            self.input_resolution_by_view[view] = (
+                int(resolution[0]),
+                int(resolution[1]),
+            )
+            if self.resize_mode_by_view[view] != "padding":
+                raise ArtifactContractError(f"{view}: resize_mode must be padding")
         self.diagnostic_root = diagnostic_root.expanduser().resolve()
 
     def load(self, path: Path) -> PreparedView:
@@ -274,7 +399,7 @@ class Mono8PatchCorePreprocessor:
         x, y, width, height = (int(value) for value in cv2.boundingRect(points))
         crop_1 = cv2.bitwise_and(image, image, mask=final_mask)
         crop_2 = crop_1[y : y + height, x : x + width]
-        resized = self._resize_with_black_padding(crop_2)
+        resized = self._resize_with_black_padding(crop_2, view)
         rgb = np.repeat(resized[:, :, None], 3, axis=2)
         tensor = (
             torch.from_numpy(np.ascontiguousarray(rgb))
@@ -291,8 +416,8 @@ class Mono8PatchCorePreprocessor:
             original_component_count=component_count,
         )
 
-    def _resize_with_black_padding(self, image: np.ndarray) -> np.ndarray:
-        target_h, target_w = self.input_resolution
+    def _resize_with_black_padding(self, image: np.ndarray, view: str) -> np.ndarray:
+        target_h, target_w = self.input_resolution_by_view[view]
         source_h, source_w = image.shape
         scale = min(target_w / source_w, target_h / source_h)
         resized_w = max(1, min(target_w, int(round(source_w * scale))))
@@ -509,6 +634,7 @@ class PatchCoreArtifactModel:
         identity: ModelIdentity,
         manifest: dict[str, Any],
         station_views: Mapping[int, tuple[str, ...]],
+        parameters_by_view: Mapping[str, PatchCoreViewSettings],
         models: Mapping[str, PatchCoreViewModel],
         preprocessor: Mono8PatchCorePreprocessor,
         device: torch.device,
@@ -517,6 +643,7 @@ class PatchCoreArtifactModel:
         self.identity = identity
         self.manifest = manifest
         self.station_views = dict(station_views)
+        self.parameters_by_view = dict(parameters_by_view)
         self.models = dict(models)
         self.preprocessor = preprocessor
         self.device = device
@@ -560,18 +687,24 @@ class PatchCoreArtifactModel:
             identity.runtime,
             warnings,
         )
-        parameters = manifest["parameters"]
+        parameters_by_view = {
+            view: PatchCoreViewSettings.from_payload(
+                view, manifest["parameters_by_view"][view]
+            )
+            for view in manifest["view_names"]
+        }
         device = torch.device("cuda:0")
         torch.cuda.set_device(device)
         models: dict[str, PatchCoreViewModel] = {}
         try:
             for view in manifest["view_names"]:
+                parameters = parameters_by_view[view]
                 model = PatchCoreViewModel(
-                    backbone=str(parameters["backbone"]),
-                    layer_numbers=parameters["feature_layers"],
-                    num_neighbors=int(parameters["k"]),
+                    backbone=parameters.backbone,
+                    layer_numbers=parameters.feature_layers,
+                    num_neighbors=parameters.k,
                     pretrained=False,
-                    distance_chunk_size=int(parameters["distance_chunk_size"]),
+                    distance_chunk_size=parameters.distance_chunk_size,
                 )
                 actual_shape = _load_patchcore_state(
                     model, root / view / "model.pt"
@@ -599,8 +732,14 @@ class PatchCoreArtifactModel:
         preprocessor = Mono8PatchCorePreprocessor(
             serial_to_view=serial_to_view,
             settings_by_view=preprocessing,
-            input_resolution=parameters["input_resolution"],
-            resize_mode=str(parameters["resize_mode"]),
+            input_resolution_by_view={
+                view: parameters.input_resolution
+                for view, parameters in parameters_by_view.items()
+            },
+            resize_mode_by_view={
+                view: parameters.resize_mode
+                for view, parameters in parameters_by_view.items()
+            },
             diagnostic_root=diagnostic_root,
         )
         benchmark = manifest["parallel_benchmark"]
@@ -609,6 +748,7 @@ class PatchCoreArtifactModel:
             identity=identity,
             manifest=manifest,
             station_views=station_views,
+            parameters_by_view=parameters_by_view,
             models=models,
             preprocessor=preprocessor,
             device=device,
@@ -662,39 +802,17 @@ class PatchCoreArtifactModel:
         if camera_serial_by_view != expected_serial_by_view:
             raise ArtifactContractError("artifact camera serial/view mapping differs from runtime")
 
-        parameters = manifest.get("parameters")
-        if not isinstance(parameters, dict):
-            raise ArtifactContractError("artifact parameters are missing")
-        required_parameters = {
-            "backbone",
-            "feature_layers",
-            "coreset_ratio",
-            "k",
-            "threshold_percentile",
-            "customized_margin",
-            "threshold_epsilon",
-            "input_resolution",
-            "resize_mode",
-            "construction_batch_size",
-            "distance_chunk_size",
-            "seed",
-            "view_names",
+        if "parameters" in manifest:
+            raise ArtifactContractError("artifact v2 does not allow global parameters")
+        parameters_by_view = manifest.get("parameters_by_view")
+        if not isinstance(parameters_by_view, dict) or set(parameters_by_view) != set(
+            view_names
+        ):
+            raise ArtifactContractError("artifact parameters_by_view keys differ")
+        parsed_parameters = {
+            view: PatchCoreViewSettings.from_payload(view, parameters_by_view[view])
+            for view in view_names
         }
-        if set(parameters) != required_parameters:
-            raise ArtifactContractError("artifact PatchCore parameter keys differ")
-        if list(parameters["view_names"]) != list(view_names):
-            raise ArtifactContractError("parameters.view_names differs from manifest")
-        if parameters["resize_mode"] != "padding":
-            raise ArtifactContractError("artifact resize_mode must be padding")
-        resolution = parameters["input_resolution"]
-        if not isinstance(resolution, list) or len(resolution) != 2 or min(map(int, resolution)) < 1:
-            raise ArtifactContractError("artifact input_resolution is invalid")
-        epsilon = float(parameters["threshold_epsilon"])
-        margin = float(parameters["customized_margin"])
-        if not math.isfinite(epsilon) or epsilon <= 0:
-            raise ArtifactContractError("artifact threshold_epsilon is invalid")
-        if not math.isfinite(margin) or not 0 <= margin <= 1:
-            raise ArtifactContractError("artifact customized_margin is invalid")
 
         keyed_fields = (
             "thresholds",
@@ -707,8 +825,12 @@ class PatchCoreArtifactModel:
             if not isinstance(value, dict) or set(value) != set(view_names):
                 raise ArtifactContractError(f"artifact {field} view keys differ")
         for view in view_names:
+            parameters = parsed_parameters[view]
             threshold = float(manifest["thresholds"][view])
-            if not math.isfinite(threshold) or threshold <= epsilon:
+            if (
+                not math.isfinite(threshold)
+                or threshold <= parameters.threshold_epsilon
+            ):
                 raise ArtifactContractError(f"{view}: threshold is invalid")
             shape = manifest["memory_bank_shapes"][view]
             if not isinstance(shape, list) or len(shape) != 2 or min(map(int, shape)) < 1:
@@ -794,20 +916,18 @@ class PatchCoreArtifactModel:
             raise ArtifactContractError(f"inference view order is invalid: {views}")
         expected = self.station_views[station_id]
         raw_scores = self._run_raw(expected, images)
-        parameters = self.manifest["parameters"]
-        epsilon = float(parameters["threshold_epsilon"])
-        margin = float(parameters["customized_margin"])
         normalized: list[float] = []
         view_verdicts: list[int] = []
         diagnostics: list[str] = []
         for view, raw, prepared in zip(expected, raw_scores, images, strict=True):
+            parameters = self.parameters_by_view[view]
             threshold = float(self.manifest["thresholds"][view])
-            if threshold <= epsilon:
+            if threshold <= parameters.threshold_epsilon:
                 raise ArtifactContractError(f"{view}: unsafe artifact threshold")
             score = float(raw) / threshold
             if not math.isfinite(score):
                 raise RuntimeError(f"{view}: normalized score is not finite")
-            is_ng = score >= 1.0 - margin
+            is_ng = score >= 1.0 - parameters.customized_margin
             normalized.append(score)
             view_verdicts.append(int(Verdict.NG if is_ng else Verdict.PASS))
             if is_ng:
@@ -848,27 +968,40 @@ class PatchCoreArtifactModel:
         return raw_scores
 
     def _warmup_and_verify_memory(self, *, warmup_runs: int, reserve_mib: int) -> None:
-        height, width = (int(value) for value in self.manifest["parameters"]["input_resolution"])
-        prepared = tuple(
-            PreparedView(
-                source_path=Path(f"/{view}.png"),
-                view_name=view,
-                tensor=torch.zeros((3, height, width), dtype=torch.float32),
-                crop_1=np.zeros((1, 1), dtype=np.uint8),
-                crop_2=np.zeros((1, 1), dtype=np.uint8),
-                original_component_count=1,
-            )
-            for view in self.station_views[1]
-        )
+        prepared_by_station: dict[int, tuple[PreparedView, ...]] = {}
+        for station_id, station_views in self.station_views.items():
+            prepared_items: list[PreparedView] = []
+            for view in station_views:
+                parameters = self.parameters_by_view[view]
+                height, width = parameters.input_resolution
+                prepared_items.append(
+                    PreparedView(
+                        source_path=Path(f"/{view}.png"),
+                        view_name=view,
+                        tensor=torch.zeros((3, height, width), dtype=torch.float32),
+                        crop_1=np.zeros((1, 1), dtype=np.uint8),
+                        crop_2=np.zeros((1, 1), dtype=np.uint8),
+                        original_component_count=1,
+                    )
+                )
+            prepared_by_station[station_id] = tuple(prepared_items)
         for _ in range(warmup_runs):
-            self._run_raw(self.station_views[1], prepared)
+            for station_id in sorted(self.station_views):
+                self._run_raw(
+                    self.station_views[station_id],
+                    prepared_by_station[station_id],
+                )
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         free_bytes, _ = torch.cuda.mem_get_info(self.device)
         available = max(0, free_bytes - reserve_mib * 1024**2)
         base_allocated = torch.cuda.memory_allocated(self.device)
         torch.cuda.reset_peak_memory_stats(self.device)
-        self._run_raw(self.station_views[1], prepared)
+        for station_id in sorted(self.station_views):
+            self._run_raw(
+                self.station_views[station_id],
+                prepared_by_station[station_id],
+            )
         torch.cuda.synchronize(self.device)
         peak_extra = max(
             0, torch.cuda.max_memory_allocated(self.device) - base_allocated

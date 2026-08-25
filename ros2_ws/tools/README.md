@@ -13,4 +13,6 @@ python3 tools/inspect_patchcore_artifact.py /absolute/artifact/path \
 ```
 
 두 번째 명령은 CUDA를 사용하지 않고 v2 manifest/file/calibration 계약을
-검증한 뒤 hardware YAML에 넣을 통합 directory SHA-256을 출력합니다.
+검증한 뒤 hardware YAML에 넣을 통합 directory SHA-256을 출력합니다. v2의
+`parameters_by_view`는 네 view 각각의 모델·해상도·margin 설정을 독립적으로
+보관하며 전역 `parameters`는 거부합니다.

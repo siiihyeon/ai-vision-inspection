@@ -18,7 +18,7 @@ jobs:
           python3 -m pip install pyflakes==3.4.0 numpy opencv-python-headless
           python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
       - name: Check Python undefined names and import usage
-        run: pyflakes ros2_ws/src ros2_ws/tools
+        run: pyflakes ros2_ws/src ros2_ws/tools offline_model_tools
       - name: Verify package structure and interface contract
         run: python3 ros2_ws/tools/verify_skeleton.py
       - name: Test pure domain contracts

@@ -21,13 +21,14 @@
 
 ## 실제 제품 실행 전 차단 사항
 
-- [ ] 최종 4-view format v2 artifact bundle을 생성한다. 현재 제공된 v1
-  artifact는 B view가 없어 운영 loader가 의도적으로 거부한다.
-- [ ] 최종 bundle의 `preprocessing_by_view`에는 네 view 모두 초기
+- [x] 최종 4-view format v2 artifact bundle을 생성하고
+  `/opt/inspection/models/MB_resol_180_default`에 배포했다.
+- [x] 최종 bundle의 `preprocessing_by_view`에는 네 view 모두 초기
   `v_threshold=40`을 넣는다. 판정 threshold와 margin 초기값 0.02도 artifact
   생성 결과에만 두고 ROS YAML이나 runtime 코드에는 복제하지 않는다.
-- [ ] 최종 bundle의 통합 SHA-256을
-  `vision_model.hardware.yaml`의 `vision.model.sha256`에 입력한다.
+- [x] 최종 bundle의 통합 SHA-256
+  `e7a1946e5439214959283864db94099ea3f75a709d76d76129a298e5f8cab349`를
+  `vision_model.hardware.yaml`의 `vision.model.sha256`에 입력했다.
 - [x] 2026-08-25 MVS SDK 열거에서 네 카메라의 model/serial/IP가 설정과
   일치하고 firmware가 모두 `V4.0.43 250414 1530132`임을 확인했다.
 - [x] 2026-08-25 실카메라 초기화에서 exposure/gain/white balance 자동 기능을
@@ -49,6 +50,5 @@
 - [ ] Disk 90% warning, 95% stop, 최근 10,000장 보존을 검증한다.
 - [ ] 정상 종료, 강제 종료, Vision/Log 재시작에서 멱등성과 spool replay를 검증한다.
 
-코드 구현 완료와 생산 승인은 다릅니다. 위 첫 번째 차단 묶음이 해결되어야
-hardware profile이 READY가 될 수 있고, 실제 장비·공정 시험을 통과해야 생산
-승인을 선언할 수 있습니다.
+코드 구현과 artifact 배포 완료는 생산 승인을 뜻하지 않습니다. 남은 실제
+장비·공정 인수시험을 모두 통과한 뒤에만 생산 승인을 선언할 수 있습니다.

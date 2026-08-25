@@ -65,8 +65,13 @@ class PatchCoreContractTests(unittest.TestCase):
         return Mono8PatchCorePreprocessor(
             serial_to_view=SERIAL_TO_VIEW,
             settings_by_view=settings,
-            input_resolution=(180, 180),
-            resize_mode="padding",
+            input_resolution_by_view={
+                "CAM_A_1": (180, 180),
+                "CAM_A_2": (160, 192),
+                "CAM_A_3": (192, 160),
+                "CAM_B_1": (128, 128),
+            },
+            resize_mode_by_view={view: "padding" for view in SERIAL_TO_VIEW.values()},
             diagnostic_root=root / "diagnostics",
         )
 
@@ -90,6 +95,19 @@ class PatchCoreContractTests(unittest.TestCase):
             self.assertTrue(bool((prepared.tensor[:, 0, :] == 0).all()))
             self.assertFalse((root / "diagnostics").exists())
 
+    def test_each_view_uses_its_own_input_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = np.zeros((120, 200), dtype=np.uint8)
+            image[20:100, 50:150] = 150
+            source = root / "DA7838410.png"
+            write_png(source, image)
+
+            prepared = self._preprocessor(root).load(source)
+
+            self.assertEqual(prepared.view_name, "CAM_B_1")
+            self.assertEqual(tuple(prepared.tensor.shape), (3, 128, 128))
+
     def test_no_foreground_is_failure_and_saves_only_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -111,7 +129,12 @@ class PatchCoreContractTests(unittest.TestCase):
         ]
         thresholds = {view: 2.0 for view in views}
         validation = {view: [0.5, 1.0, 1.5] for view in views}
-        shapes = {view: [10, 192] for view in views}
+        shapes = {
+            "CAM_A_1": [10, 192],
+            "CAM_A_2": [11, 256],
+            "CAM_A_3": [12, 384],
+            "CAM_B_1": [13, 512],
+        }
         preprocessing = {
             view: {
                 "v_threshold": 40,
@@ -134,20 +157,22 @@ class PatchCoreContractTests(unittest.TestCase):
             "camera_serial_by_view": {
                 view: serial for serial, view in SERIAL_TO_VIEW.items()
             },
-            "parameters": {
-                "backbone": "resnet34",
-                "feature_layers": [1, 2],
-                "coreset_ratio": 0.1,
-                "k": 9,
-                "threshold_percentile": 99.0,
-                "customized_margin": 0.125,
-                "threshold_epsilon": 1e-12,
-                "input_resolution": [180, 180],
-                "resize_mode": "padding",
-                "construction_batch_size": 16,
-                "distance_chunk_size": 4096,
-                "seed": 42,
-                "view_names": views,
+            "parameters_by_view": {
+                view: {
+                    "backbone": "resnet34",
+                    "feature_layers": [1, 2],
+                    "coreset_ratio": 0.1 + position * 0.01,
+                    "k": 9 - position,
+                    "threshold_percentile": 99.0 - position,
+                    "customized_margin": 0.02 * position,
+                    "threshold_epsilon": 1e-12,
+                    "input_resolution": [180 + position * 4, 176 + position * 8],
+                    "resize_mode": "padding",
+                    "construction_batch_size": 1 + position,
+                    "distance_chunk_size": 1024 * (position + 1),
+                    "seed": 42 + position,
+                }
+                for position, view in enumerate(views)
             },
             "thresholds": thresholds,
             "memory_bank_shapes": shapes,
