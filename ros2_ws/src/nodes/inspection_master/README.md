@@ -84,12 +84,11 @@ station별 재가동 확인(`_confirm_pending_resume` → `confirm_conveyor_resu
 Control의 장시간 Position·Actuation 실행 루프는 cancel 요청을 주기적으로
 확인하고, RESET 또는 `command_epoch` 변경 시 이전 명령을 폐기해야 합니다.
 Action server가 cancel 요청을 수락했다는 사실만으로 물리 정지를 확정하면 안 됩니다.
-
-> **알려진 공백**: `EquipmentState`의 running 전이는 station별 재가동
-> 확인에는 쓰이지만, 시스템 전체 START 확인(`confirm_all_conveyors_running`)에는
-> 아직 연결되지 않았습니다. hardware profile은 지금도 START 시마다
-> `master.action.conveyor_run_timeout_ms` 타임아웃에만 의존합니다
-> (`_request_conveyor_run`). 연결 여부는 별도 결정 필요.
+`EquipmentState`의 running 전이는 station별 재가동 확인뿐 아니라 시스템 전체
+START 확인(`confirm_all_conveyors_running`)에도 쓰입니다 — 두 컨베이어가 모두
+running으로 확인되면 `_handle_equipment_state`가 바로 호출하며,
+`master.action.conveyor_run_timeout_ms` 타임아웃은 이 확인이 오지 않는
+실제 고장 상황을 위한 안전망으로만 남습니다.
 
 ## 개발용 터미널 명령
 

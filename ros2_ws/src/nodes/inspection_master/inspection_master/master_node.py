@@ -2084,6 +2084,19 @@ class MasterNode(InspectionNodeBase):
             self._confirm_pending_resume(ConveyorId.UPPER)
         if message.lower_running and not was_lower_running:
             self._confirm_pending_resume(ConveyorId.LOWER)
+        if self._pending_run_confirmation and self.equipment.all_conveyors_running():
+            self.confirm_all_conveyors_running()
+        if self.equipment.all_conveyors_stopped():
+            self.confirm_all_conveyors_stopped()
+        if self.system_state == SystemState.RESETTING:
+            guards_satisfied = (
+                self.equipment.line_clear_guards_satisfied()
+                if self.recovery_policy == RecoveryPolicy.LINE_CLEAR_REQUIRED
+                else self.equipment.in_place_guards_satisfied()
+                and self._validate_fifo_alignment()
+            )
+            if guards_satisfied:
+                self.confirm_reset_completed()
 
     def _confirm_pending_resume(self, conveyor_id: ConveyorId) -> None:
         """새로 돌기 시작한 컨베이어를 기다리던 station cycle을 확인 처리합니다."""
@@ -3037,9 +3050,10 @@ class MasterNode(InspectionNodeBase):
         if self.profile == "sim":
             self.confirm_all_conveyors_running()
             return
-        # TODO(HARDWARE): Control의 상·하층 실제 RUN 확인 이벤트가 연결되면
-        # confirm_all_conveyors_running()을 호출합니다. 그때까지는 아래
-        # 타임아웃이 유일한 안전망입니다.
+        # hardware profile은 Control이 보고하는 EquipmentState의 running 전이를
+        # _handle_equipment_state에서 감지해 confirm_all_conveyors_running을
+        # 호출합니다. 아래 타임아웃은 그 확인이 오지 않는 실제 고장 상황을
+        # 위한 보조 안전망입니다.
         self._run_confirmation_deadline_ns = (
             time.monotonic_ns() + self.conveyor_run_timeout_ms * 1_000_000
         )
@@ -3363,8 +3377,8 @@ class MasterNode(InspectionNodeBase):
     def confirm_all_conveyors_stopped(self) -> None:
         """Control의 실제 정지 완료를 받은 뒤 PAUSING을 확정합니다.
 
-        실제 Sensor/Conveyor 상태 매핑이 확정되면 PositionSettled가 아닌 별도의
-        typed 장비 상태 이벤트에서 이 확장점을 호출해야 합니다.
+        hardware profile에서는 EquipmentState의 정지 확인(_handle_equipment_state)이
+        호출하고, sim profile에서는 _request_all_conveyors_stop이 즉시 호출합니다.
         """
 
         self.equipment.mark_all_stopped()
