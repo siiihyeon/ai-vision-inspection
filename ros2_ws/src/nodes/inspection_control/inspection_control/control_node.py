@@ -190,6 +190,23 @@ class ControlNode(InspectionNodeBase):
             except RuntimeError as exc:
                 self.get_logger().error(str(exc))
 
+    def handle_all_conveyors_command(self, message: SystemCommand) -> None:
+        """전체 컨베이어 대상 PAUSE/RESUME을 Mega STOP/RUN으로 전달합니다."""
+
+        if self.profile != "hardware":
+            return
+        operation = {
+            SystemCommand.PAUSE: "STOP",
+            SystemCommand.RESUME: "RUN",
+        }.get(int(message.command_type))
+        if operation is None:
+            return
+        for conveyor_id in (ConveyorId.UPPER, ConveyorId.LOWER):
+            try:
+                self._send_mega(operation, int(conveyor_id))
+            except RuntimeError as exc:
+                self.get_logger().error(str(exc))
+
     def _next_sequence(self) -> int:
         with self._mega_lock:
             self._mega_sequence = (self._mega_sequence + 1) & 0x7FFFFFFF
