@@ -2084,6 +2084,8 @@ class MasterNode(InspectionNodeBase):
             self._confirm_pending_resume(ConveyorId.UPPER)
         if message.lower_running and not was_lower_running:
             self._confirm_pending_resume(ConveyorId.LOWER)
+        if self._pending_run_confirmation and self.equipment.all_conveyors_running():
+            self.confirm_all_conveyors_running()
 
     def _confirm_pending_resume(self, conveyor_id: ConveyorId) -> None:
         """새로 돌기 시작한 컨베이어를 기다리던 station cycle을 확인 처리합니다."""
