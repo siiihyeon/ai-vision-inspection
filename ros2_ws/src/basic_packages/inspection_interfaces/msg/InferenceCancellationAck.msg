@@ -1,0 +1,10 @@
+CommonHeader header
+string cancellation_id
+string product_id
+uint64 fifo_sequence
+uint8 station_id
+uint32 removed_queue_jobs
+bool active_job_found
+bool active_result_will_be_discarded
+string reason
+builtin_interfaces/Time acknowledged_at

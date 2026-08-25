@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import rclpy
-from .mega_protocol import decode_frame, encode_frame, parse_event
 from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+
+import rclpy
 from inspection_common import (
     ConveyorId,
     ErrorCode,
@@ -29,9 +31,10 @@ from inspection_interfaces.msg import (
 )
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
-import threading
-import time
+
+from .mega_protocol import decode_frame, encode_frame, parse_event
 
 try:
     import serial
@@ -483,7 +486,7 @@ class ControlNode(InspectionNodeBase):
 
 
 def main(args: list[str] | None = None) -> None:
-    rclpy.init(args=args)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     spin_node(ControlNode())
 
 

@@ -20,8 +20,9 @@ Station A/B 결과 결합, Sensor3 최종 판정 잠금과 액추에이터 분�
 | 8 | 판정 발행, SQLite log spool/ACK, 안전 종료 | 완료 |
 
 `완료`는 Master 책임 범위의 코드와 ROS 연결점이 구현되었다는 뜻입니다.
-Control·Vision의 실장비 adapter, Mega/TB6600 신호, MVS 카메라, 액추에이터
-feedback은 각 노드 담당 구현과 통합 시험이 필요합니다.
+Vision의 MVS Action1 adapter는 구현됐지만 Ubuntu 실장비 검증과 실제 모델
+decoder가 남아 있고, Control의 Mega/TB6600·액추에이터 adapter는 placeholder입니다.
+따라서 각 노드의 실장비 통합 시험이 별도로 필요합니다.
 
 ## 핵심 운전 규칙
 

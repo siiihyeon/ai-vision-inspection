@@ -59,6 +59,15 @@ launch를 실행한 터미널에서 눌러 네 노드의 안전 종료 절차를
 - 새 Python 파일이나 패키지 추가: 재빌드하는 것이 안전합니다.
 - 판단이 애매함: 실행 중인 노드를 `Ctrl+C`로 종료한 뒤 다시 빌드합니다.
 
+### 정적 검사·package test
+
+코드 검증(빌드/실행 절차와는 별개)은 `tools/README.md`에 정리되어 있습니다.
+
+이 PC처럼 `/usr/local/bin/python3`와 ROS의 system Python이 함께 있으면
+`colcon`이 잘못된 Python을 골라 `em` import에서 실패할 수 있습니다 — 그래서
+아래 build 명령에는 `-DPython3_EXECUTABLE=/usr/bin/python3` 지정이 들어가
+있고, 제거하면 안 됩니다.
+
 ## 2. Hardware
 
 빌드부터 환경 적용까지 한 번에:
@@ -66,7 +75,8 @@ launch를 실행한 터미널에서 눌러 네 노드의 안전 종료 절차를
 ```bash
 cd ~/ai-vision-inspection/ros2_ws && \
 source /opt/ros/jazzy/setup.bash && \
-colcon build --symlink-install && \
+colcon build --symlink-install --cmake-force-configure \
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 && \
 source install/setup.bash
 ```
 
@@ -83,7 +93,8 @@ ros2 launch inspection_bringup inspection_system.launch.py profile:=hardware
 ```bash
 cd ~/ai-vision-inspection/ros2_ws && \
 source /opt/ros/jazzy/setup.bash && \
-colcon build --symlink-install && \
+colcon build --symlink-install --cmake-force-configure \
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 && \
 source install/setup.bash
 ```
 

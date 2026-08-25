@@ -1,0 +1,15 @@
+/inspection/vision_node:
+  ros__parameters:
+    vision.queue.capacity: 16
+    vision.inference_queue_total_timeout_ms: 0
+    vision.inference.station_a.total_timeout_ms: 0
+    vision.inference.station_b.total_timeout_ms: 0
+    vision.result_spool_path: "/tmp/inspection/spool/vision.sqlite3"
+    vision.shutdown.queue_drain_timeout_ms: 3000
+    vision.gpu.sample_interval_ms: 200
+    vision.disk.warning_ratio: 0.90
+    vision.disk.stop_ratio: 0.95
+    vision.timeout_tuning.auto_apply: false
+    vision.timeout_tuning.generated_path: "/tmp/inspection/config/vision_timeout_tuning.json"
+    vision.timeout_tuning.minimum_samples: 10000
+    vision.timeout_tuning.safety_factor: 1.2

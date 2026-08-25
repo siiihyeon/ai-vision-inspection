@@ -1,57 +1,105 @@
 # inspection_vision
 
-Vision은 camera capture, RGB PNG 파일, station-level FrameBatch, bounded FIFO, shared model worker와 station 결과를 소유합니다. 제품 최종 판정은 소유하지 않습니다.
+Vision Node는 HIKROBOT 네 대의 Mono8 촬영, 원자적 PNG 저장, 전처리와
+4-view PatchCore artifact 추론, durable station terminal 발행을 담당합니다.
+제품의 최종 판정과 물리 FIFO는 Master가 소유합니다.
 
-## 골격에 구현된 경계
+## Workflow
 
-- station A/B 각각의 async lock: 같은 station 직렬, 서로 다른 camera set이면 A/B 동시 가능
-- `CaptureBackend` Protocol과 fail-closed placeholder
-- 같은 `capture_id`로 필수 camera 전체 최대 2 attempts
-- `CaptureBatch` identity, 필수 camera, 절대경로, RGB8 PNG, digest/size 검증
-- host arrival monotonic max-min `frame_arrival_skew_us`
-- queue full 시 saved batch 유지, Action `ENQUEUE_BLOCKED`, 복구 후 같은 job enqueue
-- path-only bounded FIFO와 Sensor3 lock 제거
-- shared model `WorkerPool`, model lock 기본 활성, file read 1 retry, inference 1 retry
+```text
+Master CaptureProduct
+  → station/camera lock
+  → GigE Action1 (A 3대 또는 B 1대)
+  → ACK·필수 frame·packet loss 0·host-arrival skew 검증
+  → 2448×2048 Mono8 PNG를 fsync + atomic rename
+  → path-only bounded FIFO enqueue
+  → 카메라별 V threshold와 largest-component crop
+  → black-padding resize → 3-channel 복제 → ImageNet normalize
+  → 카메라별 PatchCore memory bank 추론
+  → threshold 대비 normalized score와 margin으로 view 판정
+  → 하나라도 NG이면 station NG, station score는 normalized score 최댓값
+  → durable spool commit
+  → StationResult 또는 StationInferenceFailed 발행
+```
 
-## 반드시 결정할 Camera/MVS 값
+전경이 검출되지 않으면 정상 판정이 아니라 `PREPROCESSING` 추론 실패입니다.
+`crop_1`과 `crop_2`는 메모리에서만 만들고 NG 또는 전처리 실패 때만
+`vision.data_root/diagnostics` 아래에 저장합니다. 완성 canonical 이미지는
+Vision이 삭제하지 않으며 Log Node가 보존 정책을 소유합니다.
 
-| 항목 | 정확히 필요한 정보 |
-|---|---|
-| 장치 | MV-CS050-10GC 각 serial, station/role, NIC와 IP topology |
-| SDK | Ubuntu 24용 MVS SDK 정확한 version, Python binding/API, camera firmware |
-| Action | 장치별 Action1 지원, `TriggerSource=Action1`, device key, group key/mask, scheduled action 사용 여부 |
-| Network | NIC MTU/jumbo frame, packet size/delay, bandwidth reserve, firewall, reconnect |
-| Pixel | camera Bayer format, exposure/gain, white balance, demosaic algorithm, 출력 2448×2048 RGB8 PNG 확인 |
-| Timing | acquisition timeout, callback의 host arrival 기록 지점, camera raw timestamp unit/wrap/domain |
-| PTP | IEEE1588 지원·동기화 시험 결과와 camera timestamp 사용 가능 여부 |
-| Skew | `frame_arrival_skew_limit_us` production 값과 시험 분포 |
-| Recovery | camera별 장애 판정, 해당 station 시험촬영 성공 조건, late frame 보존 경로 |
+## 카메라 계약
 
-## 반드시 결정할 Queue/Model/파일 값
+| View | Serial | IP | Exposure | Gain |
+|---|---|---|---:|---:|
+| CAM_A_1 | DA9880512 | 192.168.10.13 | 8000 µs | 0 dB |
+| CAM_A_2 | DA9880516 | 192.168.10.11 | 5000 µs | 0 dB |
+| CAM_A_3 | DA7552836 | 192.168.10.14 | 5000 µs | 0 dB |
+| CAM_B_1 | DA7838410 | 192.168.10.12 | 10000 µs | 0 dB |
 
-| 항목 | 정확히 필요한 정보 |
-|---|---|
-| Queue | capacity, enqueue→결과 총 timeout ms, 메모리/디스크 포화 기준 |
-| Worker | production 수, 공유 model thread safety, lock 유지/해제 근거, CPU/GPU affinity |
-| Model | artifact path/version/SHA-256, runtime, device, warmup, 입력 shape/batch |
-| 전처리 | OpenCV load BGR→RGB, resize/crop, scale/normalize, camera order |
-| 판정 | 수학식, score 범위, camera 결과 결합, station threshold, 불확실/오류 처리 |
-| 파일 | `data_root`, attempt/frame naming, temp suffix+fsync+atomic rename, permission |
-| 보존 | 성공/NG/실패/late image 보존 기간, disk warning/stop, Log 삭제 요청 handshake |
+- Host NIC은 `192.168.10.10/24`입니다.
+- 공통 Action DeviceKey는 1, A key/mask는 1/1, B는 2/2입니다.
+- acquisition timeout은 250 ms, frame arrival skew limit은 50 ms,
+  packet delay는 5000 ticks입니다.
+- `ExposureAuto`, `GainAuto`, `BalanceWhiteAuto`와 gamma, saturation,
+  sharpness, black-level 보정은 초기화 때 모두 OFF로 강제합니다. 지원되는
+  boolean node는 read-back까지 검증하고, Mono8에서 숨겨지는 color node는
+  `UNAVAILABLE_IN_MONO8_FEATURE_SET`으로 inventory에 명시합니다.
+- 승인 firmware는 `V4.0.43 250414 1530132`입니다. 초기화 때 네 카메라에서
+  조회한 값이 모두 이 문자열과 정확히 일치해야 합니다.
 
-`StationResult.score`는 유한한 `float32`만 허용합니다. 계산 결과가 `NaN`·`Inf`이면
-`StationResult`를 발행하지 말고 `StationInferenceFailed`로 보고해야 합니다.
-비유한 score가 전송되면 Master는 결과 계약 위반으로 기록하고 해당 제품을
-`FORCED_NG` 처리합니다. score의 수학적 의미·정상 범위·threshold는 별도
-모델 검증으로 확정합니다.
+## Artifact v2 계약
 
-## 필수 구현 순서
+운영 runtime은 `PYTORCH_PATCHCORE_ARTIFACT`입니다. 하나의 versioned bundle에
+`CAM_A_1`, `CAM_A_2`, `CAM_A_3`, `CAM_B_1`의 독립 memory bank와 calibration을
+넣습니다. Vision Node는 완성 artifact만 읽고 memory bank를 만들지 않습니다.
 
-1. fake `CaptureBackend` 통합 test
-2. MVS device enumeration/config/ARM과 GIGE Action adapter
-3. atomic RGB PNG writer + digest/readback
-4. model loader/worker callbacks → `StationResult`/`StationInferenceFailed`
-5. restart recovery: 저장 완료 batch를 재사용하지 않고 제품 잔류 시 재촬영, 이탈 시 FORCED_NG 보고
-6. station camera recovery test capture
+```text
+artifact/
+├── manifest.json
+├── CAM_A_1/{model.pt,calibration.json}
+├── CAM_A_2/{model.pt,calibration.json}
+├── CAM_A_3/{model.pt,calibration.json}
+└── CAM_B_1/{model.pt,calibration.json}
+```
 
-Action 정상 결과는 `error_code=0`, `reason=""`; warning은 `LogEvent`입니다.
+전체 상대경로와 파일 내용을 합산한 SHA-256이 YAML의
+`vision.model.sha256`과 일치해야 합니다. View별 `v_threshold`, 판정 threshold,
+normalized margin은 반드시 artifact manifest에만 존재해야 하며 ROS parameter나
+코드 fallback으로 두지 않습니다. 현재 참고 artifact는 구형 3-view v1이므로
+형식 참고용일 뿐 운영에 직접 배포할 수 없습니다.
+
+## 장애와 session 정책
+
+- 파일 읽기 오류만 한 번 재시도합니다. 전처리, timeout, 모델 오류는
+  같은 입력으로 재시도하지 않습니다.
+- CUDA OOM은 현재 제품의 추론 실패입니다. CPU fallback 없이 Vision을
+  `DEGRADED`로 내리고 대기 queue를 닫으며, Master의 InitializeNode 재시도에서
+  모델·queue·worker를 새 객체로 재생성합니다.
+- terminal 결과는 먼저 SQLite durable spool에 enqueue되어야 합니다.
+  spool commit이 실패하면 terminal ROS message를 억제하고 `DEGRADED`로 전환합니다.
+- 새 session 성공 시 capture idempotency/cancellation/timing cache만 비웁니다.
+  아직 Log ACK를 받지 않은 spool record는 session을 넘어 보존합니다.
+- A/B queue total timeout 초기값은 각각 3000/1500 ms입니다. 각 station 정상
+  표본 10,000개 전에는 후보만 기록하며, 자동 적용은 기본적으로 꺼져 있습니다.
+
+## 검증
+
+```bash
+cd ros2_ws
+source /opt/ros/jazzy/setup.bash
+/usr/bin/python3 tools/verify_skeleton.py
+/usr/bin/python3 tools/test_domain_contracts.py
+/usr/bin/python3 tools/test_vision_algorithms.py
+colcon build --symlink-install --cmake-force-configure \
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
+source install/setup.bash
+colcon test --python-testing pytest --return-code-on-test-failure \
+  --event-handlers console_direct+
+colcon test-result --verbose
+```
+
+Ubuntu에 `/usr/local/bin/python3`가 함께 설치되어 있으면 ROS의 `em` module과
+충돌할 수 있으므로 colcon에는 위처럼 `/usr/bin/python3`를 명시합니다.
+
+구현 상태와 실장비 투입 전 남은 차단 사항은
+[README_COMPLETION_CHECKLIST.md](README_COMPLETION_CHECKLIST.md)를 따릅니다.

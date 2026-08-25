@@ -1,47 +1,54 @@
-# 상세설계 현재 상태
+# Vision Node 2 정책 기준
 
-이 폴더의 표와 문서는 구현 근거입니다. 다만 일부 XLSX 원본에는 수정 전 하드웨어 트리거·조명 제어 표현이 남아 있습니다. 해당 표현은 폐기되었으며 **현재 코드 baseline, 이 README, v2로 정정된 `노드별_책임과_상태_소유권.md`가 우선**합니다. `06_코드_골격_완성을_위한_필수_결정사항.md`는 질의 과정의 상세 기록이라 서로 다른 시점의 미결정 표기가 남아 있을 수 있습니다.
+이 문서는 `feature/vision-node-2` 구현의 승인 정책 요약입니다. 과거 XLSX나 질의 기록에 RGB/Bayer, inference retry, confusion matrix가 남아 있으면 현재 코드와 이 문서가 우선합니다.
 
-## 문서 우선순위
+Vision Node의 모든 미결정값과 수정 위치는 [Vision Node 완성 결정표](../ros2_ws/src/nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)가 단일 기준입니다. 이 문서는 노드 간 책임과 승인 정책만 요약하며 파라미터 목록을 중복 관리하지 않습니다.
 
-1. 현재 `inspection_interfaces 2.0.0`과 실행 코드
-2. 이 README의 승인사항 및 폴더별 결정표
-3. `노드별_책임과_상태_소유권.md`의 v2 촬영 정책
-4. `06_코드_골격_완성을_위한_필수_결정사항.md`의 상세 배경
-5. XLSX 원본은 영향받지 않은 물리 흐름 참고용
+## 책임과 판정
 
-## 승인되어 v2 골격에 반영된 사항
+- Vision은 A 세 장과 B 한 장을 각각 station job으로 추론합니다. 제품 최종 판정은 Master가 소유합니다.
+- A는 세 장을 `[3,1,H,W]` 한 batch로 한 번 forward합니다. B는 `[1,1,H,W]`입니다.
+- A 첫 NG는 terminal이며 PASS로 수정할 수 없습니다. 즉시 Master에 전송되고 B는 단계별 취소됩니다.
+- B active forward는 강제 종료하지 않습니다. 완료 결과만 버립니다.
+- Sensor3 통과 순간 결과가 없으면 Master가 FORCED_NG로 잠급니다. 이후 Vision 결과는 공정에 적용하지 않습니다.
+- Vision 종료 순간 station의 `PositionSettled`가 이미 확인된 제품만 잔류로 고정해 재촬영합니다. 당시 모터가 감속/이동 중이었다면 이후 정지하더라도 비잔류로 보고 재촬영하지 않고 station 실패 처리합니다.
+- timeout/file read/model/CUDA OOM 등 모든 terminal error는 해당 제품 NG 근거입니다. file read만 1회 재시도하고 model/timeout은 재시도하지 않습니다.
 
-- HIKROBOT MVS `GIGE_ACTION_COMMAND` broadcast, LED software control 없음
-- Capture 성공점: 필수 frame의 RGB PNG 저장·검증 및 FrameBatch 경로 enqueue 완료
-- `frame_arrival_skew_us`: host receive monotonic timestamp의 max-min
-- camera raw timestamp/domain과 host wall/monotonic timestamp 모두 보존
-- same `capture_id`, station 전체 재촬영, 최대 2 attempts
-- Vision restart 후 제품이 station에 있으면 재촬영, 떠났으면 station 실패→FORCED_NG
-- Queue full: 저장 FrameBatch 보존, Action `ENQUEUE_BLOCKED`, Master PAUSED, 복구 후 같은 batch enqueue
-- station-level `InferenceJob`, path-only FIFO, `fifo_sequence`, shared model, worker 병렬
-- 파일 read 1회 재시도, inference 1회 재시도
-- 추론 timeout 경과는 enqueue부터 결과 확정까지 Queue 총시간으로 측정; 제품 결과 적용 deadline은 Sensor3
-- A/B 결합과 최종 잠금은 Master, 늦은 결과는 진단 보존 후 적용 금지
-- `warning_codes` 없음; warning은 `LogEvent`
-- UUIDv4 session/command/node instance, SHA-256 digest, epoch invalidation, 500/2000 ms Heartbeat
-- SQLite commit 후 Log ACK, producer local SQLite spool, approved v2 table families/QoS
-- Capture 성공 응답은 `error_code=0`, `reason=""`; 실패만 구체 error와 사람이 읽을 수 있는 reason 사용
-- 수정 레퍼런스의 `RUN_SYS/PAUSING/FAULT_STOP/RESETTING`, pause reason, physical zone 명칭 반영
+## 촬영과 파일
 
-## 최종 구현 전에 반드시 받을 결정 묶음
+- Camera: Station A `DA9880512`, `DA9880516`, `DA7552836`; Station B `DA7838410`.
+- IP: `.13`, `.11`, `.14`, `.12` in `192.168.10.0/24`.
+- 입력 전체 ROI `2448×2048@(0,0)`, raw/store `Mono8`, canonical 1-channel PNG. RGB 변환은 하지 않습니다.
+- Action1은 DeviceKey 1, A key/mask 1/1, B 2/2의 즉시 command이며 PTP 상태와 무관하게 host monotonic arrival skew를 사용합니다.
+- packet loss는 frame별 미복구 count가 반드시 0이어야 합니다. 재전송 count는 별도 telemetry로 보존합니다.
+- 같은 capture ID, station 전체를 최대 2 attempts. 완성 파일은 Vision이 삭제하지 않고 Log만 최근 10,000장 정책으로 삭제합니다.
+- disk 90% warning, 95% 신규 촬영 중지와 PAUSE.
 
-| 묶음 | 필요한 정확한 값 |
-|---|---|
-| 제품·물리 FSM | Sensor1/2/3 명칭·polarity·제품 매핑, `product_id` 생성/복구, `fifo_sequence` 영속화, station/actuator 위치와 conveyor 매핑 |
-| Control 전장 | Mega port/baud, packet schema·CRC·ACK·retry/watchdog, pin map, sensor debounce/rearm/stuck, TB6600 calibration·속도·가감속, actuator timing/feedback |
-| Camera | station별 camera serial/role, MVS SDK/firmware, Action key/group/mask, Action1/PTP 지원 시험, acquisition timeout, Bayer/pixel-format 설정 |
-| Timestamp/skew | camera timestamp domain/PTP 사용 여부, host arrival 기록 지점, `frame_arrival_skew_us` 허용치 |
-| Vision 파일 | `data_root`, 폴더/파일 naming, fsync/rename 규칙, disk threshold, late/failed attempt 보존 기간 |
-| Queue/worker | production queue capacity, worker 수, Queue 총 timeout ms, model thread safety 확인 후 lock 유지 여부 |
-| 모델 | 파일/버전/digest, 입력 크기·정규화·BGR→RGB 위치, 수학식, camera 결과→station 결과 결합, threshold/calibration, score schema |
-| Master 정책 | 초기화 순서·retry/전체 상태 전이, 각 timeout/복구 횟수, Sensor3 매핑, actuator 명령 시점과 late result 진단 정책 |
-| Log 운영 | DB/spool 경로, 용량 경고·정지 기준, 보존/삭제 기간, projection mapping/query, backup/복구 |
-| 복구 시험 | camera station 시험촬영 판정, Mega reconnect, node restart별 제품 위치 판별 방법과 운영자 승인 흐름 |
+## 모델과 GPU
 
-세부 키는 각 ROS package README에 중복 없이 배정되어 있습니다. 모든 생산값은 `hardware.yaml`에 반영하고 config digest를 다시 생성해야 합니다.
+- A/B는 하나의 versioned PatchCore v2 bundle을 사용하되 네 view별 memory bank와 threshold를 독립 보관하고, 한 session 동안 version/통합 SHA-256을 고정합니다.
+- 실제 resize/normalization/input-output decoder는 추후 주입합니다. 전처리 파일은 보존하지 않습니다.
+- CUDA 필수, CPU fallback 금지. CUDA OOM은 현재 제품 실패 후 PAUSE/재초기화입니다.
+- RTX 5070 Laptop GPU 8,151 MiB 기준으로 batch 3의 실제 VRAM/latency를 시험합니다. 현재 골격이 안전 용량을 보장하는 것은 아닙니다.
+- warmup 기본 10회, NVML GPU/VRAM sample 200 ms입니다. 최초값은 queue 16, model lock 활성화, worker 1이며 실험 후 조정합니다.
+
+## 종료, replay, 보고서
+
+- 프로그램 종료가 운전 종료입니다. 정상 종료는 waiting job 취소, active forward 3초 soft timeout 후에도 완료까지 대기합니다.
+- 비정상 종료 session은 CSV/보고서를 복구 생성하지 않고 timeout tuning에서 제외합니다. 원본 SQLite audit는 유지합니다.
+- Vision terminal은 local spool 선기록 후 ROS publish합니다. Log commit/ACK 전에는 spool에서 지우지 않습니다.
+- 같은 Master session의 Vision/Log restart만 replay합니다. Master restart 이전 session은 공정 판정에 재사용하지 않습니다.
+- 정상 종료 CSV에는 제품 순서·A/B 결과·오류·forward·enqueue→결과·제품 전체 시간을 기록합니다. Summary에는 GPU/VRAM과 timeout 통계를 기록합니다. 정답 label 기반 confusion matrix/accuracy/precision/recall/F1은 만들지 않습니다.
+
+## Timeout과 queue
+
+- A/B enqueue→결과 p99.9를 분리 계산합니다. 최소 표본은 station별 10,000, 후보는 p99.9×1.2입니다.
+- 자동 적용은 기본 false. true여도 같은 model version/SHA-256/config fingerprint일 때만 다음 정상 실행에 적용합니다.
+- Queue 시작식: `capacity >= ceil(λjob × T최악 × 안전계수)`. `λjob`은 최대 제품 유입률에 제품당 실제 발생 job 수(A=1, A PASS일 때 B=1)를 반영합니다. model lock이 켜졌으면 worker 수가 많아도 forward 처리율이 직렬이라는 점과 GPU memory 한계를 함께 검증합니다.
+- Capture timeout 후보는 `평균 acquisition × 2 + save overhead + validation`을 기록합니다.
+
+## 실제 장비 전에 남은 결정/시험
+
+- Camera/MVS, 모델, queue, 파일의 전체 입력은 Vision Node 완성 결정표를 따릅니다.
+- 핵심 차단 항목은 firmware/runtime 실측, Host NIC 설정, exposure/gain/acquisition/skew, 실제 모델 입출력·전처리·threshold, 최대 제품 유입속도와 A/B timeout입니다.
+- Mega serial 방식과 firmware protocol은 Vision 내부 알고리즘에는 필요 없지만 전체 라인 Sensor3/재시작 잔류 판정 통합에는 반드시 필요

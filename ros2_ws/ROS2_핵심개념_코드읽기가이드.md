@@ -1,6 +1,6 @@
 # ROS 2 코드 개념 사전
 
-> **v2 기준 안내:** 이 문서는 `inspection_interfaces 2.0.0`과 현재 v2 Python 골격을 기준으로 정리한 학습 자료입니다. 인터페이스 필드의 최종 정본은 `.msg`, `.srv`, `.action` 파일이며, Python 상태값의 정본은 `inspection_common/constants.py`입니다.
+> **v2.1 기준 안내:** 이 문서는 `inspection_interfaces 2.1.0`과 현재 Python 골격을 기준으로 정리한 학습 자료입니다. 인터페이스 필드의 최종 정본은 `.msg`, `.srv`, `.action` 파일이며, Python 상태값의 정본은 `inspection_common/constants.py`입니다.
 
 > AI 비전 검사 시스템의 ROS 2 코드를 읽다가 모르는 용어·함수·구조가 나왔을 때 찾아보는 사전형 문서
 

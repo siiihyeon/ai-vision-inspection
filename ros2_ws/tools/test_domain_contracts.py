@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import struct
 import sys
 import tempfile
@@ -32,10 +33,13 @@ from inspection_common import (  # noqa: E402
     StationId,
     SystemState,
     Verdict,
+    canonical_json,
     payload_digest,
+    sha256_text,
 )
 from inspection_common.log_spool import DurableLogSpool, SpoolRecord  # noqa: E402
 from inspection_log.storage import LogRepository, StoredLogEvent  # noqa: E402
+from inspection_log.reporting import generate_session_report  # noqa: E402
 from inspection_master.operation_runtime import (  # noqa: E402
     EquipmentSnapshot,
     build_late_operation_diagnostic,
@@ -65,21 +69,40 @@ from inspection_master.worker_supervision import (  # noqa: E402
     WorkerInitPhase,
     WorkerRuntimeState,
 )
-from inspection_vision.capture_contract import CaptureBatch, ImageArtifact  # noqa: E402
+from inspection_vision.capture_contract import (  # noqa: E402
+    CaptureBatch,
+    ImageArtifact,
+    MONO8_PNG,
+    RGB8_PNG,
+    write_mono8_png_atomic,
+)
+from inspection_vision.hikrobot_mvs import (  # noqa: E402
+    ActionGroup,
+    CameraAcquisitionSettings,
+    CameraInventoryEntry,
+    MvsBackendSettings,
+    MvsSdkError,
+    validate_camera_inventory,
+)
 from inspection_vision.inference_queue import (  # noqa: E402
+    InferenceFailureKind,
     InferenceJob,
     InferenceQueue,
     WorkerPool,
 )
 
 
-def make_rgb8_png(width: int = 1, height: int = 1) -> bytes:
+def make_png(pixel_format: str, width: int = 1, height: int = 1) -> bytes:
     def chunk(kind: bytes, data: bytes) -> bytes:
         checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
 
-    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    scanlines = b"".join(b"\x00" + b"\x00\x00\x00" * width for _ in range(height))
+    channels = 1 if pixel_format == MONO8_PNG else 3
+    color_type = 0 if pixel_format == MONO8_PNG else 2
+    header = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    scanlines = b"".join(
+        b"\x00" + b"\x00" * channels * width for _ in range(height)
+    )
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", header)
@@ -584,6 +607,32 @@ class MasterContractTests(unittest.TestCase):
         self.assertEqual(locked.verdict, Verdict.FORCED_NG)
         self.assertIn("final capture failed", locked.reason)
 
+    def test_station_a_terminal_ng_skips_station_b_and_cannot_be_revised(self) -> None:
+        context = ProductLedger().register("terminal-ng", 1)
+        context.record_sensor(1, "sensor1-terminal-ng", 100)
+        self._complete_station(context, StationId.A, verdict=Verdict.NG)
+        self.assertTrue(context.request_station_b_skip("Station A terminal NG"))
+        context.accept_sensor2("sensor2-terminal-ng", 200)
+        self.assertEqual(context.physical_state, ProductPhysicalState.SENSOR3_WAIT)
+        self.assertEqual(
+            context.station(StationId.B).process_state,
+            StationProcessState.SKIPPED,
+        )
+        with self.assertRaises(StationResultConflict):
+            context.apply_station_result(
+                StationDecision(
+                    StationId.A,
+                    Verdict.PASS,
+                    2,
+                    "capture-a-terminal-ng",
+                    "job-a",
+                    "batch-a",
+                )
+            )
+        locked = context.lock_at_sensor3("sensor3-terminal-ng", 300)
+        self.assertIn(locked.verdict, {Verdict.NG, Verdict.FORCED_NG})
+        self.assertFalse(locked.station_b_completed)
+
     def test_vision_result_can_precede_capture_action_result(self) -> None:
         context = ProductLedger().register("race-product", 1)
         context.record_sensor(1, "sensor1-race", 100)
@@ -970,7 +1019,7 @@ class VisionContractTests(unittest.TestCase):
         queue = InferenceQueue(capacity=1)
         shared_model = object()
         successes: list[str] = []
-        failures: list[tuple[str, str]] = []
+        failures: list[tuple[str, InferenceFailureKind, str]] = []
         completed = threading.Event()
 
         def infer(model: object, _images: tuple[bytes, ...]) -> str:
@@ -982,14 +1031,14 @@ class VisionContractTests(unittest.TestCase):
             queue=queue,
             model=shared_model,
             worker_count=1,
-            load_image=lambda _path: b"rgb",
+            load_image=lambda _path: b"mono",
             infer=infer,
             on_success=lambda job, _result: (
                 successes.append(job.inference_job_id),
                 completed.set(),
             ),
-            on_failure=lambda job, reason: (
-                failures.append((job.inference_job_id, reason)),
+            on_failure=lambda job, failure: (
+                failures.append((job.inference_job_id, failure.kind, failure.reason)),
                 completed.set(),
             ),
         )
@@ -1003,10 +1052,146 @@ class VisionContractTests(unittest.TestCase):
         self.assertTrue(completed.wait(1.0))
         pool.stop()
         self.assertEqual(successes, [])
-        self.assertEqual(failures, [("job-1", "queue total inference timeout")])
+        self.assertEqual(
+            failures,
+            [("job-1", InferenceFailureKind.TIMEOUT, "queue total inference timeout")],
+        )
 
-    def test_capture_batch_validates_rgb_png_digest_and_host_skew(self) -> None:
-        png = make_rgb8_png()
+    def test_active_forward_finishes_but_result_is_discarded_after_cancel(self) -> None:
+        queue = InferenceQueue(capacity=1)
+        forward_started = threading.Event()
+        release_forward = threading.Event()
+        terminal = threading.Event()
+        successes: list[str] = []
+        canceled: list[tuple[str, str]] = []
+
+        def infer(_model: object, _images: tuple[bytes, ...]) -> str:
+            forward_started.set()
+            release_forward.wait(1.0)
+            return "PASS"
+
+        pool: WorkerPool[object, bytes, str] = WorkerPool(
+            queue=queue,
+            model=object(),
+            worker_count=1,
+            load_image=lambda _path: b"mono",
+            infer=infer,
+            on_success=lambda job, _result: successes.append(job.inference_job_id),
+            on_failure=lambda _job, _failure: terminal.set(),
+            on_canceled=lambda job, stage: (
+                canceled.append((job.inference_job_id, stage)),
+                terminal.set(),
+            ),
+        )
+        job = self._job(1, product="cancel-active")
+        self.assertTrue(queue.try_enqueue(job))
+        pool.start()
+        self.assertTrue(forward_started.wait(1.0))
+        self.assertEqual(queue.cancel_scope("cancel-active", 1), ())
+        release_forward.set()
+        self.assertTrue(terminal.wait(1.0))
+        pool.stop()
+        self.assertEqual(successes, [])
+        self.assertEqual(canceled, [("job-1", "DISCARDED_AFTER_FORWARD")])
+
+    def test_model_failure_is_not_retried(self) -> None:
+        queue = InferenceQueue(capacity=1)
+        attempts = 0
+        completed = threading.Event()
+        failures: list[InferenceFailureKind] = []
+
+        def infer(_model: object, _images: tuple[bytes, ...]) -> str:
+            nonlocal attempts
+            attempts += 1
+            raise RuntimeError("model failed")
+
+        pool: WorkerPool[object, bytes, str] = WorkerPool(
+            queue=queue,
+            model=object(),
+            worker_count=1,
+            load_image=lambda _path: b"mono",
+            infer=infer,
+            on_success=lambda _job, _result: None,
+            on_failure=lambda _job, failure: (
+                failures.append(failure.kind),
+                completed.set(),
+            ),
+        )
+        self.assertTrue(queue.try_enqueue(self._job(1)))
+        pool.start()
+        self.assertTrue(completed.wait(1.0))
+        pool.stop()
+        self.assertEqual(attempts, 1)
+        self.assertEqual(failures, [InferenceFailureKind.MODEL])
+
+    def test_preprocessing_failure_is_not_retried_or_misclassified(self) -> None:
+        class ForegroundMissing(RuntimeError):
+            is_preprocessing_failure = True
+
+        queue = InferenceQueue(capacity=1)
+        attempts = 0
+        completed = threading.Event()
+        failures: list[InferenceFailureKind] = []
+
+        def load(_path: Path) -> bytes:
+            nonlocal attempts
+            attempts += 1
+            raise ForegroundMissing("no foreground")
+
+        pool: WorkerPool[object, bytes, str] = WorkerPool(
+            queue=queue,
+            model=object(),
+            worker_count=1,
+            load_image=load,
+            infer=lambda _model, _images: "PASS",
+            on_success=lambda _job, _result: None,
+            on_failure=lambda _job, failure: (
+                failures.append(failure.kind),
+                completed.set(),
+            ),
+        )
+        self.assertTrue(queue.try_enqueue(self._job(1)))
+        pool.start()
+        self.assertTrue(completed.wait(1.0))
+        pool.stop()
+        self.assertEqual(attempts, 1)
+        self.assertEqual(failures, [InferenceFailureKind.PREPROCESSING])
+
+    def test_cuda_out_of_memory_is_fail_closed_and_not_retried(self) -> None:
+        class FakeOutOfMemoryError(RuntimeError):
+            pass
+
+        queue = InferenceQueue(capacity=1)
+        attempts = 0
+        completed = threading.Event()
+        failures: list[InferenceFailureKind] = []
+
+        def infer(_model: object, _images: tuple[bytes, ...]) -> str:
+            nonlocal attempts
+            attempts += 1
+            raise FakeOutOfMemoryError("synthetic allocation failure")
+
+        pool: WorkerPool[object, bytes, str] = WorkerPool(
+            queue=queue,
+            model=object(),
+            worker_count=1,
+            load_image=lambda _path: b"mono",
+            infer=infer,
+            on_success=lambda _job, _result: None,
+            on_failure=lambda _job, failure: (
+                failures.append(failure.kind),
+                completed.set(),
+            ),
+        )
+        self.assertTrue(queue.try_enqueue(self._job(1)))
+        pool.start()
+        self.assertTrue(completed.wait(1.0))
+        pool.stop()
+        self.assertEqual(attempts, 1)
+        self.assertEqual(failures, [InferenceFailureKind.CUDA_OOM])
+
+    def test_capture_batch_validates_mono_png_digest_and_host_skew(self) -> None:
+        png = make_png(MONO8_PNG)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "image.png"
             path.write_bytes(png)
@@ -1019,13 +1204,15 @@ class VisionContractTests(unittest.TestCase):
                     file_size_bytes=len(png),
                     width=1,
                     height=1,
-                    pixel_format="RGB8_PNG",
+                    pixel_format=MONO8_PNG,
                     camera_timestamp_raw=index,
                     camera_timestamp_domain="DEVICE_TICKS_UNSYNCED",
                     camera_timestamp_ns=index,
                     camera_timestamp_synchronized=False,
                     host_arrival_monotonic_ns=1_000_000 + index * 5_000,
                     host_arrival_timestamp_ns=1_000_000 + index * 5_000,
+                    packet_loss_count=0,
+                    packet_resend_count=0,
                 )
                 for index, camera in enumerate(("camera-a", "camera-b"))
             )
@@ -1041,11 +1228,309 @@ class VisionContractTests(unittest.TestCase):
                 trigger_returned_wall_time_ns=950_000,
                 images=artifacts,
             )
-            batch.validate(("camera-a", "camera-b"))
+            batch.validate(
+                ("camera-a", "camera-b"), expected_pixel_format=MONO8_PNG
+            )
             self.assertEqual(batch.frame_arrival_skew_us, 5)
+
+            with self.assertRaisesRegex(ValueError, "unrecovered packet loss"):
+                replace(
+                    batch,
+                    images=(replace(artifacts[0], packet_loss_count=1), artifacts[1]),
+                ).validate(("camera-a", "camera-b"), expected_pixel_format=MONO8_PNG)
+
+    def test_capture_batch_rejects_declared_mono_with_rgb_png(self) -> None:
+        png = make_png(RGB8_PNG)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rgb.png"
+            path.write_bytes(png)
+            artifact = ImageArtifact(
+                camera_id="camera-a",
+                file_path=str(path.resolve()),
+                sha256=hashlib.sha256(png).hexdigest(),
+                file_size_bytes=len(png),
+                width=1,
+                height=1,
+                pixel_format=MONO8_PNG,
+                camera_timestamp_raw=1,
+                camera_timestamp_domain="DEVICE_TICKS_UNSYNCED",
+                camera_timestamp_ns=1,
+                camera_timestamp_synchronized=False,
+                host_arrival_monotonic_ns=1,
+                host_arrival_timestamp_ns=1,
+                packet_loss_count=0,
+                packet_resend_count=0,
+            )
+            batch = CaptureBatch(
+                product_id="product",
+                station_id=1,
+                capture_id="capture",
+                frame_batch_id="batch",
+                attempt=1,
+                trigger_requested_monotonic_ns=1,
+                trigger_returned_monotonic_ns=2,
+                trigger_requested_wall_time_ns=1,
+                trigger_returned_wall_time_ns=2,
+                images=(artifact,),
+            )
+            with self.assertRaisesRegex(ValueError, "color type"):
+                batch.validate(("camera-a",), expected_pixel_format=MONO8_PNG)
+
+    def test_atomic_mono8_png_writer_refuses_completed_file_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / "mono.png"
+            digest, size_bytes = write_mono8_png_atomic(
+                path, bytes((0, 64, 128, 255)), 2, 2
+            )
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+            self.assertEqual(path.stat().st_size, size_bytes)
+            with self.assertRaises(FileExistsError):
+                write_mono8_png_atomic(path, bytes(4), 2, 2)
+            self.assertFalse(any(path.parent.glob("*.part")))
+
+    @staticmethod
+    def _mvs_inventory(firmware_a: str, firmware_b: str | None = None):
+        serials = ("A1", "A2", "A3", "B1")
+        addresses = ("192.168.10.13", "192.168.10.11", "192.168.10.14", "192.168.10.12")
+        return tuple(
+            CameraInventoryEntry(
+                serial=serial,
+                station_id=1 if index < 3 else 2,
+                ip_address=addresses[index],
+                model_name="MV-CS050-10GC",
+                firmware_version=(
+                    firmware_b if index == 3 and firmware_b is not None else firmware_a
+                ),
+            )
+            for index, serial in enumerate(serials)
+        )
+
+    def test_mvs_firmware_empty_expectation_requires_four_versions_to_match(self) -> None:
+        entries = self._mvs_inventory("V1.2.3")
+        network_map = {entry.serial: entry.ip_address for entry in entries}
+        version = validate_camera_inventory(
+            entries,
+            expected_serials=("A1", "A2", "A3", "B1"),
+            expected_network_map=network_map,
+            expected_model="MV-CS050-10GC",
+            expected_firmware_version="",
+        )
+        self.assertEqual(version, "V1.2.3")
+
+        with self.assertRaisesRegex(MvsSdkError, "firmware versions differ"):
+            validate_camera_inventory(
+                self._mvs_inventory("V1.2.3", "V1.2.4"),
+                expected_serials=("A1", "A2", "A3", "B1"),
+                expected_network_map=network_map,
+                expected_model="MV-CS050-10GC",
+                expected_firmware_version="",
+            )
+
+    def test_mvs_firmware_exact_expectation_is_fail_closed(self) -> None:
+        entries = self._mvs_inventory("V4.0.43 250414 1530132")
+        network_map = {entry.serial: entry.ip_address for entry in entries}
+        version = validate_camera_inventory(
+            entries,
+            expected_serials=("A1", "A2", "A3", "B1"),
+            expected_network_map=network_map,
+            expected_model="MV-CS050-10GC",
+            expected_firmware_version="V4.0.43 250414 1530132",
+        )
+        self.assertEqual(version, "V4.0.43 250414 1530132")
+        with self.assertRaisesRegex(MvsSdkError, "configured expected version"):
+            validate_camera_inventory(
+                entries,
+                expected_serials=("A1", "A2", "A3", "B1"),
+                expected_network_map=network_map,
+                expected_model="MV-CS050-10GC",
+                expected_firmware_version="V4.0.44",
+            )
+
+    def test_mvs_action_groups_and_initial_operating_defaults(self) -> None:
+        settings = MvsBackendSettings(
+            station_camera_ids={1: ("A1", "A2", "A3"), 2: ("B1",)},
+            camera_network_map={
+                "A1": "192.168.10.13",
+                "A2": "192.168.10.11",
+                "A3": "192.168.10.14",
+                "B1": "192.168.10.12",
+            },
+            camera_acquisition_settings={
+                serial: CameraAcquisitionSettings(5000.0, 0.0)
+                for serial in ("A1", "A2", "A3", "B1")
+            },
+            action_device_key=1,
+            action_groups={1: ActionGroup(1, 1), 2: ActionGroup(2, 2)},
+            data_root=Path(tempfile.gettempdir()).resolve() / "inspection-images",
+            acquisition_timeout_ms=250,
+        )
+        settings.validate()
+        self.assertEqual(settings.packet_size, 1500)
+        self.assertEqual(settings.acquisition_timeout_ms, 250)
+        self.assertEqual(settings.action_groups[1], ActionGroup(1, 1))
+        self.assertEqual(settings.action_groups[2], ActionGroup(2, 2))
+
+        config_root = (
+            WORKSPACE
+            / "src"
+            / "basic_packages"
+            / "inspection_bringup"
+            / "config"
+        )
+        capture_config = (config_root / "vision_capture.hardware.yaml").read_text(
+            encoding="utf-8"
+        )
+        runtime_config = (config_root / "vision_runtime.hardware.yaml").read_text(
+            encoding="utf-8"
+        )
+        model_config = (config_root / "vision_model.hardware.yaml").read_text(
+            encoding="utf-8"
+        )
+        for expected_line in (
+            "vision.image.sensor_width: 2448",
+            "vision.image.sensor_height: 2048",
+            "vision.gige_action.station_a.group_key: 1",
+            "vision.gige_action.station_b.group_key: 2",
+            'vision.camera.expected_firmware_version: "V4.0.43 250414 1530132"',
+            'vision.nic.ipv4: "192.168.10.10"',
+            "vision.nic.prefix_length: 24",
+            "vision.frame_arrival_skew_limit_us: 50000",
+            "vision.capture.acquisition_timeout_ms: 250",
+        ):
+            self.assertIn(expected_line, capture_config)
+        hardware_config = (config_root / "hardware.yaml").read_text(encoding="utf-8")
+        self.assertIn('control.mega.port: "/dev/ttyACM0"', hardware_config)
+        self.assertIn("control.mega.baud_rate: 115200", hardware_config)
+        self.assertIn("vision.queue.capacity: 16", runtime_config)
+        self.assertIn("vision.inference.station_a.total_timeout_ms: 3000", runtime_config)
+        self.assertIn("vision.inference.station_b.total_timeout_ms: 1500", runtime_config)
+        self.assertIn("vision.worker_count: 1", model_config)
+        self.assertIn("vision.model.serialize_access: true", model_config)
 
 
 class LogContractTests(unittest.TestCase):
+    @staticmethod
+    def _durable_event(
+        *, event_type: str, payload: dict[str, object], log_id: str
+    ) -> StoredLogEvent:
+        envelope = {
+            "schema_version": 2,
+            "event_type": event_type,
+            "severity": 20,
+            "source_node": "vision",
+            "producer_instance_id": "vision-instance",
+            "session_id": "session-1",
+            "product_id": str(payload.get("product_id", "")),
+            "payload": payload,
+        }
+        payload_json = canonical_json(envelope)
+        return StoredLogEvent(
+            log_id=log_id,
+            revision=1,
+            severity=20,
+            event_type=event_type,
+            source_node="vision",
+            producer_instance_id="vision-instance",
+            product_id=str(payload.get("product_id", "")),
+            payload_json=payload_json,
+            payload_digest=sha256_text(payload_json),
+            occurred_at_ns=1,
+        )
+
+    def test_durable_vision_terminal_can_be_replayed_and_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = LogRepository(root / "log.sqlite3")
+            result_payload = {
+                "product_id": "product-1",
+                "fifo_sequence": 1,
+                "station_id": 1,
+                "capture_id": "capture-a",
+                "frame_batch_id": "batch-a",
+                "inference_job_id": "job-a",
+                "result_revision": 1,
+                "verdict": int(Verdict.NG),
+                "score": 0.9,
+                "model_version": "Model_v_1",
+                "model_sha256": "0" * 64,
+                "config_fingerprint": "1" * 64,
+                "model_forward_ms": 2.0,
+                "enqueue_to_result_ms": 3.0,
+                "capture_completed_monotonic_ns": 10,
+                "completed_monotonic_ns": 20,
+                "image_paths": [],
+            }
+            repository.append_event(
+                self._durable_event(
+                    event_type="VISION_STATION_RESULT_DURABLE",
+                    payload=result_payload,
+                    log_id="vision-result",
+                )
+            )
+            terminals, has_more = repository.replay_station_terminals(
+                "session-1", 100
+            )
+            self.assertFalse(has_more)
+            self.assertEqual(len(terminals), 1)
+            self.assertEqual(terminals[0].inference_job_id, "job-a")
+            report = generate_session_report(
+                repository,
+                session_id="session-1",
+                report_root=root / "reports",
+                timeout_tuning_path=root / "tuning.json",
+                auto_apply_timeouts=False,
+                minimum_samples=10000,
+                safety_factor=1.2,
+            )
+            self.assertTrue(report.csv_path.is_file())
+            self.assertTrue(report.summary_path.is_file())
+            self.assertIsNone(report.tuning_path)
+            tuned = generate_session_report(
+                repository,
+                session_id="session-1",
+                report_root=root / "reports-auto",
+                timeout_tuning_path=root / "tuning.json",
+                auto_apply_timeouts=True,
+                minimum_samples=1,
+                safety_factor=1.2,
+            )
+            self.assertIsNone(tuned.tuning_path)
+            self.assertFalse((root / "tuning.json").exists())
+
+            station_b_payload = dict(result_payload)
+            station_b_payload.update(
+                {
+                    "station_id": 2,
+                    "capture_id": "capture-b",
+                    "frame_batch_id": "batch-b",
+                    "inference_job_id": "job-b",
+                    "enqueue_to_result_ms": 2.0,
+                }
+            )
+            repository.append_event(
+                self._durable_event(
+                    event_type="VISION_STATION_RESULT_DURABLE",
+                    payload=station_b_payload,
+                    log_id="vision-result-b",
+                )
+            )
+            tuned = generate_session_report(
+                repository,
+                session_id="session-1",
+                report_root=root / "reports-auto-complete",
+                timeout_tuning_path=root / "tuning.json",
+                auto_apply_timeouts=True,
+                minimum_samples=1,
+                safety_factor=1.2,
+            )
+            self.assertEqual(tuned.tuning_path, root / "tuning.json")
+            tuning_document = json.loads(
+                (root / "tuning.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(tuning_document["timeouts_ms"]["station_a"], 4)
+            self.assertEqual(tuning_document["timeouts_ms"]["station_b"], 3)
+            repository.close()
+
     def test_repository_replacement_can_close_previous_connection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database_path = Path(directory) / "log.sqlite3"
