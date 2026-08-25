@@ -21,7 +21,7 @@
 //    -> Conveyor 2 does NOT stop.
 //
 // 5) Control Node sends ACTUATE|1 for defective product.
-//    -> continuous-rotation MG996R reject cycle runs non-blocking.
+//    -> angle-controlled MG996R moves 0 deg -> 70 deg -> waits -> 0 deg.
 //    ACTUATE|2 = normal/pass, no servo motion.
 //
 // Serial framing is compatible with the existing CRC protocol:
@@ -73,7 +73,7 @@ AccelStepper conveyor1(AccelStepper::DRIVER, CONV1_STEP, CONV1_DIR);
 AccelStepper conveyor2(AccelStepper::DRIVER, CONV2_STEP, CONV2_DIR);
 
 // Values confirmed in the component-test sketch.
-const long CONV1_SPEED = -3000;
+const long CONV1_SPEED = 3000;
 const long CONV2_SPEED = -3000;
 
 const long CONV_MAX_SPEED = 10000;
@@ -103,18 +103,20 @@ const float MAX_VALID_DISTANCE_CM = 80.0f;
 
 
 // ============================================================
-// 4. Servo parameters
-//    These values preserve the successful continuous-rotation test.
+// 4. Servo parameters - angle-controlled MG996R
+//    Values copied from the successful angle-control test.
 // ============================================================
 
 Servo sorterServo;
 
-const int SERVO_STOP    = 90;
-const int SERVO_FORWARD = 150;
-const int SERVO_REVERSE = 50;
+const int SERVO_HOME_ANGLE = 0;
+const int SERVO_WORK_ANGLE = 70;
 
-const unsigned long SERVO_MOVE_TIME_MS = 3000UL;
-const unsigned long SERVO_WAIT_TIME_MS = 500UL;
+// Time allowed for the servo to physically reach each angle.
+const unsigned long SERVO_MOVE_DELAY_MS = 500UL;
+
+// Time to keep the reject arm at the work angle.
+const unsigned long SERVO_WAIT_TIME_MS = 3000UL;
 
 
 // ============================================================
@@ -186,9 +188,9 @@ unsigned long echoStartUs = 0;
 
 enum ServoState : uint8_t {
   SERVO_READY = 0,
-  SERVO_FORWARD_MOVE,
+  SERVO_MOVING_TO_WORK,
   SERVO_WAITING,
-  SERVO_REVERSE_MOVE
+  SERVO_MOVING_HOME
 };
 
 ServoState servoState = SERVO_READY;
@@ -544,6 +546,11 @@ void finishPing(float distanceCm) {
 
 
 void abortPing() {
+  // No echo within the timeout means no nearby object was observed.
+  // Re-arm the sensor so the next product can be detected.
+  sensors[activeSensorIndex].detectionArmed = true;
+  sensors[activeSensorIndex].lastDistanceCm = -1.0f;
+
   lastGlobalPingUs = micros();
   nextSensorIndex = (activeSensorIndex + 1) % 3;
   sonicState = SONIC_IDLE;
@@ -594,8 +601,9 @@ bool startRejectCycle(long sequence) {
     return false;
   }
 
-  sorterServo.write(SERVO_FORWARD);
-  servoState = SERVO_FORWARD_MOVE;
+  // Move from the home angle to the reject/work angle.
+  sorterServo.write(SERVO_WORK_ANGLE);
+  servoState = SERVO_MOVING_TO_WORK;
   servoStateStartMs = millis();
   pendingActuationSequence = sequence;
 
@@ -610,28 +618,31 @@ void updateServo() {
     case SERVO_READY:
       break;
 
-    case SERVO_FORWARD_MOVE:
-      if (now - servoStateStartMs >= SERVO_MOVE_TIME_MS) {
-        sorterServo.write(SERVO_STOP);
+    case SERVO_MOVING_TO_WORK:
+      // Servo.write() only commands the angle, so give the motor
+      // enough time to physically reach SERVO_WORK_ANGLE.
+      if (now - servoStateStartMs >= SERVO_MOVE_DELAY_MS) {
         servoState = SERVO_WAITING;
         servoStateStartMs = now;
       }
       break;
 
     case SERVO_WAITING:
+      // Hold the reject arm at 70 degrees for the configured time.
       if (now - servoStateStartMs >= SERVO_WAIT_TIME_MS) {
-        sorterServo.write(SERVO_REVERSE);
-        servoState = SERVO_REVERSE_MOVE;
+        sorterServo.write(SERVO_HOME_ANGLE);
+        servoState = SERVO_MOVING_HOME;
         servoStateStartMs = now;
       }
       break;
 
-    case SERVO_REVERSE_MOVE:
-      if (now - servoStateStartMs >= SERVO_MOVE_TIME_MS) {
-        sorterServo.write(SERVO_STOP);
+    case SERVO_MOVING_HOME:
+      // After the arm has physically returned to 0 degrees,
+      // report completion to the Control Node.
+      if (now - servoStateStartMs >= SERVO_MOVE_DELAY_MS) {
         servoState = SERVO_READY;
-
         sendActuationEvent("OK", pendingActuationSequence);
+        pendingActuationSequence = 0;
       }
       break;
   }
@@ -885,9 +896,9 @@ void setup() {
     digitalWrite(sensors[i].trigPin, LOW);
   }
 
-  // Continuous-rotation MG996R behavior copied from the test code.
+  // Angle-controlled MG996R behavior copied from the test code.
   sorterServo.attach(SERVO_PIN);
-  sorterServo.write(SERVO_STOP);
+  sorterServo.write(SERVO_HOME_ANGLE);
 
   // Start both conveyors independently.
   conveyors[0].state = CONV_RUNNING;
