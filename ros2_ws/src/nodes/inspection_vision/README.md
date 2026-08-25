@@ -65,8 +65,10 @@ artifact/
 전체 상대경로와 파일 내용을 합산한 SHA-256이 YAML의
 `vision.model.sha256`과 일치해야 합니다. View별 `v_threshold`, 판정 threshold,
 normalized margin은 반드시 artifact manifest에만 존재해야 하며 ROS parameter나
-코드 fallback으로 두지 않습니다. 현재 참고 artifact는 구형 3-view v1이므로
-형식 참고용일 뿐 운영에 직접 배포할 수 없습니다.
+코드 fallback으로 두지 않습니다. `parameters_by_view`에는 각 view의 backbone,
+feature layer, coreset ratio, reweighting k, 입력 해상도, margin과 나머지 PatchCore
+설정을 각각 완전한 형태로 저장합니다. View마다 설정과 memory-bank shape가 달라도
+되며 전역 `parameters` 항목은 v2에서 허용하지 않습니다.
 
 ## 장애와 session 정책
 

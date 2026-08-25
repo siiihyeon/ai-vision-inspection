@@ -25,13 +25,13 @@ Vision의 전체 파라미터, 아직 key가 없는 모델·카메라 항목, �
 - 완성 이미지 최근 10,000장, timeout 최소 표본 A/B 각각 10,000, p99.9×1.2, 자동 적용 기본 false
 - 모델 runtime `PYTORCH_PATCHCORE_ARTIFACT`, 4-view v2 bundle, warmup 기본 10회, CPU fallback 금지
 
-## Hardware에서 아직 빈 값으로 남는 항목
+## Hardware에서 아직 시험이 필요한 항목
 
-- 최종 4-view artifact bundle의 통합 SHA-256
 - queue/worker/model-lock의 생산 조정 결과
 - Mega firmware protocol, 센서·TB6600·actuator 설정과 위치 timeout
 
-미확정 값 때문에 hardware가 `INIT_BLOCKED`되는 것은 정상입니다. 값을 임의로 채워 READY를 우회하지 마십시오.
+미확정 장비 계약이나 인수시험 실패 때문에 hardware가 `INIT_BLOCKED`되는 것은
+정상입니다. 값을 임의로 채워 READY를 우회하지 마십시오.
 
 Exposure/gain은 camera map에 있으며 모든 보정 OFF는 adapter가 강제합니다. V threshold, 판정 threshold와 margin은 ROS key로 만들지 않고 artifact 안에서만 관리합니다. 설치 후 `install/` 아래 복사본을 직접 수정하지 않습니다.
 
