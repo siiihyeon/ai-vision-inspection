@@ -2,53 +2,49 @@
 
 기준 작업공간: `~/ai-vision-inspection/ros2_ws`
 
-## 1. 작업공간으로 이동
-cd ~/ai-vision-inspection/ros2_ws
+## 1. 공통
 
-## 2. ROS 2 기본 환경 적용
-source /opt/ros/jazzy/setup.bash
+### 명령용 두 번째 터미널 준비
 
-## 3. 전체 패키지 빌드
-colcon build --symlink-install
+launch를 띄운 첫 번째 터미널은 그대로 두고, 운전 명령(`op`)이나 topic 확인은 새 터미널에서 합니다.
 
-## 4. 빌드 결과 환경 적용
-source install/setup.bash
-
-## 5. 시뮬레이션 실행
-ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
-
-Master·Control·Vision·Log 노드를 sim 프로필로 함께 실행합니다.
-
-## 6. 빌드부터 실행까지 한 번에 수행
-
-cd ~/ai-vision-inspection/ros2_ws && \
-source /opt/ros/jazzy/setup.bash && \
-colcon build --symlink-install && \
-source install/setup.bash && \
-ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
-
-## 7. 명령용 두 번째 터미널 준비
-
+```bash
 cd ~/ai-vision-inspection/ros2_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
+```
 
-## 8. 실행 노드 확인
+### 실행 노드 확인
 
+```bash
 ros2 node list
+```
 
 `/inspection/master_node`, `control_node`, `vision_node`, `log_node`가 보이면 정상입니다.
 
-## 9. 정적 계약 검사
+### 모니터링용 터미널
+
+`ros2 topic echo`는 실행하면 계속 그 자리에서 실시간 출력하며 멈추지 않으므로, 보고 싶은 topic마다 터미널을 따로 엽니다. 각 터미널도 터미널 2와 같은 준비(`cd` + `source` 두 줄)가 먼저 필요합니다.
+
+**터미널 3** — 컨베이어 RUNNING/STOPPED, 센서 CLEAR, 액추에이터 안전 상태를 실시간으로 봅니다.
 
 ```bash
-python3 tools/verify_skeleton.py
-python3 tools/test_domain_contracts.py
+ros2 topic echo /inspection/control/equipment_state
 ```
 
-패키지 구조·인터페이스 계약과 ROS 비의존 핵심 로직 테스트를 실행합니다.
+**터미널 4** — 제품 하나가 A/B 촬영 다 끝나고 최종 PASS/NG 판정이 확정될 때마다 뜹니다.
 
-## 10. 실행 종료
+```bash
+ros2 topic echo /inspection/master/product_result_locked
+```
+
+**터미널 5 (sim에서 `PositionSettled`를 수동으로 찍어 넣는 경우만)** — 그 값이 Master까지 잘 들어가는지 확인합니다.
+
+```bash
+ros2 topic echo /inspection/control/position_settled
+```
+
+### 실행 종료
 
 ```text
 Ctrl+C
@@ -56,10 +52,45 @@ Ctrl+C
 
 launch를 실행한 터미널에서 눌러 네 노드의 안전 종료 절차를 시작합니다.
 
-## 언제 다시 빌드해야 하나
+### 언제 다시 빌드해야 하나
 
 - 일반 Python 코드만 수정: `--symlink-install` 상태에서는 재빌드 없이 반영되는 경우가 많습니다.
 - `msg`, `srv`, `action`, `setup.py`, `package.xml`, `CMakeLists.txt` 수정: 반드시 재빌드합니다.
 - 새 Python 파일이나 패키지 추가: 재빌드하는 것이 안전합니다.
 - 판단이 애매함: 실행 중인 노드를 `Ctrl+C`로 종료한 뒤 다시 빌드합니다.
 
+## 2. Hardware
+
+빌드부터 환경 적용까지 한 번에:
+
+```bash
+cd ~/ai-vision-inspection/ros2_ws && \
+source /opt/ros/jazzy/setup.bash && \
+colcon build --symlink-install && \
+source install/setup.bash
+```
+
+실행 (별도 명령, 첫 번째 터미널에 계속 떠 있음):
+
+```bash
+ros2 launch inspection_bringup inspection_system.launch.py profile:=hardware
+```
+
+## 3. Sim
+
+빌드부터 환경 적용까지 한 번에:
+
+```bash
+cd ~/ai-vision-inspection/ros2_ws && \
+source /opt/ros/jazzy/setup.bash && \
+colcon build --symlink-install && \
+source install/setup.bash
+```
+
+실행 (별도 명령, 첫 번째 터미널에 계속 떠 있음):
+
+```bash
+ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
+```
+
+Master·Control·Vision·Log 노드를 sim 프로필로 함께 실행합니다.
