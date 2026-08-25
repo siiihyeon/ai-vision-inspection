@@ -2086,6 +2086,8 @@ class MasterNode(InspectionNodeBase):
             self._confirm_pending_resume(ConveyorId.LOWER)
         if self._pending_run_confirmation and self.equipment.all_conveyors_running():
             self.confirm_all_conveyors_running()
+        if self.equipment.all_conveyors_stopped():
+            self.confirm_all_conveyors_stopped()
 
     def _confirm_pending_resume(self, conveyor_id: ConveyorId) -> None:
         """새로 돌기 시작한 컨베이어를 기다리던 station cycle을 확인 처리합니다."""
@@ -3365,8 +3367,8 @@ class MasterNode(InspectionNodeBase):
     def confirm_all_conveyors_stopped(self) -> None:
         """Control의 실제 정지 완료를 받은 뒤 PAUSING을 확정합니다.
 
-        실제 Sensor/Conveyor 상태 매핑이 확정되면 PositionSettled가 아닌 별도의
-        typed 장비 상태 이벤트에서 이 확장점을 호출해야 합니다.
+        hardware profile에서는 EquipmentState의 정지 확인(_handle_equipment_state)이
+        호출하고, sim profile에서는 _request_all_conveyors_stop이 즉시 호출합니다.
         """
 
         self.equipment.mark_all_stopped()
