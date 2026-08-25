@@ -5,10 +5,11 @@
 // AI Vision Inspection - Arduino Mega Firmware
 //
 // Workflow
-// 1) HC-SR04 #1 detects product (while Conveyor 1 is RUNNING)
+// 1) HC-SR04 #1 detects product
 //    -> report SENSOR_1
-//    -> Conveyor 1 autonomously moves cameraOffsetSteps (from SET_OFFSET)
-//       to the camera position and stops
+//    -> Conveyor 1 autonomously moves its configured camera offset
+//       (configured by Control Node with SET_OFFSET)
+//    -> Conveyor 1 moves to the camera position and stops
 //    -> report POSITION settled
 //
 // 2) Master finishes capture
@@ -21,7 +22,7 @@
 //    -> Conveyor 2 does NOT stop.
 //
 // 5) Control Node sends ACTUATE|1 for defective product.
-//    -> continuous-rotation MG996R reject cycle runs non-blocking.
+//    -> angle-controlled MG996R moves 0 deg -> 70 deg -> waits -> 0 deg.
 //    ACTUATE|2 = normal/pass, no servo motion.
 //
 // Serial framing is compatible with the existing CRC protocol:
@@ -73,7 +74,7 @@ AccelStepper conveyor1(AccelStepper::DRIVER, CONV1_STEP, CONV1_DIR);
 AccelStepper conveyor2(AccelStepper::DRIVER, CONV2_STEP, CONV2_DIR);
 
 // Values confirmed in the component-test sketch.
-const long CONV1_SPEED = -3000;
+const long CONV1_SPEED = 3000;
 const long CONV2_SPEED = -3000;
 
 const long CONV_MAX_SPEED = 10000;
@@ -103,18 +104,20 @@ const float MAX_VALID_DISTANCE_CM = 80.0f;
 
 
 // ============================================================
-// 4. Servo parameters
-//    These values preserve the successful continuous-rotation test.
+// 4. Servo parameters - angle-controlled MG996R
+//    Values copied from the successful angle-control test.
 // ============================================================
 
 Servo sorterServo;
 
-const int SERVO_STOP    = 90;
-const int SERVO_FORWARD = 150;
-const int SERVO_REVERSE = 50;
+const int SERVO_HOME_ANGLE = 0;
+const int SERVO_WORK_ANGLE = 70;
 
-const unsigned long SERVO_MOVE_TIME_MS = 3000UL;
-const unsigned long SERVO_WAIT_TIME_MS = 500UL;
+// Time allowed for the servo to physically reach each angle.
+const unsigned long SERVO_MOVE_DELAY_MS = 500UL;
+
+// Time to keep the reject arm at the work angle.
+const unsigned long SERVO_WAIT_TIME_MS = 3000UL;
 
 
 // ============================================================
@@ -134,9 +137,10 @@ struct ConveyorController {
   long runSpeed;
   uint8_t conveyorId;
   ConveyorState state;
-  long positionCommandSequence;
+  // Sensor sequence that caused this autonomous positioning cycle.
+  long positionSensorSequence;
   long positionTargetSteps;
-  long cameraOffsetSteps;  // SET_OFFSET으로 Control이 전달; 0이면 아직 미설정
+  long cameraOffsetSteps;
 };
 
 ConveyorController conveyors[2] = {
@@ -187,9 +191,9 @@ unsigned long echoStartUs = 0;
 
 enum ServoState : uint8_t {
   SERVO_READY = 0,
-  SERVO_FORWARD_MOVE,
+  SERVO_MOVING_TO_WORK,
   SERVO_WAITING,
-  SERVO_REVERSE_MOVE
+  SERVO_MOVING_HOME
 };
 
 ServoState servoState = SERVO_READY;
@@ -282,7 +286,7 @@ void sendSensorEvent(uint8_t sensorId, uint32_t sensorSequence) {
 
 
 void sendPositionSettled(uint8_t conveyorId, long movedSteps) {
-  // E|POSITION|conveyor_id|step_count|position_command_sequence
+  // E|POSITION|conveyor_id|step_count|sensor_sequence
   char body[96];
   ConveyorController& conveyor = conveyors[conveyorId - 1];
   snprintf(
@@ -291,7 +295,7 @@ void sendPositionSettled(uint8_t conveyorId, long movedSteps) {
     "E|POSITION|%u|%ld|%ld",
     conveyorId,
     movedSteps,
-    conveyor.positionCommandSequence
+    conveyor.positionSensorSequence
   );
   sendFrame(body);
 }
@@ -385,12 +389,12 @@ void stopConveyor(uint8_t index) {
 }
 
 
-bool startAutomaticPosition(uint8_t index, long targetSteps, long commandSequence) {
+bool startAutomaticPosition(uint8_t index, long targetSteps, long sensorSequence) {
   if (index > 1) return false;
 
   ConveyorController& conveyor = conveyors[index];
 
-  // Positioning is explicitly owned by the host POSITION command.
+  // Only a normally running conveyor can begin autonomous positioning.
   if (conveyor.state != CONV_RUNNING) {
     return false;
   }
@@ -407,7 +411,7 @@ bool startAutomaticPosition(uint8_t index, long targetSteps, long commandSequenc
   conveyor.motor->move(signedOffset);
   conveyor.motor->setMaxSpeed(labs(conveyor.runSpeed));
   conveyor.motor->setAcceleration(CONV_ACCELERATION);
-  conveyor.positionCommandSequence = commandSequence;
+  conveyor.positionSensorSequence = sensorSequence;
   conveyor.positionTargetSteps = targetSteps;
 
   conveyor.state = CONV_POSITIONING;
@@ -477,11 +481,14 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
     sensor.detectionArmed = false;
     ++sensor.detectionSequence;
 
+    // Report the edge before beginning the local positioning cycle.
     sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
-    // Conveyor owns positioning: move the SET_OFFSET step count on its own,
-    // no host command needed. A zero offset (never configured) means stay put.
     if (conveyors[0].cameraOffsetSteps > 0) {
-      startAutomaticPosition(0, conveyors[0].cameraOffsetSteps, sensor.detectionSequence);
+      startAutomaticPosition(
+        0,
+        conveyors[0].cameraOffsetSteps,
+        sensor.detectionSequence
+      );
     }
     return;
   }
@@ -497,7 +504,11 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
 
     sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
     if (conveyors[1].cameraOffsetSteps > 0) {
-      startAutomaticPosition(1, conveyors[1].cameraOffsetSteps, sensor.detectionSequence);
+      startAutomaticPosition(
+        1,
+        conveyors[1].cameraOffsetSteps,
+        sensor.detectionSequence
+      );
     }
     return;
   }
@@ -552,6 +563,11 @@ void finishPing(float distanceCm) {
 
 
 void abortPing() {
+  // No echo within the timeout means no nearby object was observed.
+  // Re-arm the sensor so the next product can be detected.
+  sensors[activeSensorIndex].detectionArmed = true;
+  sensors[activeSensorIndex].lastDistanceCm = -1.0f;
+
   lastGlobalPingUs = micros();
   nextSensorIndex = (activeSensorIndex + 1) % 3;
   sonicState = SONIC_IDLE;
@@ -602,8 +618,9 @@ bool startRejectCycle(long sequence) {
     return false;
   }
 
-  sorterServo.write(SERVO_FORWARD);
-  servoState = SERVO_FORWARD_MOVE;
+  // Move from the home angle to the reject/work angle.
+  sorterServo.write(SERVO_WORK_ANGLE);
+  servoState = SERVO_MOVING_TO_WORK;
   servoStateStartMs = millis();
   pendingActuationSequence = sequence;
 
@@ -618,28 +635,31 @@ void updateServo() {
     case SERVO_READY:
       break;
 
-    case SERVO_FORWARD_MOVE:
-      if (now - servoStateStartMs >= SERVO_MOVE_TIME_MS) {
-        sorterServo.write(SERVO_STOP);
+    case SERVO_MOVING_TO_WORK:
+      // Servo.write() only commands the angle, so give the motor
+      // enough time to physically reach SERVO_WORK_ANGLE.
+      if (now - servoStateStartMs >= SERVO_MOVE_DELAY_MS) {
         servoState = SERVO_WAITING;
         servoStateStartMs = now;
       }
       break;
 
     case SERVO_WAITING:
+      // Hold the reject arm at 70 degrees for the configured time.
       if (now - servoStateStartMs >= SERVO_WAIT_TIME_MS) {
-        sorterServo.write(SERVO_REVERSE);
-        servoState = SERVO_REVERSE_MOVE;
+        sorterServo.write(SERVO_HOME_ANGLE);
+        servoState = SERVO_MOVING_HOME;
         servoStateStartMs = now;
       }
       break;
 
-    case SERVO_REVERSE_MOVE:
-      if (now - servoStateStartMs >= SERVO_MOVE_TIME_MS) {
-        sorterServo.write(SERVO_STOP);
+    case SERVO_MOVING_HOME:
+      // After the arm has physically returned to 0 degrees,
+      // report completion to the Control Node.
+      if (now - servoStateStartMs >= SERVO_MOVE_DELAY_MS) {
         servoState = SERVO_READY;
-
         sendActuationEvent("OK", pendingActuationSequence);
+        pendingActuationSequence = 0;
       }
       break;
   }
@@ -737,7 +757,6 @@ void handleCommand(char* line) {
     return;
   }
 
-  // ----------------------------------------------------------
   // RUN
   // C|seq|RUN|1
   // C|seq|RUN|2
@@ -818,6 +837,45 @@ void handleCommand(char* line) {
     return;
   }
 
+  // ----------------------------------------------------------
+  // Optional manual POSITION command for maintenance compatibility.
+  // Normal operation starts positioning locally from Sensor 1/2.
+  //
+  // C|seq|POSITION|conveyor_id|steps
+  // ----------------------------------------------------------
+  if (strcmp(operation, "POSITION") == 0) {
+    char* conveyorText = strtok_r(nullptr, "|", &savePtr);
+    char* stepsText = strtok_r(nullptr, "|", &savePtr);
+
+    if (conveyorText == nullptr || stepsText == nullptr) {
+      acknowledge(sequence, "ERR");
+      return;
+    }
+
+    int conveyorId = atoi(conveyorText);
+    long steps = atol(stepsText);
+
+    if (
+      (conveyorId == 1 || conveyorId == 2) &&
+      steps > 0
+    ) {
+      ConveyorController& conveyor = conveyors[conveyorId - 1];
+
+      if (conveyor.state == CONV_RUNNING) {
+        if (startAutomaticPosition(conveyorId - 1, steps, sequence)) {
+          acknowledge(sequence, "OK");
+        } else {
+          acknowledge(sequence, "BUSY");
+        }
+      } else {
+        acknowledge(sequence, "BUSY");
+      }
+    } else {
+      acknowledge(sequence, "ERR");
+    }
+    return;
+  }
+
   acknowledge(sequence, "ERR_COMMAND");
 }
 
@@ -879,12 +937,13 @@ void setup() {
     digitalWrite(sensors[i].trigPin, LOW);
   }
 
-  // Continuous-rotation MG996R behavior copied from the test code.
+  // Angle-controlled MG996R behavior copied from the test code.
   sorterServo.attach(SERVO_PIN);
-  sorterServo.write(SERVO_STOP);
+  sorterServo.write(SERVO_HOME_ANGLE);
 
-  // Conveyors boot STOPPED (see the conveyors[] initializer) - Control
-  // must send RUN before anything moves. Do not override state here.
+  // Stay stopped until ControlNode completes initialization and sends RUN.
+  conveyors[0].state = CONV_STOPPED;
+  conveyors[1].state = CONV_STOPPED;
 
   // No plain-text Serial debug output here.
   // All PC-facing messages use CRC-framed protocol packets.
