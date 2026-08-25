@@ -36,6 +36,7 @@ REQUIRED_INTERFACES = {
         "SystemCommand.msg",
         "SensorEvent.msg",
         "PositionSettled.msg",
+        "EquipmentState.msg",
         "ImageReference.msg",
         "StationResult.msg",
         "StationInferenceFailed.msg",
@@ -49,7 +50,6 @@ REQUIRED_INTERFACES = {
     "srv": {"GetNodeStatus.srv", "OperatorCommand.srv", "ReplayStationResults.srv"},
     "action": {
         "InitializeNode.action",
-        "PositionProduct.action",
         "CaptureProduct.action",
         "ActuateProduct.action",
     },
@@ -60,7 +60,8 @@ EXPECTED_FIELDS = {
     "msg/SystemCommand.msg": [["command", "command_type", "target_conveyor_id", "reason"]],
     "msg/MasterHeartbeat.msg": [["header", "master_instance_id", "interface_version", "command_epoch", "sequence", "system_state"]],
     "msg/NodeHeartbeat.msg": [["header", "node_id", "node_instance_id", "sequence", "health_state", "interface_version"]],
-    "msg/PositionSettled.msg": [["header", "product_id", "station_id", "position_command_id", "conveyor_id", "target_step", "estimated_step", "position_error_steps", "position_source", "position_verified", "settled_at"]],
+    "msg/PositionSettled.msg": [["header", "conveyor_id", "estimated_step", "position_source", "position_verified", "settled_at"]],
+    "msg/EquipmentState.msg": [["header", "upper_running", "upper_stopped", "lower_running", "lower_stopped", "sensor_1_clear", "sensor_2_clear", "sensor_3_clear", "actuator_safe"]],
     "msg/ImageReference.msg": [["camera_id", "file_path", "sha256", "file_size_bytes", "width", "height", "pixel_format", "camera_timestamp_raw", "camera_timestamp_domain", "camera_timestamp_ns", "camera_timestamp_synchronized", "host_arrival_monotonic_ns", "host_arrival_wall_time"]],
     "msg/ProductResultLocked.msg": [["header", "product_id", "fifo_sequence", "final_verdict", "station_a_completed", "station_b_completed", "lock_reason", "sensor3_event_id", "locked_at"]],
     "msg/LogPersistedAck.msg": [["header", "producer_node", "producer_instance_id", "acked_log_ids", "acked_revisions", "committed_at"]],
@@ -264,8 +265,8 @@ for config in (sim, hardware):
     require('system.expected_interface_version: "2.1.0"' in config, "interface version config mismatch")
     require("comm.master_heartbeat_period_ms: 500" in config, "Master heartbeat period mismatch")
     require(config.count("comm.node_heartbeat_period_ms: 500") == 3, "worker heartbeat period mismatch")
-    require("comm.master_heartbeat_timeout_ms: 2000" in config, "heartbeat timeout mismatch")
-    require("comm.node_heartbeat_timeout_ms: 2000" in config, "worker heartbeat timeout mismatch")
+    require("comm.master_heartbeat_timeout_ms: 5000" in config, "heartbeat timeout mismatch")
+    require("comm.node_heartbeat_timeout_ms: 5000" in config, "worker heartbeat timeout mismatch")
     require("system.init_timeout_ms: 10000" in config, "worker init timeout mismatch")
     require("retry.init_interval_ms: 1000" in config, "worker init retry interval mismatch")
     require(

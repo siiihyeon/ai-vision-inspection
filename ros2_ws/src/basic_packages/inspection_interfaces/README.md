@@ -6,7 +6,7 @@
 
 - 공통: `CommonHeader`, `CommandHeader`, `ErrorCode`, `NodeHealth`, `SystemState`, `StationId`, `ConveyorId`, `NodeRuntimeEnvironment`
 - 생존/운영: `MasterHeartbeat`, `NodeHeartbeat`, `SystemCommand`, `GetNodeStatus`, `InitializeNode`, `OperatorCommand`
-- Control: `SensorEvent`, `PositionSettled`, `PositionProduct`, `ActuateProduct`
+- Control: `SensorEvent`, `PositionSettled`, `EquipmentState`, `ActuateProduct`
 - Vision: `ImageReference`, `CaptureProduct`, `VisionQueueState`, `StationResult`, `StationInferenceFailed`, `InferenceCancellation`, `InferenceCancellationAck`
 - Master: `ProductResultLocked`
 - Log: `LogEvent`, `LogPersistedAck`, `ReplayStationResults`

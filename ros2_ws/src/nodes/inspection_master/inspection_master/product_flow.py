@@ -77,8 +77,6 @@ class StationInspection:
     station_id: StationId
     process_state: StationProcessState = StationProcessState.PENDING
     position_command_id: str = ""
-    position_target_step: int = 0
-    position_action_succeeded: bool = False
     position_settled: bool = False
     capture_command_id: str = ""
     capture_id: str = ""
@@ -149,7 +147,6 @@ class ProductContext:
         station_id: StationId,
         *,
         position_command_id: str,
-        target_step: int,
         capture_id: str,
     ) -> None:
         expected = (
@@ -169,17 +166,7 @@ class ProductContext:
             )
         station.process_state = StationProcessState.POSITIONING
         station.position_command_id = position_command_id
-        station.position_target_step = target_step
         station.capture_id = capture_id
-        self._touch()
-
-    def mark_position_action_succeeded(
-        self, station_id: StationId, position_command_id: str
-    ) -> None:
-        station = self.station(station_id)
-        if station.position_command_id != position_command_id:
-            raise ProductIdentityConflict("position command identity mismatch")
-        station.position_action_succeeded = True
         self._touch()
 
     def mark_position_settled(
@@ -203,8 +190,7 @@ class ProductContext:
     def can_request_capture(self, station_id: StationId) -> bool:
         station = self.station(station_id)
         return (
-            station.position_action_succeeded
-            and station.position_settled
+            station.position_settled
             and station.process_state == StationProcessState.POSITION_SETTLED
         )
 

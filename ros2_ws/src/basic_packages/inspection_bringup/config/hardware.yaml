@@ -1,12 +1,12 @@
 /**:
   ros__parameters:
     profile: hardware
-    comm.master_heartbeat_timeout_ms: 2000
+    comm.master_heartbeat_timeout_ms: 5000
 
 /inspection/master_node:
   ros__parameters:
     comm.master_heartbeat_period_ms: 500
-    comm.node_heartbeat_timeout_ms: 2000
+    comm.node_heartbeat_timeout_ms: 5000
     system.expected_interface_version: "2.1.0"
     system.config_version: "dev-001"
     system.init_timeout_ms: 10000
@@ -19,15 +19,13 @@
     master.sensor_ids.sensor_3: "SENSOR_3"
     master.sensor.accepted_edge: 1
     master.hardware_mapping_confirmed: false
-    master.station_a.position_offset_steps: 0
-    master.station_b.position_offset_steps: 0
-    master.position_tolerance_steps: 0
     master.camera_ids.station_a: ["DA9880512", "DA9880516", "DA7552836"]
     master.camera_ids.station_b: ["DA7838410"]
     master.action.position_timeout_ms: 10000
     master.action.capture_timeout_ms: 30000
     master.action.actuation_timeout_ms: 10000
     master.action.conveyor_resume_timeout_ms: 10000
+    master.action.conveyor_run_timeout_ms: 10000
     master.pause_stop_timeout_ms: 10000
     master.shutdown_stop_timeout_ms: 10000
     master.log_spool_path: "/var/lib/inspection/spool/master.sqlite3"
@@ -45,6 +43,9 @@
     control.tb6600.lower_config: ""
     control.sensor_config: ""
     control.actuator_config: ""
+    control.actuator.timeout_ms: 10000
+    control.station_a.position_offset_steps: 15100
+    control.station_b.position_offset_steps: 7700
 
 /inspection/vision_node:
   ros__parameters:

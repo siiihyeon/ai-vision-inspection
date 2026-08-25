@@ -41,9 +41,9 @@ from inspection_interfaces.action import (
     ActuateProduct,
     CaptureProduct,
     InitializeNode,
-    PositionProduct,
 )
 from inspection_interfaces.msg import (
+    EquipmentState,
     InferenceCancellation,
     InferenceCancellationAck,
     LogEvent,
@@ -136,9 +136,6 @@ class MasterNode(InspectionNodeBase):
         self.declare_parameter("master.sensor_ids.sensor_3", "SENSOR_3")
         self.declare_parameter("master.sensor.accepted_edge", int(SensorEvent.RISING))
         self.declare_parameter("master.hardware_mapping_confirmed", False)
-        self.declare_parameter("master.station_a.position_offset_steps", 0)
-        self.declare_parameter("master.station_b.position_offset_steps", 0)
-        self.declare_parameter("master.position_tolerance_steps", 0)
         self.declare_parameter(
             "master.camera_ids.station_a", Parameter.Type.STRING_ARRAY
         )
@@ -149,6 +146,7 @@ class MasterNode(InspectionNodeBase):
         self.declare_parameter("master.action.capture_timeout_ms", 30000)
         self.declare_parameter("master.action.actuation_timeout_ms", 10000)
         self.declare_parameter("master.action.conveyor_resume_timeout_ms", 10000)
+        self.declare_parameter("master.action.conveyor_run_timeout_ms", 10000)
         self.declare_parameter("master.pause_stop_timeout_ms", 10000)
         self.declare_parameter("master.shutdown_stop_timeout_ms", 10000)
         self.declare_parameter(
@@ -185,17 +183,6 @@ class MasterNode(InspectionNodeBase):
         self.hardware_mapping_confirmed = bool(
             self.get_parameter("master.hardware_mapping_confirmed").value
         )
-        self.station_position_offsets = {
-            StationId.A: int(
-                self.get_parameter("master.station_a.position_offset_steps").value
-            ),
-            StationId.B: int(
-                self.get_parameter("master.station_b.position_offset_steps").value
-            ),
-        }
-        self.position_tolerance_steps = int(
-            self.get_parameter("master.position_tolerance_steps").value
-        )
         station_a_camera_ids = self.get_parameter(
             "master.camera_ids.station_a"
         ).value
@@ -220,6 +207,9 @@ class MasterNode(InspectionNodeBase):
         )
         self.conveyor_resume_timeout_ms = int(
             self.get_parameter("master.action.conveyor_resume_timeout_ms").value
+        )
+        self.conveyor_run_timeout_ms = int(
+            self.get_parameter("master.action.conveyor_run_timeout_ms").value
         )
         self.pause_stop_timeout_ms = int(
             self.get_parameter("master.pause_stop_timeout_ms").value
@@ -314,11 +304,6 @@ class MasterNode(InspectionNodeBase):
                 "sensor_ids": sorted(self.sensor_id_to_index.items()),
                 "accepted_sensor_edge": self.accepted_sensor_edge,
                 "hardware_mapping_confirmed": self.hardware_mapping_confirmed,
-                "station_position_offsets": {
-                    "A": self.station_position_offsets[StationId.A],
-                    "B": self.station_position_offsets[StationId.B],
-                },
-                "position_tolerance_steps": self.position_tolerance_steps,
                 "station_camera_ids": {
                     "A": self.station_camera_ids[StationId.A],
                     "B": self.station_camera_ids[StationId.B],
@@ -360,6 +345,7 @@ class MasterNode(InspectionNodeBase):
         self._queue_recovered_pending = False
         self._pause_deadline_ns = 0
         self._shutdown_deadline_ns = 0
+        self._run_confirmation_deadline_ns = 0
         self._next_context_prune_ns = time.monotonic_ns() + 60_000_000_000
         self.shutdown_phase = ShutdownPhase.IDLE
         self._log_spool: DurableLogSpool | None = None
@@ -422,9 +408,6 @@ class MasterNode(InspectionNodeBase):
             )
             for worker in (NodeId.CONTROL, NodeId.VISION, NodeId.LOG)
         }
-        self.position_client = ActionClient(
-            self, PositionProduct, "/inspection/control/position_product"
-        )
         self.capture_client = ActionClient(
             self, CaptureProduct, "/inspection/vision/capture_product"
         )
@@ -457,6 +440,12 @@ class MasterNode(InspectionNodeBase):
             PositionSettled,
             "/inspection/control/position_settled",
             self._handle_position_settled,
+            reliable_event_qos(),
+        )
+        self._equipment_state_subscription = self.create_subscription(
+            EquipmentState,
+            "/inspection/control/equipment_state",
+            self._handle_equipment_state,
             reliable_event_qos(),
         )
         self._queue_subscription = self.create_subscription(
@@ -520,9 +509,6 @@ class MasterNode(InspectionNodeBase):
             "master.sensor_ids.sensor_2",
             "master.sensor_ids.sensor_3",
             "master.hardware_mapping_confirmed",
-            "master.station_a.position_offset_steps",
-            "master.station_b.position_offset_steps",
-            "master.position_tolerance_steps",
             "master.camera_ids.station_a",
             "master.camera_ids.station_b",
             "master.action.position_timeout_ms",
@@ -717,6 +703,7 @@ class MasterNode(InspectionNodeBase):
         if transition is None:
             return False
         self._pending_run_confirmation = False
+        self._run_confirmation_deadline_ns = 0
         self.equipment.mark_all_running()
         if previous_state == SystemState.READY:
             # 빈 라인 확인은 신규 RUN 시작에 한 번만 소비합니다.
@@ -1875,10 +1862,6 @@ class MasterNode(InspectionNodeBase):
         conveyor_id = (
             ConveyorId.UPPER if station_id == StationId.A else ConveyorId.LOWER
         )
-        target_step = (
-            context.sensor_steps[sensor_index]
-            + self.station_position_offsets[station_id]
-        )
         position_command_id = new_uuid()
         capture_id = new_uuid()
         try:
@@ -1886,226 +1869,56 @@ class MasterNode(InspectionNodeBase):
                 context.begin_station_cycle(
                     station_id,
                     position_command_id=position_command_id,
-                    target_step=target_step,
                     capture_id=capture_id,
                 )
                 self.ledger.register_capture(capture_id, product_id, station_id)
         except ProductFlowError as exc:
             self._fault_stop(f"station cycle start failed: {exc}")
             return
-        self._station_cycles[station_id] = StationCycle(
+        cycle = StationCycle(
             product_id=product_id,
             fifo_sequence=fifo_sequence,
             station_id=station_id,
             conveyor_id=conveyor_id,
             position_command_id=position_command_id,
             capture_id=capture_id,
-            target_step=target_step,
         )
-        self._deferred_station_starts.discard((product_id, station_id))
-        self._send_position_goal(product_id, fifo_sequence, station_id)
-
-    def _send_position_goal(
-        self, product_id: str, fifo_sequence: int, station_id: StationId
-    ) -> None:
-        """ControlNode에 PositionProduct Goal을 전송합니다."""
-
-        cycle = self._station_cycles.get(station_id)
-        if (
-            cycle is None
-            or cycle.product_id != product_id
-            or cycle.fifo_sequence != fifo_sequence
-        ):
-            self._fault_stop("position cycle identity mismatch")
-            return
-        # TODO(HARDWARE): position offset과 허용오차는 제품 크기·TB6600 보정 후
-        # hardware.yaml의 승인값으로 교체합니다.
-        if not self.position_client.wait_for_server(timeout_sec=0.0):
-            self._pause_station_for_recovery(
-                station_id, "PositionProduct Action server is unavailable"
-            )
-            return
-        goal = PositionProduct.Goal()
-        payload = {
-            "product_id": product_id,
-            "fifo_sequence": fifo_sequence,
-            "station_id": int(station_id),
-            "conveyor_id": int(cycle.conveyor_id),
-            "target_step": cycle.target_step,
-        }
-        self._fill_command_header(
-            goal.command,
-            command_id=cycle.position_command_id,
-            correlation_id=product_id,
-            payload=payload,
-        )
-        goal.product_id = product_id
-        goal.fifo_sequence = fifo_sequence
-        goal.station_id = int(station_id)
-        goal.conveyor_id = int(cycle.conveyor_id)
-        goal.target_step = cycle.target_step
-        cycle.phase = StationCyclePhase.POSITION_GOAL
         cycle.deadline_ns = (
             time.monotonic_ns() + self.position_timeout_ms * 1_000_000
         )
-        try:
-            future = self.position_client.send_goal_async(goal)
-        except Exception as exc:
-            self._pause_station_for_recovery(
-                station_id,
-                f"PositionProduct Goal send failed: {type(exc).__name__}",
-            )
-            return
-        future.add_done_callback(
-            partial(
-                self._handle_position_goal_response,
-                station_id,
-                cycle.position_command_id,
-            )
-        )
-
-    def _handle_position_goal_response(
-        self, station_id: StationId, command_id: str, future
-    ) -> None:
-        cycle = self._station_cycles.get(station_id)
-        if cycle is None or cycle.position_command_id != command_id:
-            return
-        if self._ignore_operation_while_fault_stopped(
-            "POSITION_GOAL_RESPONSE",
-            product_id=cycle.product_id,
-            correlation_id=command_id,
-        ):
-            return
-        try:
-            goal_handle = future.result()
-        except Exception as exc:
-            self._pause_station_for_recovery(
-                station_id,
-                f"PositionProduct Goal response failed: {type(exc).__name__}",
-            )
-            return
-        if not goal_handle.accepted:
-            self._pause_station_for_recovery(
-                station_id, "PositionProduct Goal was rejected"
-            )
-            return
-        canceled_context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
-        if (
-            station_id == StationId.B
-            and canceled_context is not None
-            and canceled_context.station_b_skip_requested
-        ):
-            cycle.position_goal_handle = goal_handle
-            try:
-                goal_handle.cancel_goal_async()
-            except Exception:
-                pass
-            return
-        cycle.position_goal_handle = goal_handle
-        cycle.phase = StationCyclePhase.WAITING_POSITION
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(
-            partial(self._handle_position_goal_result, station_id, command_id)
-        )
-
-    def _handle_position_goal_result(
-        self, station_id: StationId, command_id: str, future
-    ) -> None:
-        """위치 이동 Action 결과와 후속 PositionSettled를 연결합니다."""
-
-        cycle = self._station_cycles.get(station_id)
-        if cycle is None or cycle.position_command_id != command_id:
-            return
-        if self._ignore_operation_while_fault_stopped(
-            "POSITION_RESULT",
-            product_id=cycle.product_id,
-            correlation_id=command_id,
-        ):
-            return
-        try:
-            result = future.result().result
-        except Exception as exc:
-            self._fault_stop(
-                "PositionProduct Result became unavailable after Goal acceptance; "
-                f"physical position is unknown: {type(exc).__name__}"
-            )
-            return
-        if (
-            result.product_id != cycle.product_id
-            or int(result.station_id) != int(station_id)
-            or result.position_command_id != command_id
-        ):
-            self._fault_stop("PositionProduct Result identity mismatch")
-            return
-        canceled_context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
-        if (
-            station_id == StationId.B
-            and canceled_context is not None
-            and canceled_context.station_b_skip_requested
-        ):
-            return
-        if not result.success:
-            error_code = int(result.error_code)
-            if error_code == int(ErrorCode.COMMAND_CONFLICT):
-                self._fault_stop(f"PositionProduct command conflict: {result.reason}")
-            elif error_code == int(ErrorCode.POSITION_FAILED):
-                self._fault_stop(
-                    "PositionProduct reported an untrustworthy physical position: "
-                    + (result.reason or "POSITION_FAILED")
-                )
-            else:
-                self._pause_station_for_recovery(
-                    station_id, result.reason or "PositionProduct failed"
-                )
-            return
-        context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
-        if context is None:
-            self._fault_stop("PositionProduct Result references unknown product")
-            return
-        try:
-            with self._flow_lock:
-                context.mark_position_action_succeeded(station_id, command_id)
-        except ProductFlowError as exc:
-            self._fault_stop(f"position result application failed: {exc}")
-            return
-        self._maybe_request_station_capture(station_id)
+        self._station_cycles[station_id] = cycle
+        self._deferred_station_starts.discard((product_id, station_id))
+        # 이동은 Mega가 SET_OFFSET으로 받아둔 step 수만큼 센서 감지에 맞춰
+        # 자율로 수행합니다 - Master는 명령을 보내지 않고 PositionSettled만
+        # 기다립니다(cycle.deadline_ns가 타임아웃 안전망입니다).
 
     def _handle_position_settled(self, message: PositionSettled) -> None:
-        """Control이 보고한 정지·안정화 완료 이벤트를 검증합니다."""
+        """Mega가 자율로 이동·정지한 결과를 검증합니다."""
 
         if message.header.session_id != self.session_id:
             return
+        try:
+            conveyor_id = ConveyorId(message.conveyor_id)
+        except ValueError:
+            self._fault_stop("PositionSettled contains invalid conveyor_id")
+            return
+        station_id = StationId.A if conveyor_id == ConveyorId.UPPER else StationId.B
         if self._ignore_operation_while_fault_stopped(
             "POSITION_SETTLED",
-            product_id=message.product_id,
-            correlation_id=message.position_command_id,
+            correlation_id=station_id.name,
         ):
             return
-        try:
-            station_id = StationId(message.station_id)
-        except ValueError:
-            self._fault_stop("PositionSettled contains invalid station_id")
-            return
         cycle = self._station_cycles.get(station_id)
-        if cycle is None:
+        if cycle is None or cycle.phase != StationCyclePhase.WAITING_POSITION:
             self._emit_log_event(
                 severity=LogEvent.WARNING,
                 event_type="SUPERSEDED_POSITION_SETTLED_IGNORED",
-                product_id=message.product_id,
                 payload={
                     "station_id": station_id.name,
-                    "position_command_id": message.position_command_id,
-                    "reason": "no active station cycle",
+                    "conveyor_id": conveyor_id.name,
+                    "reason": "no station cycle is waiting for position",
                 },
             )
-            return
-        if (
-            message.product_id != cycle.product_id
-            or message.position_command_id != cycle.position_command_id
-            or int(message.conveyor_id) != int(cycle.conveyor_id)
-            or int(message.target_step) != cycle.target_step
-        ):
-            self._fault_stop("PositionSettled identity or target mismatch")
             return
         context = self.ledger.get(cycle.product_id, cycle.fifo_sequence)
         if context is None:
@@ -2119,12 +1932,6 @@ class MasterNode(InspectionNodeBase):
                 payload=context.snapshot(),
             )
             return
-        if abs(int(message.position_error_steps)) > self.position_tolerance_steps:
-            self._pause_station_for_recovery(
-                station_id,
-                "PositionSettled exceeded configured position tolerance",
-            )
-            return
         try:
             with self._flow_lock:
                 context.mark_position_settled(
@@ -2134,6 +1941,51 @@ class MasterNode(InspectionNodeBase):
             self._fault_stop(f"PositionSettled application failed: {exc}")
             return
         self._maybe_request_station_capture(station_id)
+
+    def _handle_equipment_state(self, message: EquipmentState) -> None:
+        """Control이 보고한 장비 상태를 안전 guard mirror에 반영합니다."""
+
+        if message.header.session_id != self.session_id:
+            return
+        was_upper_running = self.equipment.conveyor_running.get(ConveyorId.UPPER)
+        was_lower_running = self.equipment.conveyor_running.get(ConveyorId.LOWER)
+        self.update_equipment_snapshot(
+            upper_running=message.upper_running,
+            upper_stopped=message.upper_stopped,
+            lower_running=message.lower_running,
+            lower_stopped=message.lower_stopped,
+            sensor_1_clear=message.sensor_1_clear,
+            sensor_2_clear=message.sensor_2_clear,
+            sensor_3_clear=message.sensor_3_clear,
+            actuator_safe=message.actuator_safe,
+        )
+        if message.upper_running and not was_upper_running:
+            self._confirm_pending_resume(ConveyorId.UPPER)
+        if message.lower_running and not was_lower_running:
+            self._confirm_pending_resume(ConveyorId.LOWER)
+        if self._pending_run_confirmation and self.equipment.all_conveyors_running():
+            self.confirm_all_conveyors_running()
+        if self.equipment.all_conveyors_stopped():
+            self.confirm_all_conveyors_stopped()
+        if self.system_state == SystemState.RESETTING:
+            guards_satisfied = (
+                self.equipment.line_clear_guards_satisfied()
+                if self.recovery_policy == RecoveryPolicy.LINE_CLEAR_REQUIRED
+                else self.equipment.in_place_guards_satisfied()
+                and self._validate_fifo_alignment()
+            )
+            if guards_satisfied:
+                self.confirm_reset_completed()
+
+    def _confirm_pending_resume(self, conveyor_id: ConveyorId) -> None:
+        """새로 돌기 시작한 컨베이어를 기다리던 station cycle을 확인 처리합니다."""
+
+        for station_id, cycle in tuple(self._station_cycles.items()):
+            if (
+                cycle.conveyor_id == conveyor_id
+                and cycle.phase == StationCyclePhase.RESUME_PENDING
+            ):
+                self.confirm_conveyor_resumed(cycle.product_id, station_id)
 
     def _maybe_request_station_capture(self, station_id: StationId) -> None:
         cycle = self._station_cycles.get(station_id)
@@ -2468,8 +2320,8 @@ class MasterNode(InspectionNodeBase):
             target_conveyor_id=int(cycle.conveyor_id),
         )
         # sim profile에는 실제 conveyor status adapter가 없으므로 즉시 확인합니다.
-        # TODO(HARDWARE): Control의 station별 실제 RUN 확인 이벤트가 연결되면
-        # hardware profile에서 아래 공개 확인 진입점을 호출해야 합니다.
+        # hardware profile은 Control이 보고하는 EquipmentState의 running 전이를
+        # _handle_equipment_state에서 감지해 confirm_conveyor_resumed를 호출합니다.
         if self.profile == "sim":
             self.confirm_conveyor_resumed(product_id, station_id)
 
@@ -2931,17 +2783,13 @@ class MasterNode(InspectionNodeBase):
         )
         cycle = self._station_cycles.get(StationId.B)
         if cycle is not None and cycle.product_id == context.product_id:
-            for goal_handle in (
-                cycle.position_goal_handle,
-                cycle.capture_goal_handle,
-            ):
-                if goal_handle is None:
-                    continue
+            if cycle.capture_goal_handle is not None:
                 try:
-                    goal_handle.cancel_goal_async()
+                    cycle.capture_goal_handle.cancel_goal_async()
                 except Exception as exc:
                     self.get_logger().warning(
-                        f"Station B action cancellation failed: {type(exc).__name__}"
+                        "Station B capture cancellation failed: "
+                        f"{type(exc).__name__}"
                     )
             with self._flow_lock:
                 changed = context.mark_station_b_skipped(reason)
@@ -3327,10 +3175,16 @@ class MasterNode(InspectionNodeBase):
         """정합성 검증을 통과한 뒤 Control에 운전 재개를 요청합니다."""
 
         self._publish_system_command(SystemCommand.RESUME, reason)
-        # TODO(HARDWARE): Control의 상·하층 실제 RUN 확인 이벤트가 연결되면
-        # hardware profile에서 confirm_all_conveyors_running()을 호출합니다.
         if self.profile == "sim":
             self.confirm_all_conveyors_running()
+            return
+        # hardware profile은 Control이 보고하는 EquipmentState의 running 전이를
+        # _handle_equipment_state에서 감지해 confirm_all_conveyors_running을
+        # 호출합니다. 아래 타임아웃은 그 확인이 오지 않는 실제 고장 상황을
+        # 위한 보조 안전망입니다.
+        self._run_confirmation_deadline_ns = (
+            time.monotonic_ns() + self.conveyor_run_timeout_ms * 1_000_000
+        )
 
     def _verify_resume_conditions(self) -> bool:
         """재개 전에 노드·FIFO·센서·컨베이어 정합성을 검사합니다."""
@@ -3401,7 +3255,6 @@ class MasterNode(InspectionNodeBase):
         sensor_2_clear: bool | None = None,
         sensor_3_clear: bool | None = None,
         actuator_safe: bool | None = None,
-        actuator_area_clear: bool | None = None,
         estop_asserted: bool | None = None,
     ) -> None:
         """향후 Control typed 상태 event가 갱신할 안전 guard 진입점입니다."""
@@ -3420,8 +3273,6 @@ class MasterNode(InspectionNodeBase):
                 target[key] = value
         if actuator_safe is not None:
             self.equipment.actuator_safe = actuator_safe
-        if actuator_area_clear is not None:
-            self.equipment.actuator_area_clear = actuator_area_clear
         if estop_asserted is not None:
             self.equipment.estop_asserted = estop_asserted
             if estop_asserted:
@@ -3452,10 +3303,9 @@ class MasterNode(InspectionNodeBase):
         """
 
         goal_handles = [
-            goal_handle
+            cycle.capture_goal_handle
             for cycle in tuple(self._station_cycles.values())
-            for goal_handle in (cycle.position_goal_handle, cycle.capture_goal_handle)
-            if goal_handle is not None
+            if cycle.capture_goal_handle is not None
         ]
         if include_actuation:
             goal_handles.extend(
@@ -3692,8 +3542,8 @@ class MasterNode(InspectionNodeBase):
     def confirm_all_conveyors_stopped(self) -> None:
         """Control의 실제 정지 완료를 받은 뒤 PAUSING을 확정합니다.
 
-        실제 Sensor/Conveyor 상태 매핑이 확정되면 PositionSettled가 아닌 별도의
-        typed 장비 상태 이벤트에서 이 확장점을 호출해야 합니다.
+        hardware profile에서는 EquipmentState의 정지 확인(_handle_equipment_state)이
+        호출하고, sim profile에서는 _request_all_conveyors_stop이 즉시 호출합니다.
         """
 
         self.equipment.mark_all_stopped()
@@ -4093,6 +3943,13 @@ class MasterNode(InspectionNodeBase):
                 "conveyor stop confirmation timed out", timed_out=True
             )
         if (
+            self._run_confirmation_deadline_ns
+            and now_ns > self._run_confirmation_deadline_ns
+            and self._pending_run_confirmation
+        ):
+            self._run_confirmation_deadline_ns = 0
+            self.report_run_failed("conveyor RUN confirmation timed out")
+        if (
             self._shutdown_deadline_ns
             and now_ns > self._shutdown_deadline_ns
             and self.shutdown_phase == ShutdownPhase.WAITING_STOP
@@ -4129,26 +3986,20 @@ class MasterNode(InspectionNodeBase):
                 self._finish_capture_failure(
                     station_id, "CaptureProduct timed out"
                 )
-            elif cycle.phase == StationCyclePhase.POSITION_GOAL:
-                if cycle.position_goal_handle is not None:
-                    try:
-                        cycle.position_goal_handle.cancel_goal_async()
-                    except Exception:
-                        pass
-                self._pause_station_for_recovery(
-                    station_id,
-                    "PositionProduct Goal response timed out before command acceptance",
-                )
             elif cycle.phase == StationCyclePhase.WAITING_POSITION:
-                if cycle.position_goal_handle is not None:
-                    try:
-                        cycle.position_goal_handle.cancel_goal_async()
-                    except Exception:
-                        pass
-                self._fault_stop(
-                    "PositionProduct timed out after Goal acceptance; physical "
-                    "position is unknown"
-                )
+                if self.equipment.conveyor_running.get(cycle.conveyor_id):
+                    # 컨베이어가 여전히 RUNNING이면 자율 이동이 시작된 적이
+                    # 없다는 뜻이라 물리적으로 아무 일도 안 일어났습니다.
+                    self._pause_station_for_recovery(
+                        station_id,
+                        f"{cycle.conveyor_id.name} conveyor PositionSettled timed "
+                        "out while still RUNNING; positioning never started",
+                    )
+                else:
+                    self._fault_stop(
+                        f"{cycle.conveyor_id.name} conveyor PositionSettled timed "
+                        "out after leaving RUNNING; physical position is unknown"
+                    )
             elif cycle.phase == StationCyclePhase.RESUME_PENDING:
                 self._deferred_capture_resumes.add(
                     (cycle.product_id, station_id)

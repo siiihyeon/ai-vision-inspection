@@ -19,6 +19,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SystemCommand.msg"
   "msg/SensorEvent.msg"
   "msg/PositionSettled.msg"
+  "msg/EquipmentState.msg"
   "msg/ImageReference.msg"
   "msg/StationResult.msg"
   "msg/StationInferenceFailed.msg"
@@ -32,7 +33,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/OperatorCommand.srv"
   "srv/ReplayStationResults.srv"
   "action/InitializeNode.action"
-  "action/PositionProduct.action"
   "action/CaptureProduct.action"
   "action/ActuateProduct.action"
   DEPENDENCIES builtin_interfaces

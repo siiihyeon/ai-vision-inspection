@@ -168,10 +168,8 @@ class MasterContractTests(unittest.TestCase):
         context.begin_station_cycle(
             station_id,
             position_command_id=position_command_id,
-            target_step=100 * int(station_id),
             capture_id=capture_id,
         )
-        context.mark_position_action_succeeded(station_id, position_command_id)
         context.mark_position_settled(station_id, position_command_id)
         context.mark_capture_requested(
             station_id,
@@ -641,10 +639,8 @@ class MasterContractTests(unittest.TestCase):
         context.begin_station_cycle(
             StationId.A,
             position_command_id="position-a",
-            target_step=100,
             capture_id="capture-race",
         )
-        context.mark_position_action_succeeded(StationId.A, "position-a")
         context.mark_position_settled(StationId.A, "position-a")
         context.mark_capture_requested(
             StationId.A,
@@ -687,10 +683,8 @@ class MasterContractTests(unittest.TestCase):
         context.begin_station_cycle(
             StationId.A,
             position_command_id="position-a",
-            target_step=100,
             capture_id="capture-a",
         )
-        context.mark_position_action_succeeded(StationId.A, "position-a")
         context.mark_position_settled(StationId.A, "position-a")
         context.mark_capture_requested(
             StationId.A,
@@ -783,7 +777,6 @@ class MasterContractTests(unittest.TestCase):
         snapshot.actuator_safe = True
         self.assertTrue(snapshot.in_place_guards_satisfied())
         snapshot.sensor_clear = {1: True, 2: True, 3: True}
-        snapshot.actuator_area_clear = True
         snapshot.line_clear_confirmed = True
         snapshot.operator_id = "operator"
         self.assertTrue(snapshot.line_clear_guards_satisfied())
@@ -822,7 +815,6 @@ class StationMessageClassificationTests(unittest.TestCase):
         context.begin_station_cycle(
             StationId.A,
             position_command_id="position-a",
-            target_step=100,
             capture_id=active_capture_id,
         )
         ledger.register_capture(active_capture_id, "product-1", StationId.A)

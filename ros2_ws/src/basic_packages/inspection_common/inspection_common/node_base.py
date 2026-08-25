@@ -336,9 +336,13 @@ class InspectionNodeBase(Node):
         elif message.command_type == SystemCommand.RESET:
             self.system_state = SystemState.RESETTING
             self.health_state = NodeHealthState.RECOVERING
+        self.handle_all_conveyors_command(message)
 
     def handle_targeted_conveyor_command(self, _message: SystemCommand) -> None:
         """특정 컨베이어 명령을 Control adapter가 구현할 확장점입니다."""
+
+    def handle_all_conveyors_command(self, _message: SystemCommand) -> None:
+        """전체 컨베이어 대상 명령을 Control adapter가 구현할 확장점입니다."""
 
     def _master_heartbeat_alive(self) -> bool:
         if self.node_id == NodeId.MASTER:

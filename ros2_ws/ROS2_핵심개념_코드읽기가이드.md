@@ -84,7 +84,7 @@
 | `NodeHeartbeat` | Message | header, node_id, sequence, health_state, interface_version |
 | `GetNodeStatus` | Service | 노드 상태 즉시 조회 |
 | `InitializeNode` | Action | 노드 자원 초기화 |
-| `PositionProduct` | Action | 제품 촬영 위치 이동 |
+| `PositionSettled` | Message | Mega 자율 이동 결과 보고 (Action 아님) |
 | `CaptureProduct` | Action | 동기 촬영·파일 저장·추론 Queue 등록 |
 | `ActuateProduct` | Action | 정상 통과 또는 NG 분류 |
 | `NodeId` | Python `StrEnum` | master, control, vision, log |
@@ -277,7 +277,7 @@ CommandHeader
 | `payload_digest` | 같은 ID에 다른 명령 내용이 들어오는 충돌을 검출 |
 | `issued_at` | 명령 발행 시각 기록 |
 
-`PositionProduct`, `CaptureProduct`, `ActuateProduct`, `SystemCommand`가 이 구조를 사용한다.
+`CaptureProduct`, `ActuateProduct`, `SystemCommand`가 이 구조를 사용한다.
 수신 노드는 실행 전에 세션, epoch, UUID 형식, digest, 현재 시스템 상태를 검증한다.
 
 ### Callback
@@ -813,19 +813,16 @@ INITIALIZING    → Master 전체 시스템 FSM 상태
 
 공통 검증은 `InspectionNodeBase._execute_initialize()`가 담당하고, 실제 노드별 자원 준비는 `initialize_node_resources()`가 담당한다.
 
-### PositionProduct
+### Position은 Action이 아니다
 
-**출처:** 프로젝트 정의 (`inspection_interfaces/action/PositionProduct.action`)
-
-**한 줄 정의:** Master가 Control에 특정 제품을 지정 스테이션 촬영 위치로 이동시키도록 요청하는 Action.
-
-```text
-PositionProduct
-├─ Goal: command, product_id, fifo_sequence, station_id, conveyor_id, target_step
-├─ Result: success, product_id, station_id, position_command_id,
-│          estimated_step, position_error_steps, position_source, error_code, reason
-└─ Feedback: stage, estimated_step
-```
+Position 이동에는 Action이 없다. 컨베이어가 `RUNNING` 상태에서 센서가
+제품을 감지하면 Mega가 미리 `SET_OFFSET`으로 받아둔 step 수만큼 스스로
+이동·정지하고, Control은 `E|POSITION` 이벤트를 그대로 `PositionSettled`
+토픽으로 옮겨 발행한다. Master는 이걸 요청하지 않고 구독만 하며,
+`conveyor_id`로 어느 station cycle인지 매칭한다(한 station엔 항상 최대
+하나의 cycle만 활성 상태라 모호함이 없다). Mega 왕복 지연의 jitter가
+정밀한 위치 정렬을 방해하기 때문에, 결정론적 타이밍이 필요한 이 부분만
+MCU가 직접 맡도록 설계를 바꾼 결과다.
 
 ### CaptureProduct
 
@@ -960,7 +957,6 @@ MasterNode
 │  ├─ Control InitializeNode ActionClient
 │  ├─ Vision InitializeNode ActionClient
 │  └─ Log InitializeNode ActionClient
-├─ position_client: Control PositionProduct ActionClient
 ├─ capture_client: Vision CaptureProduct ActionClient
 ├─ actuate_client: Control ActuateProduct ActionClient
 ├─ 업무 Subscription

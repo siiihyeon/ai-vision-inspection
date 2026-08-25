@@ -10,7 +10,6 @@ from inspection_common import ConveyorId, StationId
 
 
 class StationCyclePhase(StrEnum):
-    POSITION_GOAL = "POSITION_GOAL"
     WAITING_POSITION = "WAITING_POSITION"
     CAPTURE_GOAL = "CAPTURE_GOAL"
     WAITING_CAPTURE_RESULT = "WAITING_CAPTURE_RESULT"
@@ -60,10 +59,8 @@ class StationCycle:
     conveyor_id: ConveyorId
     position_command_id: str
     capture_id: str
-    target_step: int
-    phase: StationCyclePhase = StationCyclePhase.POSITION_GOAL
+    phase: StationCyclePhase = StationCyclePhase.WAITING_POSITION
     deadline_ns: int = 0
-    position_goal_handle: object | None = None
     capture_goal_handle: object | None = None
 
 
@@ -98,7 +95,6 @@ class EquipmentSnapshot:
         default_factory=lambda: {1: None, 2: None, 3: None}
     )
     actuator_safe: bool | None = None
-    actuator_area_clear: bool | None = None
     line_clear_confirmed: bool = False
     estop_asserted: bool = False
     operator_id: str = ""
@@ -109,7 +105,6 @@ class EquipmentSnapshot:
         snapshot.mark_all_stopped()
         snapshot.sensor_clear = {1: True, 2: True, 3: True}
         snapshot.actuator_safe = True
-        snapshot.actuator_area_clear = True
         snapshot.line_clear_confirmed = True
         snapshot.operator_id = "sim"
         return snapshot
@@ -139,7 +134,6 @@ class EquipmentSnapshot:
             and self.all_conveyors_stopped()
             and self.all_sensors_clear()
             and self.actuator_safe is True
-            and self.actuator_area_clear is True
             and not self.estop_asserted
         )
 

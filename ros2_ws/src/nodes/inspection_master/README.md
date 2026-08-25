@@ -42,9 +42,11 @@ decoder가 남아 있고, Control의 Mega/TB6600·액추에이터 adapter는 pla
 - 따라서 각 worker의 `initialize_node_resources()`는 같은 프로세스에서 여러 번
   호출되어도 안전해야 합니다. 이미 연 장치·파일·DB를 재사용하거나 새 자원으로
   교체한 뒤 이전 자원을 명시적으로 닫는 멱등 재초기화 계약을 지켜야 합니다.
-- `PositionProduct` Goal 수락 전 응답 timeout은 장비가 움직이지 않은 것으로
-  보고 `PAUSED`에서 복구하지만, Goal 수락 후 결과·위치를 신뢰할 수 없으면
-  `FAULT_STOP + LINE_CLEAR_REQUIRED`입니다.
+- Position은 Action이 아닙니다. Mega가 센서 감지 후 자율로 이동·정지하고
+  `PositionSettled`만 보고하며, Master는 `cycle.deadline_ns` 안에 이 이벤트가
+  안 오면 `EquipmentState`로 컨베이어가 아직 RUNNING인지 봅니다 — 여전히
+  RUNNING이면 이동이 시작된 적이 없다는 뜻이라 `PAUSED`에서 복구하고,
+  RUNNING을 벗어났으면 물리 위치를 신뢰할 수 없으므로 `FAULT_STOP`합니다.
 - 액추에이터 Goal이 수락된 뒤 완료 여부를 알 수 없으면 물리 상태가 불명하므로 `FAULT_STOP`입니다.
 - 완료 제품은 활성 FIFO에서 즉시 빠지지만 late result 진단을 위해 Context를 10분 보존한 뒤 bounded tombstone으로 전환합니다.
 - Master local spool 장애 시 health를 `DEGRADED`로 내리고 내구성 보장 없이
@@ -63,25 +65,35 @@ decoder가 남아 있고, Control의 Mega/TB6600·액추에이터 adapter는 pla
 - LINE_CLEAR·제자리 복구와 종료 시 Master가 보유한 Action Goal에 취소를
   요청합니다. 취소는 best-effort이며 실제 안전 정지는 RESET·PAUSE 명령과
   Control adapter의 안전 출력이 보장해야 합니다.
-- 이미 회수된 station cycle의 늦은 `PositionSettled`는 경고 후 무시하며,
-  살아 있는 cycle과 identity·target이 충돌할 때만 `FAULT_STOP` 처리합니다.
+- 이미 회수됐거나 아직 위치 대기 단계가 아닌 station cycle에 도착한 늦은
+  `PositionSettled`는 경고 후 무시합니다. `conveyor_id`로만 매칭하며(한
+  station엔 항상 최대 하나의 cycle만 활성이므로 모호함이 없습니다),
+  Master가 명령을 보내지 않으므로 identity·target 불일치 개념이 없습니다.
 
 ## 하드웨어 통합 전 남은 Control → Master 계약
 
-현재 Master의 장비 상태 반영 함수는 구현되어 있지만 이를 호출할 typed ROS
-message는 아직 없습니다. Control 담당자와 다음 계약을 확정한 뒤 별도 통합
-작업으로 연결합니다.
+`EquipmentState`는 이미 구현되어 연결되어 있습니다. Control이 상태가 바뀔
+때만 발행하고, Master `_handle_equipment_state`가 안전 guard mirror 갱신과
+station별 재가동 확인(`_confirm_pending_resume` → `confirm_conveyor_resumed`)에
+사용합니다. 필드는 상·하층 실제 RUN/STOP, Sensor1/2/3 CLEAR, 액추에이터 안전
+위치뿐이며, 작업 구역 CLEAR와 E-stop은 보고할 센서가 없어 포함하지 않습니다.
+
+다음 계약은 아직 Control 담당자와 확정되지 않았습니다.
 
 | 계약 | 포함해야 할 정보 | 사용 목적 |
 |---|---|---|
-| `EquipmentState` 성격의 상태 message | 상·하층 실제 RUN/STOP, Sensor1/2/3 CLEAR, 액추에이터 안전 위치·작업 구역 CLEAR, E-stop | START·PAUSE·RESET·LINE_CLEAR guard |
-| `EquipmentCommandResult` 성격의 완료 event | 원본 `command_id`, 명령 종류, 대상 컨베이어, 성공 여부, 실제 상태, 오류 코드·사유 | 전체 RUN/STOP/RESET 및 촬영 후 층별 재가동 확인 |
+| `EquipmentCommandResult` 성격의 완료 event | 원본 `command_id`, 명령 종류, 대상 컨베이어, 성공 여부, 실제 상태, 오류 코드·사유 | 전체 RUN/STOP/RESET 확인, 촬영 후 층별 재가동 확인 |
 
 단순 현재 상태만 보고 층별 재가동을 확정하면 다른 명령의 결과를 잘못 연결할
 수 있으므로 완료 event에는 원본 `command_id` 상관관계가 필요합니다.
 Control의 장시간 Position·Actuation 실행 루프는 cancel 요청을 주기적으로
 확인하고, RESET 또는 `command_epoch` 변경 시 이전 명령을 폐기해야 합니다.
 Action server가 cancel 요청을 수락했다는 사실만으로 물리 정지를 확정하면 안 됩니다.
+`EquipmentState`의 running 전이는 station별 재가동 확인뿐 아니라 시스템 전체
+START 확인(`confirm_all_conveyors_running`)에도 쓰입니다 — 두 컨베이어가 모두
+running으로 확인되면 `_handle_equipment_state`가 바로 호출하며,
+`master.action.conveyor_run_timeout_ms` 타임아웃은 이 확인이 오지 않는
+실제 고장 상황을 위한 안전망으로만 남습니다.
 
 ## 개발용 터미널 명령
 
