@@ -20,6 +20,7 @@ from inspection_common.node_base import (
     InspectionNodeBase,
     NodeInitializationOutcome,
     reliable_event_qos,
+    state_qos,
     spin_node,
 )
 from inspection_interfaces.action import ActuateProduct
@@ -66,8 +67,9 @@ class ControlNode(InspectionNodeBase):
             PositionSettled, "control/position_settled", reliable_event_qos()
         )
         self._equipment_state_publisher = self.create_publisher(
-            EquipmentState, "control/equipment_state", reliable_event_qos()
+            EquipmentState, "control/equipment_state", state_qos()
         )
+        self._latest_equipment_state: tuple[int, int, bool, bool, bool, bool] | None = None
         self._mega = None
         self._mega_thread: threading.Thread | None = None
         self._mega_lock = threading.RLock()
@@ -166,6 +168,20 @@ class ControlNode(InspectionNodeBase):
         """향후 serial adapter가 debounced 센서 이벤트를 전달할 확장점."""
 
         self._sensor_publisher.publish(message)
+
+    def on_initialization_succeeded(
+        self, previous_session_id: str, new_session_id: str
+    ) -> None:
+        """세션이 확정된 뒤 Mega의 최신 안전 상태를 다시 발행합니다.
+
+        Mega는 포트 연결 직후 상태를 한 번만 보낼 수 있다. 그 시점은 NodeBase가
+        새 session_id를 적용하기 전이므로, 그대로 두면 Master가 session mismatch로
+        버리고 START guard 값이 None으로 남는다.
+        """
+
+        del previous_session_id, new_session_id
+        if self._latest_equipment_state is not None:
+            self._publish_equipment_state(*self._latest_equipment_state)
 
     def _publish_position_settled(self, *, conveyor_id: int, estimated_step: int) -> None:
         """Mega가 자율로 이동·정지한 결과를 그대로 옮깁니다.
@@ -400,6 +416,14 @@ class ControlNode(InspectionNodeBase):
         동일합니다: 0=RUNNING, 1=POSITIONING, 2=WAIT_CAMERA, 3=STOPPED.
         """
 
+        self._latest_equipment_state = (
+            upper_state,
+            lower_state,
+            sensor_1_clear,
+            sensor_2_clear,
+            sensor_3_clear,
+            actuator_safe,
+        )
         message = EquipmentState()
         message.header.stamp = self.get_clock().now().to_msg()
         message.header.session_id = self.session_id

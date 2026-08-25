@@ -1,9 +1,9 @@
 /inspection/vision_node:
   ros__parameters:
     # 이 경로에는 format_version=2인 4-view artifact bundle을 배포합니다.
-    vision.model.path: "/opt/inspection/models/MB_resol_180_default"
-    vision.model.version: "MB_resol_180_default"
-    vision.model.sha256: "e7a1946e5439214959283864db94099ea3f75a709d76d76129a298e5f8cab349"
+    vision.model.path: "/opt/inspection/models/MB_default"
+    vision.model.version: "MB_default"
+    vision.model.sha256: "f1734acd3078c79908cef3139f2b8f9da9b0f9b6c48f2a3ee3fd112817336056"
     vision.model.runtime: "PYTORCH_PATCHCORE_ARTIFACT"
     vision.model.cuda_required: true
     vision.model.warmup_runs: 10

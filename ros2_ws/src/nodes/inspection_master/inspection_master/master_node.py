@@ -446,7 +446,7 @@ class MasterNode(InspectionNodeBase):
             EquipmentState,
             "/inspection/control/equipment_state",
             self._handle_equipment_state,
-            reliable_event_qos(),
+            state_qos(),
         )
         self._queue_subscription = self.create_subscription(
             VisionQueueState,
@@ -677,7 +677,11 @@ class MasterNode(InspectionNodeBase):
         """READY에서 운전 명령을 보내되 실제 RUN 확인 전까지 READY를 유지합니다."""
 
         if not self._verify_start_conditions():
-            self.get_logger().warning("START_REQUEST rejected: start guard failed")
+            failures = ", ".join(self._start_guard_failures())
+            self.get_logger().warning(
+                "START_REQUEST rejected: start guard failed"
+                + (f" ({failures})" if failures else "")
+            )
             return False
         transition = self._apply_system_event(SystemEvent.START_REQUEST, reason)
         if transition is None:
@@ -891,12 +895,40 @@ class MasterNode(InspectionNodeBase):
     def _verify_start_conditions(self) -> bool:
         """READY 신규 운전의 빈 라인·노드·장비 guard를 확인합니다."""
 
-        # Block 2와 3이 구현되기 전에는 실제 START를 허용하지 않습니다.
-        return (
-            self.system_state == SystemState.READY
-            and self._all_workers_ready_for_session()
-            and self._verify_empty_line_for_new_run()
-        )
+        return not self._start_guard_failures()
+
+    def _start_guard_failures(self) -> list[str]:
+        """START를 막은 안전 조건을 작업자가 즉시 식별할 수 있게 요약합니다."""
+
+        failures: list[str] = []
+        if self.system_state != SystemState.READY:
+            failures.append(f"system_state={self.system_state.name}")
+        if not self._all_workers_ready_for_session():
+            failures.append("workers_not_ready")
+        if self.profile != "sim" and not self.hardware_mapping_confirmed:
+            failures.append("hardware_mapping_unconfirmed")
+        if not (
+            len(self.station_camera_ids[StationId.A]) == 3
+            and len(self.station_camera_ids[StationId.B]) == 1
+        ):
+            failures.append("camera_mapping_incomplete")
+        if self._log_spool is None:
+            failures.append("master_log_spool_unavailable")
+        if self.ledger.active_size != 0:
+            failures.append(f"active_products={self.ledger.active_size}")
+
+        equipment = self.equipment
+        if not equipment.line_clear_confirmed:
+            failures.append("line_clear_not_confirmed")
+        if not equipment.all_conveyors_stopped():
+            failures.append(f"conveyors_not_stopped={equipment.conveyor_stopped}")
+        if not equipment.all_sensors_clear():
+            failures.append(f"sensors_not_clear={equipment.sensor_clear}")
+        if equipment.actuator_safe is not True:
+            failures.append(f"actuator_not_safe={equipment.actuator_safe}")
+        if equipment.estop_asserted:
+            failures.append("estop_asserted")
+        return failures
 
     def _apply_system_event(
         self, event: SystemEvent, reason: str
@@ -2874,8 +2906,16 @@ class MasterNode(InspectionNodeBase):
     def _request_station_result_replay(self) -> None:
         """Vision/Log 재시작 뒤 현재 session의 durable terminal을 page 단위 복원합니다."""
 
+        # Replay service 자체는 LogNode 프로세스가 띄자마자 생성되지만,
+        # SQLite repository는 InitializeNode Action이 성공해야 사용할 수 있습니다.
+        # BOOT/초기화 전에 service readiness만 보고 요청하면 2초마다
+        # "Log repository is not initialized" 경고가 반복됩니다. Master가
+        # Action·status·heartbeat로 Log READY를 확인한 뒤에만 조회합니다.
+        log_state = self.worker_states.get(NodeId.LOG)
         if (
-            self._station_replay_inflight
+            log_state is None
+            or not log_state.ready
+            or self._station_replay_inflight
             or self._station_replay_completed_generation
             == self._station_replay_generation
             or not self.session_id

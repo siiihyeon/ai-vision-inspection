@@ -6,13 +6,18 @@
 
 ### 명령용 두 번째 터미널 준비
 
-launch를 띄운 첫 번째 터미널은 그대로 두고, 운전 명령(`op`)이나 topic 확인은 새 터미널에서 합니다.
+launch를 띄운 첫 번째 터미널은 그대로 두고, 운전 명령(`op`)이나 topic 확인은 새 터미널에서 합니다. `op`는 `ros2_ws/tools/operator_command.sh`를 가리키는 셸 alias이며 리포에 포함되어 있지 않으므로, 아래 블록이 없으면 최초 1회 자동으로 `~/.bash_aliases`에 등록합니다 (이미 등록돼 있으면 건너뜁니다).
 
 ```bash
 cd ~/ai-vision-inspection/ros2_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
+grep -qxF "alias op='~/ai-vision-inspection/ros2_ws/tools/operator_command.sh'" ~/.bash_aliases 2>/dev/null || \
+  echo "alias op='~/ai-vision-inspection/ros2_ws/tools/operator_command.sh'" >> ~/.bash_aliases
+source ~/.bash_aliases
 ```
+
+이제 이 터미널에서 `op init`, `op line-clear`, `op start` 처럼 바로 쓸 수 있습니다.
 
 ### 실행 노드 확인
 
