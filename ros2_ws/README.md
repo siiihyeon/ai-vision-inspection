@@ -25,7 +25,7 @@ ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 | `/inspection/master/operator_command` | `OperatorCommand` Service | CLI/HMI → Master |
 | `/inspection/{worker}/initialize` | `InitializeNode` Action | Master → workers |
 | `/inspection/master/system_command` | `SystemCommand` | Master → workers |
-| `/inspection/control/position_product` | `PositionProduct` Action | Master → Control |
+| `/inspection/control/position_settled` | `PositionSettled` | Control → Master (Mega 자율 이동 결과, Action 아님) |
 | `/inspection/vision/capture_product` | `CaptureProduct` Action | Master → Vision |
 | `/inspection/vision/station_result` | `StationResult` | Vision → Master |
 | `/inspection/master/product_result_locked` | `ProductResultLocked` | Master → Vision/Control/Log |

@@ -7,7 +7,8 @@
 // Workflow
 // 1) HC-SR04 #1 detects product
 //    -> report SENSOR_1
-//    -> Master (via Control Node) sends POSITION|1|step_count
+//    -> Conveyor 1 autonomously moves its configured camera offset
+//       (configured by Control Node with SET_OFFSET)
 //    -> Conveyor 1 moves to the camera position and stops
 //    -> report POSITION settled
 //
@@ -136,13 +137,15 @@ struct ConveyorController {
   long runSpeed;
   uint8_t conveyorId;
   ConveyorState state;
-  long positionCommandSequence;
+  // Sensor sequence that caused this autonomous positioning cycle.
+  long positionSensorSequence;
   long positionTargetSteps;
+  long cameraOffsetSteps;
 };
 
 ConveyorController conveyors[2] = {
-  { &conveyor1, CONV1_EN, CONV1_SPEED, 1, CONV_RUNNING, 0, 0 },
-  { &conveyor2, CONV2_EN, CONV2_SPEED, 2, CONV_RUNNING, 0, 0 }
+  { &conveyor1, CONV1_EN, CONV1_SPEED, 1, CONV_STOPPED, 0, 0, 0 },
+  { &conveyor2, CONV2_EN, CONV2_SPEED, 2, CONV_STOPPED, 0, 0, 0 }
 };
 
 
@@ -283,7 +286,7 @@ void sendSensorEvent(uint8_t sensorId, uint32_t sensorSequence) {
 
 
 void sendPositionSettled(uint8_t conveyorId, long movedSteps) {
-  // E|POSITION|conveyor_id|step_count|position_command_sequence
+  // E|POSITION|conveyor_id|step_count|sensor_sequence
   char body[96];
   ConveyorController& conveyor = conveyors[conveyorId - 1];
   snprintf(
@@ -292,7 +295,7 @@ void sendPositionSettled(uint8_t conveyorId, long movedSteps) {
     "E|POSITION|%u|%ld|%ld",
     conveyorId,
     movedSteps,
-    conveyor.positionCommandSequence
+    conveyor.positionSensorSequence
   );
   sendFrame(body);
 }
@@ -386,12 +389,12 @@ void stopConveyor(uint8_t index) {
 }
 
 
-bool startAutomaticPosition(uint8_t index, long targetSteps, long commandSequence) {
+bool startAutomaticPosition(uint8_t index, long targetSteps, long sensorSequence) {
   if (index > 1) return false;
 
   ConveyorController& conveyor = conveyors[index];
 
-  // Positioning is explicitly owned by the host POSITION command.
+  // Only a normally running conveyor can begin autonomous positioning.
   if (conveyor.state != CONV_RUNNING) {
     return false;
   }
@@ -408,7 +411,7 @@ bool startAutomaticPosition(uint8_t index, long targetSteps, long commandSequenc
   conveyor.motor->move(signedOffset);
   conveyor.motor->setMaxSpeed(labs(conveyor.runSpeed));
   conveyor.motor->setAcceleration(CONV_ACCELERATION);
-  conveyor.positionCommandSequence = commandSequence;
+  conveyor.positionSensorSequence = sensorSequence;
   conveyor.positionTargetSteps = targetSteps;
 
   conveyor.state = CONV_POSITIONING;
@@ -478,8 +481,15 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
     sensor.detectionArmed = false;
     ++sensor.detectionSequence;
 
-    // Master owns positioning; this event only reports the sensor edge.
+    // Report the edge before beginning the local positioning cycle.
     sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
+    if (conveyors[0].cameraOffsetSteps > 0) {
+      startAutomaticPosition(
+        0,
+        conveyors[0].cameraOffsetSteps,
+        sensor.detectionSequence
+      );
+    }
     return;
   }
 
@@ -493,6 +503,13 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
     ++sensor.detectionSequence;
 
     sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
+    if (conveyors[1].cameraOffsetSteps > 0) {
+      startAutomaticPosition(
+        1,
+        conveyors[1].cameraOffsetSteps,
+        sensor.detectionSequence
+      );
+    }
     return;
   }
 
@@ -715,6 +732,31 @@ void handleCommand(char* line) {
   }
 
   // ----------------------------------------------------------
+  // SET_OFFSET
+  // C|seq|SET_OFFSET|1|15100
+  // C|seq|SET_OFFSET|2|7700
+  // ----------------------------------------------------------
+  if (strcmp(operation, "SET_OFFSET") == 0) {
+    char* conveyorText = strtok_r(nullptr, "|", &savePtr);
+    char* stepsText = strtok_r(nullptr, "|", &savePtr);
+
+    if (conveyorText == nullptr || stepsText == nullptr) {
+      acknowledge(sequence, "ERR");
+      return;
+    }
+
+    int conveyorId = atoi(conveyorText);
+    long steps = atol(stepsText);
+
+    if ((conveyorId == 1 || conveyorId == 2) && steps > 0) {
+      conveyors[conveyorId - 1].cameraOffsetSteps = steps;
+      acknowledge(sequence, "OK");
+    } else {
+      acknowledge(sequence, "ERR");
+    }
+    return;
+  }
+
   // RUN
   // C|seq|RUN|1
   // C|seq|RUN|2
@@ -796,9 +838,8 @@ void handleCommand(char* line) {
   }
 
   // ----------------------------------------------------------
-  // POSITION command.
-  // Master decides when a conveyor moves; this is the only command
-  // that starts a positioning cycle.
+  // Optional manual POSITION command for maintenance compatibility.
+  // Normal operation starts positioning locally from Sensor 1/2.
   //
   // C|seq|POSITION|conveyor_id|steps
   // ----------------------------------------------------------
@@ -900,9 +941,9 @@ void setup() {
   sorterServo.attach(SERVO_PIN);
   sorterServo.write(SERVO_HOME_ANGLE);
 
-  // Start both conveyors independently.
-  conveyors[0].state = CONV_RUNNING;
-  conveyors[1].state = CONV_RUNNING;
+  // Stay stopped until ControlNode completes initialization and sends RUN.
+  conveyors[0].state = CONV_STOPPED;
+  conveyors[1].state = CONV_STOPPED;
 
   // No plain-text Serial debug output here.
   // All PC-facing messages use CRC-framed protocol packets.
