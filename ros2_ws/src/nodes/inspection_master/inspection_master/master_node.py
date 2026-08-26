@@ -131,6 +131,9 @@ class MasterNode(InspectionNodeBase):
         self.declare_parameter("system.init_timeout_ms", 10000)
         self.declare_parameter("master.fifo.soft_limit", 18)
         self.declare_parameter("master.fifo.hard_capacity", 20)
+        self.declare_parameter(
+            "master.station_b.skip_after_station_a_ng", False
+        )
         self.declare_parameter("master.sensor_ids.sensor_1", "SENSOR_1")
         self.declare_parameter("master.sensor_ids.sensor_2", "SENSOR_2")
         self.declare_parameter("master.sensor_ids.sensor_3", "SENSOR_3")
@@ -171,6 +174,11 @@ class MasterNode(InspectionNodeBase):
         self.fifo_soft_limit = int(self.get_parameter("master.fifo.soft_limit").value)
         self.fifo_hard_capacity = int(
             self.get_parameter("master.fifo.hard_capacity").value
+        )
+        self.skip_station_b_after_station_a_ng = bool(
+            self.get_parameter(
+                "master.station_b.skip_after_station_a_ng"
+            ).value
         )
         self.sensor_id_to_index = {
             str(self.get_parameter("master.sensor_ids.sensor_1").value): 1,
@@ -301,6 +309,9 @@ class MasterNode(InspectionNodeBase):
                 "expected_interface_version": self.expected_interface_version,
                 "profile": self.profile,
                 "fifo_limits": [self.fifo_soft_limit, self.fifo_hard_capacity],
+                "skip_station_b_after_station_a_ng": (
+                    self.skip_station_b_after_station_a_ng
+                ),
                 "sensor_ids": sorted(self.sensor_id_to_index.items()),
                 "accepted_sensor_edge": self.accepted_sensor_edge,
                 "hardware_mapping_confirmed": self.hardware_mapping_confirmed,
@@ -619,6 +630,9 @@ class MasterNode(InspectionNodeBase):
                 "fifo_active_size": len(active),
                 "fifo_soft_limit": self.fifo_soft_limit,
                 "fifo_hard_capacity": self.fifo_hard_capacity,
+                "skip_station_b_after_station_a_ng": (
+                    self.skip_station_b_after_station_a_ng
+                ),
                 "active_product_ids": [item.product_id for item in active],
                 "pause_reason": (
                     self.pause_reason.name if self.pause_reason is not None else ""
@@ -2804,6 +2818,19 @@ class MasterNode(InspectionNodeBase):
         self, context, reason: str
     ) -> None:
         """A terminal NG/실패 즉시 B의 미시작·대기·active 작업을 취소합니다."""
+
+        if not self.skip_station_b_after_station_a_ng:
+            self._emit_log_event(
+                severity=LogEvent.INFO,
+                event_type="STATION_B_RETAINED_AFTER_A_TERMINAL_NG",
+                product_id=context.product_id,
+                payload={
+                    **context.snapshot(),
+                    "reason": reason,
+                    "skip_after_station_a_ng": False,
+                },
+            )
+            return
 
         with self._flow_lock:
             context.request_station_b_skip(reason)
