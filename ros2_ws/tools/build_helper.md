@@ -9,11 +9,11 @@
 launch를 띄운 첫 번째 터미널은 그대로 두고, 운전 명령(`op`)이나 topic 확인은 새 터미널에서 합니다. `op`는 `ros2_ws/tools/operator_command.sh`를 가리키는 셸 alias이며 리포에 포함되어 있지 않으므로, 아래 블록이 없으면 최초 1회 자동으로 `~/.bash_aliases`에 등록합니다 (이미 등록돼 있으면 건너뜁니다).
 
 ```bash
-cd ~/ai-vision-inspection/ros2_ws
+cd ~/ai-vision-inspection-main/ros2_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-grep -qxF "alias op='~/ai-vision-inspection/ros2_ws/tools/operator_command.sh'" ~/.bash_aliases 2>/dev/null || \
-  echo "alias op='~/ai-vision-inspection/ros2_ws/tools/operator_command.sh'" >> ~/.bash_aliases
+grep -qxF "alias op='~/ai-vision-inspection-main/ros2_ws/tools/operator_command.sh'" ~/.bash_aliases 2>/dev/null || \
+  echo "alias op='~/ai-vision-inspection-main/ros2_ws/tools/operator_command.sh'" >> ~/.bash_aliases
 source ~/.bash_aliases
 ```
 
@@ -78,7 +78,7 @@ launch를 실행한 터미널에서 눌러 네 노드의 안전 종료 절차를
 빌드부터 환경 적용까지 한 번에:
 
 ```bash
-cd ~/ai-vision-inspection/ros2_ws && \
+cd ~/ai-vision-inspection-main/ros2_ws && \
 source /opt/ros/jazzy/setup.bash && \
 colcon build --symlink-install --cmake-force-configure \
   --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 && \
@@ -96,7 +96,7 @@ ros2 launch inspection_bringup inspection_system.launch.py profile:=hardware
 빌드부터 환경 적용까지 한 번에:
 
 ```bash
-cd ~/ai-vision-inspection/ros2_ws && \
+cd ~/ai-vision-inspection-main/ros2_ws && \
 source /opt/ros/jazzy/setup.bash && \
 colcon build --symlink-install --cmake-force-configure \
   --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3 && \
