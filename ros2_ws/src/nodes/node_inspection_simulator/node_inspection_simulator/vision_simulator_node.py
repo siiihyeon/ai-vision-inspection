@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import struct
 import time
 import zlib
@@ -31,6 +32,33 @@ from inspection_interfaces.msg import (
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 
+_STATION_A_ID = 1
+_SCORE_POOL_SIZE = 100
+_SCORE_POOL_SEED = 20260827
+_SCORE_POOL_RNG = random.Random(_SCORE_POOL_SEED)
+_SCORE_POOL = tuple(_SCORE_POOL_RNG.random() for _ in range(_SCORE_POOL_SIZE))
+_LOW_SCORE_BAND = (0.02, 0.35)
+_HIGH_SCORE_BAND = (0.55, 0.95)
+
+
+def _is_ng_target_sequence(fifo_sequence: int) -> bool:
+    """Products alternate NG/PASS by fifo_sequence: 1=NG, 2=PASS, 3=NG, ..."""
+    return fifo_sequence % 2 == 1
+
+
+def _simulated_image_score(
+    fifo_sequence: int, station_id: int, camera_index: int, *, spike: bool
+) -> float:
+    """Deterministic per-image anomaly score drawn from a fixed 100-value pool.
+
+    `spike` places the score in the high band (>= threshold candidate); every
+    other image lands in the low band, so a product's images vary individually
+    even though the product-level verdict follows the alternating pattern.
+    """
+    pool_index = (fifo_sequence * 7 + station_id * 3 + camera_index) % len(_SCORE_POOL)
+    low, high = _HIGH_SCORE_BAND if spike else _LOW_SCORE_BAND
+    return low + _SCORE_POOL[pool_index] * (high - low)
+
 
 class VisionSimulatorNode(InspectionNodeBase):
     """Deterministic replacement for the camera and inference node."""
@@ -39,10 +67,7 @@ class VisionSimulatorNode(InspectionNodeBase):
         super().__init__(NodeId.VISION, provides_initialize_action=True)
         self.declare_parameter("vision_sim.output_root", "/tmp/inspection/vision_sim")
         self.declare_parameter("vision_sim.result_delay_ms", 100)
-        self.declare_parameter("vision_sim.station_a_verdict", "PASS")
-        self.declare_parameter("vision_sim.station_b_verdict", "PASS")
-        self.declare_parameter("vision_sim.station_a_score", 0.10)
-        self.declare_parameter("vision_sim.station_b_score", 0.10)
+        self.declare_parameter("vision_sim.ng_threshold", 0.5)
         self.declare_parameter("vision_sim.failure_mode", "none")
         self.declare_parameter("vision_sim.model_version", "sim-model-v1")
 
@@ -193,16 +218,6 @@ class VisionSimulatorNode(InspectionNodeBase):
 
     def _publish_station_outcome(self, request: CaptureProduct.Goal) -> None:
         station_id = int(request.station_id)
-        verdict_parameter = (
-            "vision_sim.station_a_verdict"
-            if station_id == 1
-            else "vision_sim.station_b_verdict"
-        )
-        score_parameter = (
-            "vision_sim.station_a_score"
-            if station_id == 1
-            else "vision_sim.station_b_score"
-        )
         failure_mode = str(self.get_parameter("vision_sim.failure_mode").value).lower()
         if failure_mode in {"inference", "timeout"}:
             message = StationInferenceFailed()
@@ -224,6 +239,20 @@ class VisionSimulatorNode(InspectionNodeBase):
             self._failure_publisher.publish(message)
             return
 
+        fifo_sequence = int(request.fifo_sequence)
+        ng_target = _is_ng_target_sequence(fifo_sequence)
+        camera_scores = [
+            _simulated_image_score(
+                fifo_sequence,
+                station_id,
+                camera_index,
+                spike=ng_target and station_id == _STATION_A_ID and camera_index == 0,
+            )
+            for camera_index in range(len(request.required_camera_ids))
+        ]
+        score = max(camera_scores)
+        threshold = float(self.get_parameter("vision_sim.ng_threshold").value)
+
         message = StationResult()
         self._fill_header(message.header, request.capture_id)
         message.product_id = request.product_id
@@ -233,9 +262,8 @@ class VisionSimulatorNode(InspectionNodeBase):
         message.frame_batch_id = f"sim-frame-{request.capture_id}"
         message.inference_job_id = f"sim-job-{request.capture_id}"
         message.result_revision = 1
-        verdict = str(self.get_parameter(verdict_parameter).value).upper()
-        message.verdict = StationResult.NG if verdict == "NG" else StationResult.PASS
-        message.score = float(self.get_parameter(score_parameter).value)
+        message.verdict = StationResult.NG if score >= threshold else StationResult.PASS
+        message.score = score
         message.model_version = str(self.get_parameter("vision_sim.model_version").value)
         message.completed_at = self.get_clock().now().to_msg()
         self._result_publisher.publish(message)
