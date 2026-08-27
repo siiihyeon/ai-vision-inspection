@@ -9,7 +9,13 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
-        (f"share/{package_name}/launch", ["launch/inspection_system_sim.launch.py"]),
+        (
+            f"share/{package_name}/launch",
+            [
+                "launch/inspection_system_sim.launch.py",
+                "launch/inspection_system_hardware_result_sim.launch.py",
+            ],
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
