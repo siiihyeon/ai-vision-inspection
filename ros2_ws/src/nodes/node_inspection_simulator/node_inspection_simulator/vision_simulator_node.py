@@ -105,6 +105,11 @@ class VisionSimulatorNode(InspectionNodeBase):
         self._publish_queue_state(VisionQueueState.ACCEPTING, "")
         self.get_logger().info("Vision simulator started; real VisionNode is not required")
 
+    def validate_hardware_profile(self) -> list[str]:
+        # The simulator never touches real cameras or a GPU, in sim or
+        # hardware profile, so there is no hardware configuration to check.
+        return []
+
     async def initialize_node_resources(self) -> NodeInitializationOutcome:
         return NodeInitializationOutcome(
             success=True,
