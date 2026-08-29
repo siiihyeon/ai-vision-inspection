@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""4-view PatchCore artifact v2를 CUDA 없이 검증하고 통합 SHA를 출력합니다."""
+"""4-view PatchCore artifact v3를 CUDA 없이 검증하고 통합 SHA를 출력합니다."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ SERIAL_TO_VIEW = {
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="4-view PatchCore artifact v2 contract와 통합 SHA-256을 검사합니다."
+        description="4-view PatchCore artifact v3 contract와 통합 SHA-256을 검사합니다."
     )
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--version", required=True)

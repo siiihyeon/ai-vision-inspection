@@ -15,7 +15,7 @@ jobs:
           python-version: "3.12"
       - name: Install static analysis
         run: |
-          python3 -m pip install pyflakes==3.4.0 numpy opencv-python-headless
+          python3 -m pip install pyflakes==3.4.0 numpy opencv-python-headless scikit-learn matplotlib
           python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
       - name: Check Python undefined names and import usage
         run: pyflakes ros2_ws/src ros2_ws/tools offline_model_tools
@@ -25,6 +25,8 @@ jobs:
         run: python3 ros2_ws/tools/test_domain_contracts.py
       - name: Test PatchCore preprocessing and fake MVS SDK
         run: python3 ros2_ws/tools/test_vision_algorithms.py
+      - name: Test PatchCore v3 spatial scoring policy
+        run: python3 ros2_ws/tools/test_patchcore_v3_policy.py
 
   ros-jazzy-build:
     runs-on: ubuntu-24.04

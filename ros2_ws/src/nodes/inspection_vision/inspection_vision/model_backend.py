@@ -1,9 +1,9 @@
 """Mono8 전처리와 versioned multi-station PatchCore artifact runtime.
 
 Memory-bank construction은 운영 밖에서 수행합니다. Vision Node는 완성된
-artifact 디렉터리의 통합 SHA-256, manifest, calibration, tensor state를 모두
-검증한 뒤 CUDA 추론만 수행합니다. Threshold와 margin은 오직 manifest에서
-읽으며 ROS parameter나 코드 기본값으로 대체하지 않습니다.
+artifact 디렉터리의 통합 SHA-256, manifest, 공간 calibration, tensor state를 모두
+검증한 뒤 CUDA 추론만 수행합니다. Full-frame 전처리, 위치 정규화, aggregation과
+strict threshold 정책은 오직 v3 manifest에서 읽으며 코드 fallback을 허용하지 않습니다.
 """
 
 from __future__ import annotations
@@ -34,8 +34,23 @@ from torchvision.models import (
 from torchvision.models.feature_extraction import create_feature_extractor
 
 
-ARTIFACT_FORMAT_VERSION = 2
+ARTIFACT_FORMAT_VERSION = 3
 ARTIFACT_RUNTIME = "PYTORCH_PATCHCORE_ARTIFACT"
+PREPROCESSING_PIPELINE_VERSION = "mono8-largest-component-padding-v1"
+EXPECTED_PREPROCESSING_PIPELINE = {
+    "version": PREPROCESSING_PIPELINE_VERSION,
+    "input": "full_frame_mono8_png_uint8",
+    "foreground": "mono8_greater_equal_v_threshold",
+    "component_selection": "largest_connected_component",
+    "crop": "masked_foreground_bounding_rect",
+    "resize": "aspect_ratio_preserving_centered_black_padding",
+    "downscale_interpolation": "opencv_inter_area",
+    "upscale_interpolation": "opencv_inter_linear",
+    "padding_value": 0,
+    "channel_conversion": "mono8_repeat_to_rgb3",
+    "tensor_scaling": "float32_divide_255",
+    "model_normalization": "imagenet_mean_std_in_model",
+}
 EXPECTED_STATION_VIEWS = {
     1: ("CAM_A_1", "CAM_A_2", "CAM_A_3"),
     2: ("CAM_B_1",),
@@ -45,9 +60,6 @@ PATCHCORE_PARAMETER_KEYS = {
     "feature_layers",
     "coreset_ratio",
     "k",
-    "threshold_percentile",
-    "customized_margin",
-    "threshold_epsilon",
     "input_resolution",
     "resize_mode",
     "construction_batch_size",
@@ -144,9 +156,6 @@ class PatchCoreViewSettings:
     feature_layers: tuple[int, ...]
     coreset_ratio: float
     k: int
-    threshold_percentile: float
-    customized_margin: float
-    threshold_epsilon: float
     input_resolution: tuple[int, int]
     resize_mode: str
     construction_batch_size: int
@@ -159,9 +168,6 @@ class PatchCoreViewSettings:
             raise ArtifactContractError(f"{view}: PatchCore parameter keys differ")
         numeric_fields = (
             "coreset_ratio",
-            "threshold_percentile",
-            "customized_margin",
-            "threshold_epsilon",
         )
         integer_fields = (
             "k",
@@ -195,9 +201,6 @@ class PatchCoreViewSettings:
             feature_layers=tuple(layers),
             coreset_ratio=float(payload["coreset_ratio"]),
             k=payload["k"],
-            threshold_percentile=float(payload["threshold_percentile"]),
-            customized_margin=float(payload["customized_margin"]),
-            threshold_epsilon=float(payload["threshold_epsilon"]),
             input_resolution=(resolution[0], resolution[1]),
             resize_mode=payload["resize_mode"],
             construction_batch_size=payload["construction_batch_size"],
@@ -217,18 +220,6 @@ class PatchCoreViewSettings:
             raise ArtifactContractError(f"{view}: coreset_ratio is invalid")
         if settings.k < 1:
             raise ArtifactContractError(f"{view}: k is invalid")
-        if (
-            not math.isfinite(settings.threshold_percentile)
-            or not 0 <= settings.threshold_percentile <= 100
-        ):
-            raise ArtifactContractError(f"{view}: threshold_percentile is invalid")
-        if (
-            not math.isfinite(settings.customized_margin)
-            or not 0 <= settings.customized_margin <= 1
-        ):
-            raise ArtifactContractError(f"{view}: customized_margin is invalid")
-        if not math.isfinite(settings.threshold_epsilon) or settings.threshold_epsilon <= 0:
-            raise ArtifactContractError(f"{view}: threshold_epsilon is invalid")
         if settings.resize_mode != "padding":
             raise ArtifactContractError(f"{view}: resize_mode must be padding")
         if (
@@ -592,6 +583,113 @@ class PatchCoreViewModel(nn.Module):
             patch_scores, locations, embedding, images.shape[0]
         )
 
+    @torch.inference_mode()
+    def native_patch_maps(self, images: torch.Tensor) -> torch.Tensor:
+        """Bilinear 확대 전 최근접 memory-bank distance map을 반환합니다."""
+
+        normalized = (images - self.imagenet_mean) / self.imagenet_std
+        features = self.feature_extractor(normalized)
+        ordered = [
+            self.feature_pooler(features[f"layer{number}"])
+            for number in self.layer_numbers
+        ]
+        reference_size = max(
+            (tensor.shape[-2:] for tensor in ordered),
+            key=lambda size: size[0] * size[1],
+        )
+        resized = [
+            tensor
+            if tensor.shape[-2:] == reference_size
+            else F.interpolate(tensor, reference_size, mode="bilinear")
+            for tensor in ordered
+        ]
+        combined = torch.cat(resized, dim=1)
+        embedding = combined.permute(0, 2, 3, 1).reshape(-1, combined.shape[1])
+        patch_scores, _ = self.nearest_neighbors(embedding, 1)
+        maps = patch_scores.reshape(
+            images.shape[0], int(reference_size[0]), int(reference_size[1])
+        )
+        if not torch.isfinite(maps).all():
+            raise RuntimeError("native PatchCore map contains NaN/Inf")
+        return maps
+
+
+def spatial_view_scores(
+    raw_maps: torch.Tensor,
+    center: torch.Tensor,
+    denominator: torch.Tensor,
+    aggregation: Mapping[str, Any],
+) -> torch.Tensor:
+    """Artifact v3 native map을 위치 정규화하고 view score로 집계합니다."""
+
+    if raw_maps.ndim != 3 or center.ndim != 2 or denominator.ndim != 2:
+        raise ArtifactContractError("v3 scoring tensor rank is invalid")
+    if tuple(raw_maps.shape[1:]) != tuple(center.shape) or center.shape != denominator.shape:
+        raise ArtifactContractError("v3 scoring patch grid shape differs")
+    if not torch.isfinite(raw_maps).all() or not torch.isfinite(center).all():
+        raise RuntimeError("v3 scoring tensor contains NaN/Inf")
+    if not torch.isfinite(denominator).all() or torch.any(denominator <= 0):
+        raise ArtifactContractError("v3 denominator is unsafe")
+    normalized = (raw_maps - center[None]) / denominator[None]
+    flattened = normalized.reshape(normalized.shape[0], -1)
+    method = str(aggregation.get("method", ""))
+    if method == "percentile":
+        percentile = float(aggregation.get("percentile", math.nan))
+        if not math.isfinite(percentile) or not 0 <= percentile <= 100:
+            raise ArtifactContractError("v3 map percentile is invalid")
+        if percentile == 100.0:
+            return flattened.amax(dim=1)
+        return torch.quantile(
+            flattened,
+            percentile / 100.0,
+            dim=1,
+            interpolation="linear",
+        )
+    if method == "top_k_average":
+        top_k = int(aggregation.get("top_k", 0))
+        if not 1 <= top_k <= flattened.shape[1]:
+            raise ArtifactContractError("v3 top_k is outside patch count")
+        return flattened.topk(
+            top_k, dim=1, largest=True, sorted=False
+        ).values.mean(dim=1)
+    raise ArtifactContractError("unsupported v3 aggregation method")
+
+
+def _validate_spatial_policy_options(
+    normalization: Any,
+    aggregation: Any,
+) -> None:
+    if not isinstance(normalization, dict) or not isinstance(aggregation, dict):
+        raise ArtifactContractError("artifact spatial scoring options must be objects")
+    method = str(normalization.get("method", ""))
+    option_contracts: dict[str, tuple[str, set[float]]] = {
+        "epsilon": ("epsilon_ratio", {0.001, 0.01, 0.1}),
+        "std_floor": ("std_floor_ratio", {0.05, 0.1, 0.2}),
+        "shrinkage": ("shrinkage_lambda", {0.05, 0.1, 0.25, 0.5}),
+        "mad": ("mad_epsilon_ratio", {0.001, 0.01, 0.1}),
+    }
+    contract = option_contracts.get(method)
+    if contract is None or set(normalization) != {"method", contract[0]}:
+        raise ArtifactContractError("artifact normalization option is invalid")
+    if float(normalization[contract[0]]) not in contract[1]:
+        raise ArtifactContractError("artifact normalization value was not approved")
+    aggregation_method = str(aggregation.get("method", ""))
+    if aggregation_method == "percentile":
+        if (
+            set(aggregation) != {"method", "percentile"}
+            or float(aggregation["percentile"]) not in {99.0, 99.5, 99.9, 100.0}
+        ):
+            raise ArtifactContractError("artifact map percentile is invalid")
+    elif aggregation_method == "top_k_average":
+        if (
+            set(aggregation) != {"method", "top_k"}
+            or type(aggregation["top_k"]) is not int
+            or int(aggregation["top_k"]) not in {1, 3, 5, 10}
+        ):
+            raise ArtifactContractError("artifact top-k option is invalid")
+    else:
+        raise ArtifactContractError("artifact aggregation option is invalid")
+
 
 def _load_patchcore_state(model: PatchCoreViewModel, path: Path) -> tuple[int, int]:
     try:
@@ -621,6 +719,57 @@ def _load_patchcore_state(model: PatchCoreViewModel, path: Path) -> tuple[int, i
     return int(bank.shape[0]), int(bank.shape[1])
 
 
+def _load_spatial_calibration(
+    path: Path,
+    expected_grid: Sequence[int],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ArtifactContractError(f"cannot load spatial calibration: {path}") from exc
+    required = {
+        "center",
+        "denominator",
+        "raw_scale",
+        "grid_shape",
+        "scale_reference",
+        "sample_count",
+    }
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ArtifactContractError(f"spatial calibration keys are invalid: {path}")
+    center = payload["center"]
+    denominator = payload["denominator"]
+    raw_scale = payload["raw_scale"]
+    if any(not isinstance(value, torch.Tensor) for value in (center, denominator, raw_scale)):
+        raise ArtifactContractError(f"spatial calibration maps must be tensors: {path}")
+    if center.dtype != torch.float32 or denominator.dtype != torch.float32 or raw_scale.dtype != torch.float32:
+        raise ArtifactContractError(f"spatial calibration maps must be float32: {path}")
+    if center.ndim != 2 or center.shape != denominator.shape or center.shape != raw_scale.shape:
+        raise ArtifactContractError(f"spatial calibration map shapes differ: {path}")
+    grid = tuple(int(value) for value in payload["grid_shape"].reshape(-1).tolist())
+    if grid != tuple(int(value) for value in expected_grid) or tuple(center.shape) != grid:
+        raise ArtifactContractError(f"spatial calibration grid differs: {path}")
+    if (
+        not torch.isfinite(center).all()
+        or not torch.isfinite(denominator).all()
+        or not torch.isfinite(raw_scale).all()
+    ):
+        raise ArtifactContractError(f"spatial calibration contains NaN/Inf: {path}")
+    if torch.any(denominator <= 0):
+        raise ArtifactContractError(f"spatial denominator is not positive: {path}")
+    if torch.any(raw_scale < 0):
+        raise ArtifactContractError(f"spatial raw scale is negative: {path}")
+    scale_reference = float(payload["scale_reference"].reshape(-1)[0])
+    sample_count = int(payload["sample_count"].reshape(-1)[0])
+    if not math.isfinite(scale_reference) or scale_reference <= 0 or sample_count < 2:
+        raise ArtifactContractError(f"spatial calibration metadata is unsafe: {path}")
+    return {
+        "center": center.to(device),
+        "denominator": denominator.to(device),
+    }
+
+
 def _base_version(value: str) -> str:
     return str(value).split("+", 1)[0]
 
@@ -636,6 +785,7 @@ class PatchCoreArtifactModel:
         station_views: Mapping[int, tuple[str, ...]],
         parameters_by_view: Mapping[str, PatchCoreViewSettings],
         models: Mapping[str, PatchCoreViewModel],
+        spatial_calibration_by_view: Mapping[str, Mapping[str, torch.Tensor]],
         preprocessor: Mono8PatchCorePreprocessor,
         device: torch.device,
         parallel_count: int,
@@ -645,6 +795,11 @@ class PatchCoreArtifactModel:
         self.station_views = dict(station_views)
         self.parameters_by_view = dict(parameters_by_view)
         self.models = dict(models)
+        self.spatial_calibration_by_view = {
+            view: dict(calibration)
+            for view, calibration in spatial_calibration_by_view.items()
+        }
+        self.aggregation = dict(manifest["spatial_scoring_policy"]["aggregation"])
         self.preprocessor = preprocessor
         self.device = device
         self.parallel_count = int(parallel_count)
@@ -696,6 +851,7 @@ class PatchCoreArtifactModel:
         device = torch.device("cuda:0")
         torch.cuda.set_device(device)
         models: dict[str, PatchCoreViewModel] = {}
+        spatial_calibration_by_view: dict[str, dict[str, torch.Tensor]] = {}
         try:
             for view in manifest["view_names"]:
                 parameters = parameters_by_view[view]
@@ -718,8 +874,14 @@ class PatchCoreArtifactModel:
                         f"{view}: memory bank shape differs from manifest"
                     )
                 models[view] = model.to(device).eval()
+                spatial_calibration_by_view[view] = _load_spatial_calibration(
+                    root / view / "spatial_calibration.pt",
+                    manifest["patch_grid_shapes"][view],
+                    device,
+                )
         except Exception:
             models.clear()
+            spatial_calibration_by_view.clear()
             torch.cuda.empty_cache()
             raise
 
@@ -750,6 +912,7 @@ class PatchCoreArtifactModel:
             station_views=station_views,
             parameters_by_view=parameters_by_view,
             models=models,
+            spatial_calibration_by_view=spatial_calibration_by_view,
             preprocessor=preprocessor,
             device=device,
             parallel_count=parallel_count,
@@ -803,7 +966,7 @@ class PatchCoreArtifactModel:
             raise ArtifactContractError("artifact camera serial/view mapping differs from runtime")
 
         if "parameters" in manifest:
-            raise ArtifactContractError("artifact v2 does not allow global parameters")
+            raise ArtifactContractError("artifact v3 does not allow global parameters")
         parameters_by_view = manifest.get("parameters_by_view")
         if not isinstance(parameters_by_view, dict) or set(parameters_by_view) != set(
             view_names
@@ -813,11 +976,36 @@ class PatchCoreArtifactModel:
             view: PatchCoreViewSettings.from_payload(view, parameters_by_view[view])
             for view in view_names
         }
+        if len({settings.input_resolution for settings in parsed_parameters.values()}) != 1:
+            raise ArtifactContractError("artifact input resolutions must match across views")
+
+        pipeline = manifest.get("preprocessing_pipeline")
+        if pipeline != EXPECTED_PREPROCESSING_PIPELINE:
+            raise ArtifactContractError("artifact preprocessing pipeline is invalid")
+        policy = manifest.get("spatial_scoring_policy")
+        if not isinstance(policy, dict) or set(policy) != {
+            "normalization",
+            "aggregation",
+            "decision",
+        }:
+            raise ArtifactContractError("artifact spatial scoring policy is invalid")
+        normalization = policy["normalization"]
+        aggregation = policy["aggregation"]
+        _validate_spatial_policy_options(normalization, aggregation)
+        decision = policy["decision"]
+        if (
+            not isinstance(decision, dict)
+            or decision.get("comparison") != "strict_greater_than"
+            or decision.get("view_score_normalization") != "divide_by_threshold"
+            or float(decision.get("target_product_fpr", math.nan)) != 0.01
+        ):
+            raise ArtifactContractError("artifact v3 decision policy is invalid")
 
         keyed_fields = (
             "thresholds",
             "memory_bank_shapes",
-            "validation_raw_scores",
+            "patch_grid_shapes",
+            "calibration_b_scores",
             "preprocessing_by_view",
         )
         for field in keyed_fields:
@@ -825,19 +1013,22 @@ class PatchCoreArtifactModel:
             if not isinstance(value, dict) or set(value) != set(view_names):
                 raise ArtifactContractError(f"artifact {field} view keys differ")
         for view in view_names:
-            parameters = parsed_parameters[view]
             threshold = float(manifest["thresholds"][view])
-            if (
-                not math.isfinite(threshold)
-                or threshold <= parameters.threshold_epsilon
-            ):
+            if not math.isfinite(threshold) or threshold <= 0:
                 raise ArtifactContractError(f"{view}: threshold is invalid")
             shape = manifest["memory_bank_shapes"][view]
             if not isinstance(shape, list) or len(shape) != 2 or min(map(int, shape)) < 1:
                 raise ArtifactContractError(f"{view}: memory bank shape is invalid")
-            scores = np.asarray(manifest["validation_raw_scores"][view], dtype=np.float64)
-            if scores.size == 0 or not np.all(np.isfinite(scores)):
-                raise ArtifactContractError(f"{view}: validation scores are invalid")
+            grid = manifest["patch_grid_shapes"][view]
+            if not isinstance(grid, list) or len(grid) != 2 or min(map(int, grid)) < 1:
+                raise ArtifactContractError(f"{view}: patch grid shape is invalid")
+            if aggregation["method"] == "top_k_average" and int(
+                aggregation["top_k"]
+            ) > int(grid[0]) * int(grid[1]):
+                raise ArtifactContractError(f"{view}: top_k exceeds patch count")
+            scores = np.asarray(manifest["calibration_b_scores"][view], dtype=np.float64)
+            if scores.size < 100 or not np.all(np.isfinite(scores)):
+                raise ArtifactContractError(f"{view}: calibration B scores are invalid")
             PreprocessingSettings.from_payload(
                 view, manifest["preprocessing_by_view"][view]
             )
@@ -846,23 +1037,122 @@ class PatchCoreArtifactModel:
                 calibration.get("view") != view
                 or float(calibration.get("threshold", math.nan)) != threshold
                 or calibration.get("memory_bank_shape") != shape
-                or calibration.get("validation_raw_scores")
-                != manifest["validation_raw_scores"][view]
+                or calibration.get("patch_grid_shape") != grid
+                or calibration.get("calibration_b_scores")
+                != manifest["calibration_b_scores"][view]
+                or calibration.get("normalization") != normalization
+                or calibration.get("aggregation") != aggregation
             ):
                 raise ArtifactContractError(f"{view}: calibration differs from manifest")
+            _load_spatial_calibration(
+                root / view / "spatial_calibration.pt",
+                grid,
+                torch.device("cpu"),
+            )
+        if len(
+            {
+                tuple(int(value) for value in manifest["patch_grid_shapes"][view])
+                for view in view_names
+            }
+        ) != 1:
+            raise ArtifactContractError("artifact patch grids must match across views")
+
+        selection = manifest.get("candidate_selection")
+        if not isinstance(selection, dict) or not selection.get("selected_candidate_id"):
+            raise ArtifactContractError("artifact candidate selection is missing")
+        candidates = selection.get("candidates")
+        if not isinstance(candidates, list):
+            raise ArtifactContractError("artifact candidate list is missing")
+        selected_matches = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict)
+            and candidate.get("candidate_id") == selection["selected_candidate_id"]
+        ]
+        if len(selected_matches) != 1:
+            raise ArtifactContractError("artifact selected candidate is not unique")
+        selected_candidate = selected_matches[0]
+        if (
+            selected_candidate.get("status") != "valid"
+            or not selected_candidate.get("eligible_for_selection")
+            or selected_candidate.get("normalization") != normalization
+            or selected_candidate.get("aggregation") != aggregation
+            or selected_candidate.get("thresholds") != manifest["thresholds"]
+            or float(selected_candidate.get("threshold_percentile", math.nan))
+            != float(decision.get("threshold_percentile", math.nan))
+            or float(selected_candidate.get("calibration_product_fpr", math.inf)) > 0.01
+            or float(selected_candidate["validation_metrics"]["fpr"]) > 0.01
+        ):
+            raise ArtifactContractError("artifact selected candidate differs from policy")
+        provenance = manifest.get("dataset_provenance")
+        required_provenance = {
+            "training_set",
+            "calibration_set_A",
+            "calibration_set_B",
+            "validation_normal",
+            "validation_anomaly",
+        }
+        if not isinstance(provenance, dict) or set(provenance) != required_provenance:
+            raise ArtifactContractError("artifact dataset provenance is invalid")
+        for split, record in provenance.items():
+            if not isinstance(record, dict) or set(record) != {
+                "product_count",
+                "file_count",
+                "sha256",
+            }:
+                raise ArtifactContractError(f"artifact {split} provenance is invalid")
+            product_count = int(record["product_count"])
+            if product_count < 1 or int(record["file_count"]) != product_count * len(view_names):
+                raise ArtifactContractError(f"artifact {split} provenance counts differ")
+            digest = str(record["sha256"])
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ArtifactContractError(f"artifact {split} provenance SHA-256 is invalid")
+        versions = manifest.get("library_versions")
+        if not isinstance(versions, dict) or not {"torch", "torchvision"} <= set(versions):
+            raise ArtifactContractError("artifact library versions are missing")
+        sample_policy = manifest.get("calibration_b_sample_policy")
+        if (
+            not isinstance(sample_policy, dict)
+            or set(sample_policy) != {"minimum", "recommended", "actual"}
+            or int(sample_policy["minimum"]) != 100
+            or int(sample_policy["recommended"]) != 1000
+            or int(sample_policy["actual"])
+            != len(manifest["calibration_b_scores"][view_names[0]])
+        ):
+            raise ArtifactContractError("artifact calibration B sample policy is invalid")
 
         benchmark = manifest.get("parallel_benchmark")
         if not isinstance(benchmark, dict):
             raise ArtifactContractError("artifact parallel_benchmark is missing")
-        selected = int(benchmark.get("selected_parallel_count", 0))
-        reserve = int(benchmark.get("reserve_mib", -1))
-        if not 1 <= selected <= 3 or reserve < 0:
+        try:
+            selected = int(benchmark["selected_parallel_count"])
+            reserve = int(benchmark["reserve_mib"])
+            warmups = int(benchmark["warmup_runs"])
+            runs = int(benchmark["benchmark_runs"])
+            speedup = float(benchmark["min_speedup_percent"])
+            benchmark_candidates = benchmark["candidates"]
+            all_view_safety = benchmark["all_view_memory_safety"]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArtifactContractError("artifact parallel benchmark values are invalid") from exc
+        if (
+            not 1 <= selected <= 3
+            or reserve < 0
+            or warmups < 1
+            or runs < 1
+            or not 0 <= speedup < 100
+            or not isinstance(benchmark_candidates, list)
+            or not isinstance(all_view_safety, dict)
+            or not bool(all_view_safety.get("memory_safe"))
+        ):
             raise ArtifactContractError("artifact parallel benchmark policy is invalid")
 
         allowed_files = {Path("manifest.json")}
         for view in view_names:
             allowed_files.add(Path(view) / "model.pt")
             allowed_files.add(Path(view) / "calibration.json")
+            allowed_files.add(Path(view) / "spatial_calibration.pt")
         actual_files = {
             path.relative_to(root) for path in root.rglob("*") if path.is_file()
         }
@@ -915,19 +1205,18 @@ class PatchCoreArtifactModel:
         else:
             raise ArtifactContractError(f"inference view order is invalid: {views}")
         expected = self.station_views[station_id]
-        raw_scores = self._run_raw(expected, images)
+        raw_scores = self._run_view_scores(expected, images)
         normalized: list[float] = []
         view_verdicts: list[int] = []
         diagnostics: list[str] = []
         for view, raw, prepared in zip(expected, raw_scores, images, strict=True):
-            parameters = self.parameters_by_view[view]
             threshold = float(self.manifest["thresholds"][view])
-            if threshold <= parameters.threshold_epsilon:
+            if not math.isfinite(threshold) or threshold <= 0:
                 raise ArtifactContractError(f"{view}: unsafe artifact threshold")
             score = float(raw) / threshold
             if not math.isfinite(score):
                 raise RuntimeError(f"{view}: normalized score is not finite")
-            is_ng = score >= 1.0 - parameters.customized_margin
+            is_ng = float(raw) > threshold
             normalized.append(score)
             view_verdicts.append(int(Verdict.NG if is_ng else Verdict.PASS))
             if is_ng:
@@ -945,7 +1234,7 @@ class PatchCoreArtifactModel:
             diagnostic_paths=tuple(diagnostics),
         )
 
-    def _run_raw(
+    def _run_view_scores(
         self,
         views: Sequence[str],
         images: Sequence[PreparedView],
@@ -961,7 +1250,16 @@ class PatchCoreArtifactModel:
             ):
                 with torch.cuda.stream(self._streams[slot]):
                     tensor = prepared.tensor[None].to(self.device, non_blocking=True)
-                    outputs.append(self.models[view](tensor))
+                    maps = self.models[view].native_patch_maps(tensor)
+                    spatial = self.spatial_calibration_by_view[view]
+                    outputs.append(
+                        spatial_view_scores(
+                            maps,
+                            spatial["center"],
+                            spatial["denominator"],
+                            self.aggregation,
+                        )
+                    )
             for stream in self._streams[: len(wave_views)]:
                 stream.synchronize()
             raw_scores.extend(float(output[0].detach().cpu()) for output in outputs)
@@ -987,7 +1285,7 @@ class PatchCoreArtifactModel:
             prepared_by_station[station_id] = tuple(prepared_items)
         for _ in range(warmup_runs):
             for station_id in sorted(self.station_views):
-                self._run_raw(
+                self._run_view_scores(
                     self.station_views[station_id],
                     prepared_by_station[station_id],
                 )
@@ -998,7 +1296,7 @@ class PatchCoreArtifactModel:
         base_allocated = torch.cuda.memory_allocated(self.device)
         torch.cuda.reset_peak_memory_stats(self.device)
         for station_id in sorted(self.station_views):
-            self._run_raw(
+            self._run_view_scores(
                 self.station_views[station_id],
                 prepared_by_station[station_id],
             )
@@ -1020,6 +1318,7 @@ class PatchCoreArtifactModel:
 
     def close(self) -> None:
         self.models.clear()
+        self.spatial_calibration_by_view.clear()
         self._streams.clear()
         torch.cuda.empty_cache()
 

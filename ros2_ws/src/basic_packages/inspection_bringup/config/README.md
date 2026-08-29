@@ -23,7 +23,8 @@ Vision의 전체 파라미터, 아직 key가 없는 모델·카메라 항목, �
 - packet delay 초기값 5000 ticks, disk warning 90%/stop 95%
 - shutdown queue soft timeout 3초, GPU/NVML sampling 200 ms
 - 완성 이미지 최근 10,000장, timeout 최소 표본 A/B 각각 10,000, p99.9×1.2, 자동 적용 기본 false
-- 모델 runtime `PYTORCH_PATCHCORE_ARTIFACT`, 4-view v2 bundle, warmup 기본 10회, CPU fallback 금지
+- 모델 runtime `PYTORCH_PATCHCORE_ARTIFACT`, 4-view v3 공간 calibration bundle,
+  warmup 기본 10회, artifact v2/CPU fallback 금지
 
 ## Hardware에서 아직 시험이 필요한 항목
 
@@ -33,7 +34,10 @@ Vision의 전체 파라미터, 아직 key가 없는 모델·카메라 항목, �
 미확정 장비 계약이나 인수시험 실패 때문에 hardware가 `INIT_BLOCKED`되는 것은
 정상입니다. 값을 임의로 채워 READY를 우회하지 마십시오.
 
-Exposure/gain은 camera map에 있으며 모든 보정 OFF는 adapter가 강제합니다. V threshold, 판정 threshold와 margin은 ROS key로 만들지 않고 artifact 안에서만 관리합니다. 설치 후 `install/` 아래 복사본을 직접 수정하지 않습니다.
+Exposure/gain은 camera map에 있으며 모든 보정 OFF는 adapter가 강제합니다. Full-frame
+전처리 버전, V threshold, 위치 정규화/aggregation과 판정 threshold는 ROS key로
+만들지 않고 artifact v3 안에서만 관리합니다. Margin은 사용하지 않습니다. 설치 후
+`install/` 아래 복사본을 직접 수정하지 않습니다.
 
 ## Linux 경로 준비
 
@@ -43,7 +47,9 @@ sudo mkdir -p /opt/inspection/models
 sudo chown -R "$USER":"$USER" /var/lib/inspection /opt/inspection/models
 ```
 
-모델 bundle은 `/opt/inspection/models/MB_resol_180_default`에 놓고 통합 directory SHA를 `vision_model.hardware.yaml`에 입력합니다. 실제 서비스 계정을 만들면 위 소유자를 그 계정으로 바꿉니다.
+검증을 통과한 v3 모델 bundle을 `/opt/inspection/models` 아래에 놓고 artifact 이름과
+통합 directory SHA를 `vision_model.hardware.yaml`에 입력합니다. 기존 v2 bundle은
+runtime이 거부합니다. 실제 서비스 계정을 만들면 위 소유자를 그 계정으로 바꿉니다.
 
 현재 통합 호스트에서는 Mega 포트 `/dev/ttyACM0`, baud `115200`, 카메라
 firmware `V4.0.43 250414 1530132`가 hardware profile에 고정되어 있습니다.

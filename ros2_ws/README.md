@@ -11,6 +11,7 @@ source /opt/ros/jazzy/setup.bash
 python3 tools/verify_skeleton.py
 python3 tools/test_domain_contracts.py
 python3 tools/test_vision_algorithms.py
+python3 tools/test_patchcore_v3_policy.py
 colcon build --symlink-install --cmake-force-configure \
   --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
 source install/setup.bash

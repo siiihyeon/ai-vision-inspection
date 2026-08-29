@@ -1,6 +1,7 @@
 /inspection/vision_node:
   ros__parameters:
-    # 이 경로에는 format_version=2인 4-view artifact bundle을 배포합니다.
+    # 아래 identity는 기존 배포값입니다. V3 bundle 생성 후 path/version/SHA를 함께
+    # 교체해야 하며, 현재 runtime은 이 legacy v2 bundle을 의도적으로 거부합니다.
     vision.model.path: "/opt/inspection/models/MB_default"
     vision.model.version: "MB_default"
     vision.model.sha256: "f1734acd3078c79908cef3139f2b8f9da9b0f9b6c48f2a3ee3fd112817336056"

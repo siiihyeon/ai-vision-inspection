@@ -4,7 +4,13 @@
 
 ## 현재 산출물의 성격
 
-이 저장소는 **interface 2.1 공정 구현**입니다. Ubuntu MVS 5.0.2 Action1 adapter, Mono8 촬영 계약, packet-loss 검증, 4-view PatchCore artifact 전처리·CUDA 추론, A terminal NG의 B 취소, Sensor3 lock, Vision durable 결과/replay, Log 보고서·10,000장 보존까지 연결되어 있습니다. 4-view artifact v2는 배포되었으며, Mega serial protocol/TB6600·액추에이터 adapter와 실장비 인수 시험은 아직 필요합니다. 따라서 남은 설정과 검증 없이 생산 라인을 운전하면 안 됩니다.
+이 저장소는 **interface 2.1 공정 구현**입니다. Ubuntu MVS 5.0.2 Action1 adapter,
+Mono8 촬영 계약, packet-loss 검증, 4-view PatchCore artifact 전처리·CUDA 추론,
+A terminal NG의 B 취소, Sensor3 lock, Vision durable 결과/replay, Log 보고서·10,000장
+보존까지 연결되어 있습니다. Vision runtime은 full-frame 전처리와 native patch 위치
+정규화가 포함된 artifact v3만 허용하며 v2는 거부합니다. 최종 v3 artifact 생성·배포,
+Mega serial protocol/TB6600·액추에이터 adapter와 실장비 인수 시험은 아직 필요합니다.
+따라서 남은 설정과 검증 없이 생산 라인을 운전하면 안 됩니다.
 
 Vision Node의 확정값, 미결정 정책, 실험값, 모든 파라미터 수정 위치는 [Vision Node 완성 결정표](ros2_ws/src/nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)를 단일 기준으로 사용합니다. 해당 표의 구현 차단 항목을 확정하면 placeholder를 실제 장비 adapter와 추론 알고리즘으로 교체할 수 있고, 이후 실장비 인수시험을 통과해야 생산 승인이 됩니다.
 
@@ -34,7 +40,9 @@ Control PositionSettled
 - Queue에는 raw frame이 아닌 `frame_batch_id`와 절대 이미지 파일 경로만 들어갑니다.
 - FIFO는 worker가 꺼내는 순서까지 보장합니다. 병렬 완료 순서는 Master의 `fifo_sequence` reorder buffer가 정렬합니다.
 - 제품 결과 적용 deadline은 Sensor3입니다. 명시적 station 실패는 즉시 `FORCED_NG` 후보로 기록하고, Sensor3에서만 최종 판정을 잠금합니다. Sensor3 시 미완료도 `FORCED_NG`입니다.
-- 1-channel Mono8 PNG가 canonical 파일입니다. resize/normalization은 모델 계약 주입 전까지 placeholder입니다.
+- 1-channel full-frame Mono8 PNG가 canonical 파일입니다. Largest-component crop,
+  aspect-ratio black padding, ImageNet normalization, native patch 공간 calibration과
+  strict threshold 정책은 artifact v3 계약으로 고정됩니다.
 - Action1은 즉시 실행(`scheduled=false`)하며 A=`key/mask 1/1`, B=`2/2`로 분리합니다. PTP 상태와 무관하게 host monotonic frame-arrival 시각만 skew 판정에 사용합니다.
 - 시작 시 네 카메라의 모델·serial·IP·firmware를 SDK로 조회합니다. hardware profile은 승인 firmware `V4.0.43 250414 1530132`와 네 대 모두 정확히 일치해야 하며 자동 firmware update는 하지 않습니다.
 - Station A terminal NG 또는 실패는 Station B의 미시작 촬영, 저장 후 enqueue, queued job, pre-forward, active-forward 결과를 단계별로 취소합니다. 시작된 forward 자체는 강제 종료하지 않습니다.

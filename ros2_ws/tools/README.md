@@ -8,11 +8,13 @@
 
 ```bash
 python3 tools/test_vision_algorithms.py
+python3 tools/test_patchcore_v3_policy.py
 python3 tools/inspect_patchcore_artifact.py /absolute/artifact/path \
-  --version MB_resol_180_default
+  --version MB_v3_resol_180
 ```
 
-두 번째 명령은 CUDA를 사용하지 않고 v2 manifest/file/calibration 계약을
-검증한 뒤 hardware YAML에 넣을 통합 directory SHA-256을 출력합니다. v2의
-`parameters_by_view`는 네 view 각각의 모델·해상도·margin 설정을 독립적으로
-보관하며 전역 `parameters`는 거부합니다.
+정책 시험은 offline/runtime의 full-frame crop과 native-map 공간 점수가 동일한지,
+strict 4-view OR FPR 계산과 v2 거부를 검증합니다. Artifact 검사 명령은 CUDA를
+사용하지 않고 v3 manifest/file/spatial-calibration 계약을 검증한 뒤 hardware YAML에
+넣을 통합 directory SHA-256을 출력합니다. V3는 전처리 버전, 선택 후보, dataset
+digest와 view별 center/denominator/threshold를 완전하게 요구합니다.

@@ -7,12 +7,14 @@
 - [x] 2448×2048 Mono8 전체 ROI, acquisition 250 ms, skew 50 ms
 - [x] 카메라별 exposure/gain 적용 및 모든 자동·영상 보정 OFF
 - [x] packet delay 5000, frame packet loss 0 계약
-- [x] V threshold, threshold, margin을 artifact에만 보관
+- [x] Full-frame 전처리 버전, V threshold, 공간 통계와 threshold를 artifact에만 보관
 - [x] Mono8 foreground/connected-component/crop/padding 전처리
 - [x] ResNet34/EfficientNet PatchCore memory bank loader와 CUDA 추론
-- [x] View NG 결합과 normalized station max score
+- [x] Native patch 위치 정규화, percentile/top-k view score와 strict threshold 판정
+- [x] View NG 결합과 threshold-ratio station max score
 - [x] NG/전처리 실패에 한정한 crop 진단 저장
-- [x] Artifact v2 파일 집합, serial/view, calibration, version, 통합 SHA 검증
+- [x] Artifact v3 파일 집합, serial/view, 공간 calibration, version, 통합 SHA 검증
+- [x] Artifact v2 명시적 거부와 offline/runtime 공간 점수 golden test
 - [x] A/B timeout 3000/1500 ms와 10,000표본 자동 tuning guard
 - [x] 전처리 실패 분류, 파일-read-only retry, CUDA OOM 재초기화 경로
 - [x] durable-before-terminal, session-local cache cleanup
@@ -21,14 +23,14 @@
 
 ## 실제 제품 실행 전 차단 사항
 
-- [x] 최종 4-view format v2 artifact bundle을 생성하고
-  `/opt/inspection/models/MB_resol_180_default`에 배포했다.
-- [x] 최종 bundle의 `preprocessing_by_view`에는 네 view 모두 초기
-  `v_threshold=40`을 넣는다. 판정 threshold와 margin 초기값 0.02도 artifact
-  생성 결과에만 두고 ROS YAML이나 runtime 코드에는 복제하지 않는다.
-- [x] 최종 bundle의 통합 SHA-256
-  `e7a1946e5439214959283864db94099ea3f75a709d76d76129a298e5f8cab349`를
-  `vision_model.hardware.yaml`의 `vision.model.sha256`에 입력했다.
+- [ ] 합의된 full-frame training/calibration A/calibration B/validation/test split으로
+  최종 4-view format v3 artifact를 생성한다. Calibration B는 최소 100, 권장 1,000
+  정상 제품이며 validation 4-view OR FPR 1% 이하 조건을 통과해야 한다.
+- [ ] 최종 v3 bundle을 `/opt/inspection/models`에 배포하고 artifact 이름과 통합
+  SHA-256을 `vision_model.hardware.yaml`에 입력한다. 기존 배포 v2 bundle과 SHA는
+  v3 runtime에서 의도적으로 거부되므로 재사용할 수 없다.
+- [ ] `patchcore_AD_2.py`로 고정 test set의 최종 정확도와 Station A/B별 model
+  pipeline/end-to-end mean·median·p95·p99를 기록한다.
 - [x] 2026-08-25 MVS SDK 열거에서 네 카메라의 model/serial/IP가 설정과
   일치하고 firmware가 모두 `V4.0.43 250414 1530132`임을 확인했다.
 - [x] 2026-08-25 실카메라 초기화에서 exposure/gain/white balance 자동 기능을

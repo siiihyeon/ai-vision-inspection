@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
+import torch
 
 WORKSPACE = Path(__file__).parents[1]
 for package_path in (
@@ -32,6 +33,7 @@ from inspection_vision.hikrobot_mvs import (  # noqa: E402
 )
 from inspection_vision.model_backend import (  # noqa: E402
     EXPECTED_STATION_VIEWS,
+    EXPECTED_PREPROCESSING_PIPELINE,
     ArtifactContractError,
     Mono8PatchCorePreprocessor,
     PatchCoreArtifactModel,
@@ -128,7 +130,10 @@ class PatchCoreContractTests(unittest.TestCase):
             for view in EXPECTED_STATION_VIEWS[station]
         ]
         thresholds = {view: 2.0 for view in views}
-        validation = {view: [0.5, 1.0, 1.5] for view in views}
+        calibration_b = {
+            view: [0.5 + position * 0.001 for position in range(100)]
+            for view in views
+        }
         shapes = {
             "CAM_A_1": [10, 192],
             "CAM_A_2": [11, 256],
@@ -144,11 +149,14 @@ class PatchCoreContractTests(unittest.TestCase):
             }
             for view in views
         }
+        grids = {view: [2, 2] for view in views}
+        normalization = {"method": "std_floor", "std_floor_ratio": 0.1}
+        aggregation = {"method": "top_k_average", "top_k": 1}
         manifest = {
-            "format_version": 2,
+            "format_version": 3,
             "algorithm": "patchcore",
-            "artifact_name": "fixture-v2",
-            "model_version": "fixture-v2",
+            "artifact_name": "fixture-v3",
+            "model_version": "fixture-v3",
             "view_names": views,
             "station_views": {
                 "station_a": list(EXPECTED_STATION_VIEWS[1]),
@@ -163,10 +171,7 @@ class PatchCoreContractTests(unittest.TestCase):
                     "feature_layers": [1, 2],
                     "coreset_ratio": 0.1 + position * 0.01,
                     "k": 9 - position,
-                    "threshold_percentile": 99.0 - position,
-                    "customized_margin": 0.02 * position,
-                    "threshold_epsilon": 1e-12,
-                    "input_resolution": [180 + position * 4, 176 + position * 8],
+                    "input_resolution": [180, 180],
                     "resize_mode": "padding",
                     "construction_batch_size": 1 + position,
                     "distance_chunk_size": 1024 * (position + 1),
@@ -176,11 +181,59 @@ class PatchCoreContractTests(unittest.TestCase):
             },
             "thresholds": thresholds,
             "memory_bank_shapes": shapes,
-            "validation_raw_scores": validation,
+            "patch_grid_shapes": grids,
+            "calibration_b_scores": calibration_b,
             "preprocessing_by_view": preprocessing,
+            "preprocessing_pipeline": dict(EXPECTED_PREPROCESSING_PIPELINE),
+            "spatial_scoring_policy": {
+                "normalization": normalization,
+                "aggregation": aggregation,
+                "decision": {
+                    "target_product_fpr": 0.01,
+                    "threshold_percentile": 99.9,
+                    "comparison": "strict_greater_than",
+                    "view_score_normalization": "divide_by_threshold",
+                },
+            },
+            "candidate_selection": {
+                "selected_candidate_id": "candidate-001",
+                "candidates": [
+                    {
+                        "candidate_id": "candidate-001",
+                        "status": "valid",
+                        "eligible_for_selection": True,
+                        "normalization": normalization,
+                        "aggregation": aggregation,
+                        "thresholds": thresholds,
+                        "threshold_percentile": 99.9,
+                        "calibration_product_fpr": 0.01,
+                        "validation_metrics": {"fpr": 0.01, "recall": 1.0},
+                    }
+                ],
+            },
+            "dataset_provenance": {
+                split: {"product_count": 100, "file_count": 400, "sha256": "0" * 64}
+                for split in (
+                    "training_set",
+                    "calibration_set_A",
+                    "calibration_set_B",
+                    "validation_normal",
+                    "validation_anomaly",
+                )
+            },
+            "calibration_b_sample_policy": {
+                "minimum": 100,
+                "recommended": 1000,
+                "actual": 100,
+            },
             "parallel_benchmark": {
                 "selected_parallel_count": 1,
                 "reserve_mib": 512,
+                "warmup_runs": 3,
+                "benchmark_runs": 10,
+                "min_speedup_percent": 5.0,
+                "candidates": [],
+                "all_view_memory_safety": {"memory_safe": True},
             },
             "library_versions": {"torch": "0.0", "torchvision": "0.0"},
         }
@@ -188,13 +241,27 @@ class PatchCoreContractTests(unittest.TestCase):
             view_root = root / view
             view_root.mkdir(parents=True)
             (view_root / "model.pt").write_bytes(f"state:{view}".encode())
+            torch.save(
+                {
+                    "center": torch.zeros((2, 2), dtype=torch.float32),
+                    "denominator": torch.ones((2, 2), dtype=torch.float32),
+                    "raw_scale": torch.ones((2, 2), dtype=torch.float32),
+                    "grid_shape": torch.tensor([2, 2], dtype=torch.int64),
+                    "scale_reference": torch.tensor(1.0, dtype=torch.float64),
+                    "sample_count": torch.tensor(100, dtype=torch.int64),
+                },
+                view_root / "spatial_calibration.pt",
+            )
             (view_root / "calibration.json").write_text(
                 json.dumps(
                     {
                         "view": view,
                         "threshold": thresholds[view],
                         "memory_bank_shape": shapes[view],
-                        "validation_raw_scores": validation[view],
+                        "patch_grid_shape": grids[view],
+                        "calibration_b_scores": calibration_b[view],
+                        "normalization": normalization,
+                        "aggregation": aggregation,
                     }
                 ),
                 encoding="utf-8",
@@ -204,14 +271,14 @@ class PatchCoreContractTests(unittest.TestCase):
         )
         return manifest, artifact_directory_sha256(root)
 
-    def test_v2_manifest_requires_four_views_and_directory_hash_is_sensitive(self) -> None:
+    def test_v3_manifest_requires_four_views_and_directory_hash_is_sensitive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest, first_digest = self._write_manifest_fixture(root)
             station_views = PatchCoreArtifactModel._validate_manifest(
                 root,
                 manifest,
-                expected_version="fixture-v2",
+                expected_version="fixture-v3",
                 serial_to_view=SERIAL_TO_VIEW,
             )
             self.assertEqual(station_views, dict(EXPECTED_STATION_VIEWS))
@@ -225,7 +292,7 @@ class PatchCoreContractTests(unittest.TestCase):
                 PatchCoreArtifactModel._validate_manifest(
                     root,
                     invalid,
-                    expected_version="fixture-v2",
+                    expected_version="fixture-v3",
                     serial_to_view=SERIAL_TO_VIEW,
                 )
 

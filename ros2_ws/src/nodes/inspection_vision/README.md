@@ -16,8 +16,10 @@ Master CaptureProduct
   → 카메라별 V threshold와 largest-component crop
   → black-padding resize → 3-channel 복제 → ImageNet normalize
   → 카메라별 PatchCore memory bank 추론
-  → threshold 대비 normalized score와 margin으로 view 판정
-  → 하나라도 NG이면 station NG, station score는 normalized score 최댓값
+  → native patch distance map의 artifact 위치 center/scale 정규화
+  → artifact percentile/top-k aggregation으로 view score 산출
+  → view score가 calibration B threshold보다 클 때만 view NG
+  → 하나라도 NG이면 station NG, station score는 threshold ratio 최댓값
   → durable spool commit
   → StationResult 또는 StationInferenceFailed 발행
 ```
@@ -47,28 +49,34 @@ Vision이 삭제하지 않으며 Log Node가 보존 정책을 소유합니다.
 - 승인 firmware는 `V4.0.43 250414 1530132`입니다. 초기화 때 네 카메라에서
   조회한 값이 모두 이 문자열과 정확히 일치해야 합니다.
 
-## Artifact v2 계약
+## Artifact v3 계약
 
 운영 runtime은 `PYTORCH_PATCHCORE_ARTIFACT`입니다. 하나의 versioned bundle에
-`CAM_A_1`, `CAM_A_2`, `CAM_A_3`, `CAM_B_1`의 독립 memory bank와 calibration을
+`CAM_A_1`, `CAM_A_2`, `CAM_A_3`, `CAM_B_1`의 독립 memory bank와 공간 calibration을
 넣습니다. Vision Node는 완성 artifact만 읽고 memory bank를 만들지 않습니다.
+Artifact v2는 명시적으로 거부합니다.
 
 ```text
 artifact/
 ├── manifest.json
-├── CAM_A_1/{model.pt,calibration.json}
-├── CAM_A_2/{model.pt,calibration.json}
-├── CAM_A_3/{model.pt,calibration.json}
-└── CAM_B_1/{model.pt,calibration.json}
+├── CAM_A_1/{model.pt,spatial_calibration.pt,calibration.json}
+├── CAM_A_2/{model.pt,spatial_calibration.pt,calibration.json}
+├── CAM_A_3/{model.pt,spatial_calibration.pt,calibration.json}
+└── CAM_B_1/{model.pt,spatial_calibration.pt,calibration.json}
 ```
 
 전체 상대경로와 파일 내용을 합산한 SHA-256이 YAML의
-`vision.model.sha256`과 일치해야 합니다. View별 `v_threshold`, 판정 threshold,
-normalized margin은 반드시 artifact manifest에만 존재해야 하며 ROS parameter나
-코드 fallback으로 두지 않습니다. `parameters_by_view`에는 각 view의 backbone,
-feature layer, coreset ratio, reweighting k, 입력 해상도, margin과 나머지 PatchCore
-설정을 각각 완전한 형태로 저장합니다. View마다 설정과 memory-bank shape가 달라도
-되며 전역 `parameters` 항목은 v2에서 허용하지 않습니다.
+`vision.model.sha256`과 일치해야 합니다. Full-frame Mono8 foreground crop부터 padding,
+3-channel/tensor 변환까지의 전처리 버전과 view별 `v_threshold`, 위치 정규화 방식,
+aggregation, 판정 threshold는 반드시 artifact에만 존재해야 하며 ROS parameter나 코드
+fallback으로 두지 않습니다. `spatial_calibration.pt`의 center/denominator는 native
+patch grid와 정확히 일치해야 합니다. View score `S_v`가 `T_v`보다 큰 경우에만 NG이고
+보고 score는 `S_v/T_v`입니다. Margin은 사용하지 않습니다.
+
+Normalization/aggregation 방식은 네 view가 공유하지만 위치 통계와 threshold는 view별
+독립입니다. Calibration/validation FPR은 네 view 최종 OR 기준 1%이고, validation에서
+이 제약을 만족하면서 product recall이 최대인 후보만 배포됩니다. 선택 후보, 탈락 후보,
+dataset digest와 calibration B score도 manifest에 보존합니다.
 
 ## 장애와 session 정책
 
@@ -92,6 +100,7 @@ source /opt/ros/jazzy/setup.bash
 /usr/bin/python3 tools/verify_skeleton.py
 /usr/bin/python3 tools/test_domain_contracts.py
 /usr/bin/python3 tools/test_vision_algorithms.py
+/usr/bin/python3 tools/test_patchcore_v3_policy.py
 colcon build --symlink-install --cmake-force-configure \
   --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
 source install/setup.bash
