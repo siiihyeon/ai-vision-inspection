@@ -972,12 +972,8 @@ class PatchCoreArtifactModel:
             view_names
         ):
             raise ArtifactContractError("artifact parameters_by_view keys differ")
-        parsed_parameters = {
-            view: PatchCoreViewSettings.from_payload(view, parameters_by_view[view])
-            for view in view_names
-        }
-        if len({settings.input_resolution for settings in parsed_parameters.values()}) != 1:
-            raise ArtifactContractError("artifact input resolutions must match across views")
+        for view in view_names:
+            PatchCoreViewSettings.from_payload(view, parameters_by_view[view])
 
         pipeline = manifest.get("preprocessing_pipeline")
         if pipeline != EXPECTED_PREPROCESSING_PIPELINE:
@@ -1049,14 +1045,6 @@ class PatchCoreArtifactModel:
                 grid,
                 torch.device("cpu"),
             )
-        if len(
-            {
-                tuple(int(value) for value in manifest["patch_grid_shapes"][view])
-                for view in view_names
-            }
-        ) != 1:
-            raise ArtifactContractError("artifact patch grids must match across views")
-
         selection = manifest.get("candidate_selection")
         if not isinstance(selection, dict) or not selection.get("selected_candidate_id"):
             raise ArtifactContractError("artifact candidate selection is missing")

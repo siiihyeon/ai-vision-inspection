@@ -58,8 +58,11 @@ Calibration A에서 다음 후보를 만들고 네 view에 공통인 한 정책�
 4. validation postprocess p95 최소
 5. 더 단순한 normalization 우선
 
-절대 top-k와 공통 후보 비교를 위해 네 view의 입력 해상도와 native patch grid는 같아야
-합니다. View score `S_v`와 calibration B threshold `T_v`에 대해 `S_v > T_v`일 때만 NG입니다.
+`MB_construction_2.py`의 `parameters_by_view`에서 backbone, feature layer, coreset ratio,
+입력 해상도, construction batch/chunk 크기와 seed를 view별로 독립 설정할 수 있습니다.
+그 결과 native patch grid가 view마다 달라도 허용됩니다. 절대 top-k 후보는 모든 view에서
+유효해야 하므로 각 view의 patch 수보다 작거나 같아야 합니다. View score `S_v`와
+calibration B threshold `T_v`에 대해 `S_v > T_v`일 때만 NG입니다.
 보고 score는 `S_v / T_v`이며 기존 customized margin은 사용하지 않습니다. Station A는
 세 view OR, Station B는 한 view, 최종 제품은 두 station OR로 판정합니다.
 

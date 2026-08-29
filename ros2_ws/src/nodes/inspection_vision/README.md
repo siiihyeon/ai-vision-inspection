@@ -73,8 +73,10 @@ fallback으로 두지 않습니다. `spatial_calibration.pt`의 center/denominat
 patch grid와 정확히 일치해야 합니다. View score `S_v`가 `T_v`보다 큰 경우에만 NG이고
 보고 score는 `S_v/T_v`입니다. Margin은 사용하지 않습니다.
 
-Normalization/aggregation 방식은 네 view가 공유하지만 위치 통계와 threshold는 view별
-독립입니다. Calibration/validation FPR은 네 view 최종 OR 기준 1%이고, validation에서
+Normalization/aggregation 방식은 네 view가 공유하지만 backbone, feature layer, 입력
+해상도, native patch grid, 위치 통계와 threshold는 view별 독립입니다. 절대 top-k는 각
+view의 patch 수 안에서 유효해야 합니다. Calibration/validation FPR은 네 view 최종 OR
+기준 1%이고, validation에서
 이 제약을 만족하면서 product recall이 최대인 후보만 배포됩니다. 선택 후보, 탈락 후보,
 dataset digest와 calibration B score도 manifest에 보존합니다.
 

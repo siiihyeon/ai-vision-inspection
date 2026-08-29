@@ -80,7 +80,9 @@ MB_CONFIGS: dict[str, dict[str, Any]] = {
     "MB_v3_resol_180": {
         "view_names": list(PATCHCORE_EXPECTED_VIEWS),
         "parameters_by_view": {
-            view: {
+            # 각 view는 독립 설정이다. 서로 다른 backbone, feature layer와
+            # input resolution을 사용해도 된다.
+            "CAM_A_1": {
                 "backbone": "resnet34",
                 "feature_layers": [1, 2],
                 "coreset_ratio": 0.1,
@@ -92,8 +94,40 @@ MB_CONFIGS: dict[str, dict[str, Any]] = {
                 "construction_batch_size": 1,
                 "distance_chunk_size": 1024,
                 "seed": 42,
-            }
-            for view in PATCHCORE_EXPECTED_VIEWS
+            },
+            "CAM_A_2": {
+                "backbone": "resnet34",
+                "feature_layers": [1, 2],
+                "coreset_ratio": 0.1,
+                "k": 9,
+                "input_resolution": (180, 180),
+                "resize_mode": "padding",
+                "construction_batch_size": 1,
+                "distance_chunk_size": 1024,
+                "seed": 42,
+            },
+            "CAM_A_3": {
+                "backbone": "resnet34",
+                "feature_layers": [1, 2],
+                "coreset_ratio": 0.1,
+                "k": 9,
+                "input_resolution": (180, 180),
+                "resize_mode": "padding",
+                "construction_batch_size": 1,
+                "distance_chunk_size": 1024,
+                "seed": 42,
+            },
+            "CAM_B_1": {
+                "backbone": "resnet34",
+                "feature_layers": [1, 2],
+                "coreset_ratio": 0.1,
+                "k": 9,
+                "input_resolution": (180, 180),
+                "resize_mode": "padding",
+                "construction_batch_size": 1,
+                "distance_chunk_size": 1024,
+                "seed": 42,
+            },
         },
     }
 }
@@ -125,7 +159,6 @@ def validate_config(config: dict[str, Any]) -> None:
     parameters_by_view = config["parameters_by_view"]
     if not isinstance(parameters_by_view, dict) or set(parameters_by_view) != set(PATCHCORE_EXPECTED_VIEWS):
         raise ValueError("parameters_by_view는 운영 view 네 개를 정확히 포함해야 합니다.")
-    resolutions: set[tuple[int, int]] = set()
     for view in PATCHCORE_EXPECTED_VIEWS:
         parameters = parameters_by_view[view]
         if not isinstance(parameters, dict) or set(parameters) != PATCHCORE_V3_PARAMETER_KEYS:
@@ -151,15 +184,12 @@ def validate_config(config: dict[str, Any]) -> None:
         resolution = parameters["input_resolution"]
         if len(resolution) != 2 or any(type(value) is not int or value < 1 for value in resolution):
             raise ValueError(f"{view}: input_resolution이 올바르지 않습니다.")
-        resolutions.add((int(resolution[0]), int(resolution[1])))
         for field in ("construction_batch_size", "distance_chunk_size"):
             if type(parameters[field]) is not int or parameters[field] < 1:
                 raise ValueError(f"{view}: {field}가 올바르지 않습니다.")
         if type(parameters["seed"]) is not int or parameters["seed"] < 0:
             raise ValueError(f"{view}: seed가 올바르지 않습니다.")
         validate_preprocessing_settings(view, PREPROCESSING_BY_VIEW[view])
-    if len(resolutions) != 1:
-        raise ValueError("v3 absolute top-k 정책은 네 view의 input_resolution이 같아야 합니다.")
 
 
 def load_input(path: Path, view: str, config: dict[str, Any]) -> torch.Tensor:

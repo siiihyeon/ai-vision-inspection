@@ -788,15 +788,6 @@ def validate_v3_manifest(
         shape = bank_shapes[view]
         if not isinstance(shape, list) or len(shape) != 2 or min(map(int, shape)) < 1:
             raise RuntimeError(f"{view}: memory bank shape가 올바르지 않습니다.")
-    if len({tuple(int(value) for value in grids[view]) for view in views}) != 1:
-        raise RuntimeError("v3 artifact의 네 view patch grid는 같아야 합니다.")
-    if len(
-        {
-            tuple(int(value) for value in parameters_by_view[view]["input_resolution"])
-            for view in views
-        }
-    ) != 1:
-        raise RuntimeError("v3 artifact의 네 view input_resolution은 같아야 합니다.")
     selection = manifest.get("candidate_selection")
     if not isinstance(selection, dict) or not selection.get("selected_candidate_id"):
         raise RuntimeError("artifact candidate selection 기록이 없습니다.")

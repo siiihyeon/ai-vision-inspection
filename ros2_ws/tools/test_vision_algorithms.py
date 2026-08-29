@@ -149,7 +149,7 @@ class PatchCoreContractTests(unittest.TestCase):
             }
             for view in views
         }
-        grids = {view: [2, 2] for view in views}
+        grids = {view: [2 + position, 2] for position, view in enumerate(views)}
         normalization = {"method": "std_floor", "std_floor_ratio": 0.1}
         aggregation = {"method": "top_k_average", "top_k": 1}
         manifest = {
@@ -168,10 +168,10 @@ class PatchCoreContractTests(unittest.TestCase):
             "parameters_by_view": {
                 view: {
                     "backbone": "resnet34",
-                    "feature_layers": [1, 2],
+                    "feature_layers": [1, 2 + (position % 2)],
                     "coreset_ratio": 0.1 + position * 0.01,
                     "k": 9 - position,
-                    "input_resolution": [180, 180],
+                    "input_resolution": [180 + position * 8, 176 + position * 4],
                     "resize_mode": "padding",
                     "construction_batch_size": 1 + position,
                     "distance_chunk_size": 1024 * (position + 1),
@@ -241,12 +241,13 @@ class PatchCoreContractTests(unittest.TestCase):
             view_root = root / view
             view_root.mkdir(parents=True)
             (view_root / "model.pt").write_bytes(f"state:{view}".encode())
+            grid_h, grid_w = grids[view]
             torch.save(
                 {
-                    "center": torch.zeros((2, 2), dtype=torch.float32),
-                    "denominator": torch.ones((2, 2), dtype=torch.float32),
-                    "raw_scale": torch.ones((2, 2), dtype=torch.float32),
-                    "grid_shape": torch.tensor([2, 2], dtype=torch.int64),
+                    "center": torch.zeros((grid_h, grid_w), dtype=torch.float32),
+                    "denominator": torch.ones((grid_h, grid_w), dtype=torch.float32),
+                    "raw_scale": torch.ones((grid_h, grid_w), dtype=torch.float32),
+                    "grid_shape": torch.tensor(grids[view], dtype=torch.int64),
                     "scale_reference": torch.tensor(1.0, dtype=torch.float64),
                     "sample_count": torch.tensor(100, dtype=torch.int64),
                 },

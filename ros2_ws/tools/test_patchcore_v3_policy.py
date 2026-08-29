@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import sys
 import tempfile
 import unittest
@@ -38,6 +39,7 @@ from patchcore_v3_common import (  # noqa: E402
     spatial_view_scores_torch,
 )
 from ad_common import PatchCoreViewModel as OfflinePatchCoreViewModel  # noqa: E402
+from MB_construction_2 import MB_CONFIGS, validate_config  # noqa: E402
 from patchcore_v3_common import native_patch_maps  # noqa: E402
 
 
@@ -50,6 +52,27 @@ SERIAL_TO_VIEW = {
 
 
 class PatchCoreV3PolicyTests(unittest.TestCase):
+    def test_mb_config_accepts_independent_view_model_settings(self) -> None:
+        config = copy.deepcopy(MB_CONFIGS["MB_v3_resol_180"])
+        config["parameters_by_view"]["CAM_A_1"].update(
+            {"feature_layers": [1], "input_resolution": (160, 192)}
+        )
+        config["parameters_by_view"]["CAM_A_2"].update(
+            {
+                "backbone": "efficientnet_b0",
+                "feature_layers": [2, 4],
+                "input_resolution": (224, 224),
+            }
+        )
+        config["parameters_by_view"]["CAM_A_3"].update(
+            {"feature_layers": [2, 3], "input_resolution": (192, 160)}
+        )
+        config["parameters_by_view"]["CAM_B_1"].update(
+            {"feature_layers": [3], "input_resolution": (128, 128)}
+        )
+
+        validate_config(config)
+
     def test_offline_and_runtime_native_patch_maps_are_identical(self) -> None:
         torch.manual_seed(17)
         offline = OfflinePatchCoreViewModel(
