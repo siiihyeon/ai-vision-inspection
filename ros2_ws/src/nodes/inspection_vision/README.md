@@ -1,5 +1,8 @@
 # inspection_vision
 
+생성된 PatchCore v3 artifact를 실제 hardware runtime에 배포하는 전체 절차는
+[Artifact 운영 배포 매뉴얼](ARTIFACT_DEPLOYMENT_GUIDE.md)을 따릅니다.
+
 Vision Node는 HIKROBOT 네 대의 Mono8 촬영, 원자적 PNG 저장, 전처리와
 4-view PatchCore artifact 추론, durable station terminal 발행을 담당합니다.
 제품의 최종 판정과 물리 FIFO는 Master가 소유합니다.

@@ -1,5 +1,10 @@
 # 실행 설정 결정표
 
+최종 PatchCore v3 bundle의 /opt/inspection/models 배치, 통합 SHA 계산, model YAML
+갱신, launch/init 검증과 rollback은
+[Artifact 운영 배포 매뉴얼](../../../nodes/inspection_vision/ARTIFACT_DEPLOYMENT_GUIDE.md)을
+따릅니다.
+
 Launch는 공통 `sim.yaml`/`hardware.yaml`과 Vision 전용 세 파일을 순서대로 읽습니다. 생산값을 한 파일에 섞지 않기 위한 구조입니다.
 
 Vision의 전체 파라미터, 아직 key가 없는 모델·카메라 항목, 실험 인수조건은 [Vision Node 완성 결정표](../../../nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)를 따릅니다.
