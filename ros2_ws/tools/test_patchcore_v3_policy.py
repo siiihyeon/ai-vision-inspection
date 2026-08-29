@@ -70,6 +70,8 @@ class PatchCoreV3PolicyTests(unittest.TestCase):
         config["parameters_by_view"]["CAM_B_1"].update(
             {"feature_layers": [3], "input_resolution": (128, 128)}
         )
+        for position, view in enumerate(SERIAL_TO_VIEW.values()):
+            config["preprocessing_by_view"][view]["v_threshold"] = 20 + position * 30
 
         validate_config(config)
 

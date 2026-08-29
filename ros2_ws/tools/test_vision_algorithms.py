@@ -110,6 +110,40 @@ class PatchCoreContractTests(unittest.TestCase):
             self.assertEqual(prepared.view_name, "CAM_B_1")
             self.assertEqual(tuple(prepared.tensor.shape), (3, 128, 128))
 
+    def test_each_view_uses_its_own_v_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = np.zeros((80, 80), dtype=np.uint8)
+            image[20:60, 20:60] = 150
+            source_a = root / "DA9880512.png"
+            source_b = root / "DA7838410.png"
+            write_png(source_a, image)
+            write_png(source_b, image)
+            settings = {
+                view: PreprocessingSettings(
+                    100 if view == "CAM_A_1" else 200,
+                    8,
+                    True,
+                    False,
+                )
+                for view in SERIAL_TO_VIEW.values()
+            }
+            preprocessor = Mono8PatchCorePreprocessor(
+                serial_to_view=SERIAL_TO_VIEW,
+                settings_by_view=settings,
+                input_resolution_by_view={
+                    view: (64, 64) for view in SERIAL_TO_VIEW.values()
+                },
+                resize_mode_by_view={
+                    view: "padding" for view in SERIAL_TO_VIEW.values()
+                },
+                diagnostic_root=root / "diagnostics",
+            )
+
+            self.assertEqual(preprocessor.load(source_a).view_name, "CAM_A_1")
+            with self.assertRaises(PreprocessingFailure):
+                preprocessor.load(source_b)
+
     def test_no_foreground_is_failure_and_saves_only_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -142,12 +176,12 @@ class PatchCoreContractTests(unittest.TestCase):
         }
         preprocessing = {
             view: {
-                "v_threshold": 40,
+                "v_threshold": 20 + position * 30,
                 "connectivity": 8,
                 "remove_disconnected_noise": True,
                 "check_connection": False,
             }
-            for view in views
+            for position, view in enumerate(views)
         }
         grids = {view: [2 + position, 2] for position, view in enumerate(views)}
         normalization = {"method": "std_floor", "std_floor_ratio": 0.1}

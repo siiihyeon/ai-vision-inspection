@@ -129,17 +129,34 @@ MB_CONFIGS: dict[str, dict[str, Any]] = {
                 "seed": 42,
             },
         },
+        # V-threshold를 포함한 전처리 설정도 view별로 독립적이다.
+        "preprocessing_by_view": {
+            "CAM_A_1": {
+                "v_threshold": 40,
+                "connectivity": 8,
+                "remove_disconnected_noise": True,
+                "check_connection": False,
+            },
+            "CAM_A_2": {
+                "v_threshold": 40,
+                "connectivity": 8,
+                "remove_disconnected_noise": True,
+                "check_connection": False,
+            },
+            "CAM_A_3": {
+                "v_threshold": 40,
+                "connectivity": 8,
+                "remove_disconnected_noise": True,
+                "check_connection": False,
+            },
+            "CAM_B_1": {
+                "v_threshold": 40,
+                "connectivity": 8,
+                "remove_disconnected_noise": True,
+                "check_connection": False,
+            },
+        },
     }
-}
-
-PREPROCESSING_BY_VIEW: dict[str, dict[str, Any]] = {
-    view: {
-        "v_threshold": 40,
-        "connectivity": 8,
-        "remove_disconnected_noise": True,
-        "check_connection": False,
-    }
-    for view in PATCHCORE_EXPECTED_VIEWS
 }
 
 
@@ -152,13 +169,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_config(config: dict[str, Any]) -> None:
-    if set(config) != {"view_names", "parameters_by_view"}:
-        raise ValueError("v3 MB config는 view_names/parameters_by_view만 가져야 합니다.")
+    if set(config) != {"view_names", "parameters_by_view", "preprocessing_by_view"}:
+        raise ValueError(
+            "v3 MB config는 view_names/parameters_by_view/preprocessing_by_view만 가져야 합니다."
+        )
     if tuple(config["view_names"]) != PATCHCORE_EXPECTED_VIEWS:
         raise ValueError(f"v3 view 순서는 {list(PATCHCORE_EXPECTED_VIEWS)}여야 합니다.")
     parameters_by_view = config["parameters_by_view"]
     if not isinstance(parameters_by_view, dict) or set(parameters_by_view) != set(PATCHCORE_EXPECTED_VIEWS):
         raise ValueError("parameters_by_view는 운영 view 네 개를 정확히 포함해야 합니다.")
+    preprocessing_by_view = config["preprocessing_by_view"]
+    if not isinstance(preprocessing_by_view, dict) or set(preprocessing_by_view) != set(
+        PATCHCORE_EXPECTED_VIEWS
+    ):
+        raise ValueError("preprocessing_by_view는 운영 view 네 개를 정확히 포함해야 합니다.")
     for view in PATCHCORE_EXPECTED_VIEWS:
         parameters = parameters_by_view[view]
         if not isinstance(parameters, dict) or set(parameters) != PATCHCORE_V3_PARAMETER_KEYS:
@@ -189,21 +213,31 @@ def validate_config(config: dict[str, Any]) -> None:
                 raise ValueError(f"{view}: {field}가 올바르지 않습니다.")
         if type(parameters["seed"]) is not int or parameters["seed"] < 0:
             raise ValueError(f"{view}: seed가 올바르지 않습니다.")
-        validate_preprocessing_settings(view, PREPROCESSING_BY_VIEW[view])
+        validate_preprocessing_settings(view, preprocessing_by_view[view])
 
 
-def load_input(path: Path, view: str, config: dict[str, Any]) -> torch.Tensor:
+def load_input(
+    path: Path,
+    view: str,
+    config: dict[str, Any],
+    preprocessing: dict[str, Any],
+) -> torch.Tensor:
     return preprocess_full_frame(
         path,
         view=view,
-        settings=PREPROCESSING_BY_VIEW[view],
+        settings=preprocessing,
         resolution=config["input_resolution"],
         resize_mode=config["resize_mode"],
     ).tensor
 
 
 def construct_memory_bank(
-    *, view: str, config: dict[str, Any], index: Any, device: torch.device
+    *,
+    view: str,
+    config: dict[str, Any],
+    preprocessing: dict[str, Any],
+    index: Any,
+    device: torch.device,
 ) -> PatchCoreViewModel:
     print(f"\n[PatchCore v3 memory bank] view={view}")
     model = PatchCoreViewModel(
@@ -219,7 +253,10 @@ def construct_memory_bank(
     for start in range(0, len(names), batch_size):
         batch_names = names[start : start + batch_size]
         images = torch.stack(
-            [load_input(index.files["training_set"][view][name], view, config) for name in batch_names]
+            [
+                load_input(index.files["training_set"][view][name], view, config, preprocessing)
+                for name in batch_names
+            ]
         ).to(device, non_blocking=True)
         embeddings.append(model.generate_embedding(images))
         print(f"  feature extraction: {min(start + len(batch_names), len(names))}/{len(names)}")
@@ -239,6 +276,7 @@ def collect_split_maps(
     split: str,
     view: str,
     config: dict[str, Any],
+    preprocessing: dict[str, Any],
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
     names = sorted_product_names(index, split)
@@ -248,7 +286,10 @@ def collect_split_maps(
     for start in range(0, len(names), batch_size):
         batch_names = names[start : start + batch_size]
         images = torch.stack(
-            [load_input(index.files[split][view][name], view, config) for name in batch_names]
+            [
+                load_input(index.files[split][view][name], view, config, preprocessing)
+                for name in batch_names
+            ]
         ).to(device, non_blocking=True)
         maps, legacy_scores = native_patch_maps_and_legacy_scores(model, images)
         collected.append(maps.detach().cpu().numpy().astype(np.float32))
@@ -299,8 +340,15 @@ def construct_artifact(artifact_name: str, *, dataset_root: Path, artifact_root:
 
             for view in index.view_names:
                 view_config = config["parameters_by_view"][view]
+                preprocessing = config["preprocessing_by_view"][view]
                 set_reproducible_seed(int(view_config["seed"]))
-                model = construct_memory_bank(view=view, config=view_config, index=index, device=device)
+                model = construct_memory_bank(
+                    view=view,
+                    config=view_config,
+                    preprocessing=preprocessing,
+                    index=index,
+                    device=device,
+                )
                 for split in raw_maps:
                     raw_maps[split][view], legacy_scores[split][view] = collect_split_maps(
                         model=model,
@@ -308,6 +356,7 @@ def construct_artifact(artifact_name: str, *, dataset_root: Path, artifact_root:
                         split=split,
                         view=view,
                         config=view_config,
+                        preprocessing=preprocessing,
                         device=device,
                     )
                 grid = raw_maps["calibration_set_A"][view].shape[1:]
@@ -410,6 +459,7 @@ def construct_artifact(artifact_name: str, *, dataset_root: Path, artifact_root:
                     index.files["validation_normal"][view][first_name],
                     view,
                     config["parameters_by_view"][view],
+                    config["preprocessing_by_view"][view],
                 )[None].to(device)
                 for view in index.view_names
             ]
@@ -471,7 +521,7 @@ def construct_artifact(artifact_name: str, *, dataset_root: Path, artifact_root:
                 "camera_serial_by_view": PATCHCORE_CAMERA_SERIAL_BY_VIEW,
                 "parameters_by_view": config["parameters_by_view"],
                 "preprocessing_pipeline": preprocessing_pipeline_document(),
-                "preprocessing_by_view": PREPROCESSING_BY_VIEW,
+                "preprocessing_by_view": config["preprocessing_by_view"],
                 "spatial_scoring_policy": {
                     "normalization": selected_record["normalization"],
                     "aggregation": selected_record["aggregation"],

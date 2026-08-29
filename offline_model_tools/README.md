@@ -60,6 +60,9 @@ Calibration A에서 다음 후보를 만들고 네 view에 공통인 한 정책�
 
 `MB_construction_2.py`의 `parameters_by_view`에서 backbone, feature layer, coreset ratio,
 입력 해상도, construction batch/chunk 크기와 seed를 view별로 독립 설정할 수 있습니다.
+같은 artifact 설정의 `preprocessing_by_view`에서는 `CAM_A_1`~`CAM_B_1`별
+`v_threshold`를 독립 설정할 수 있으며, 해당 값은 각 view의 모든 dataset split과 runtime
+전처리에 동일하게 적용됩니다.
 그 결과 native patch grid가 view마다 달라도 허용됩니다. 절대 top-k 후보는 모든 view에서
 유효해야 하므로 각 view의 patch 수보다 작거나 같아야 합니다. View score `S_v`와
 calibration B threshold `T_v`에 대해 `S_v > T_v`일 때만 NG입니다.
