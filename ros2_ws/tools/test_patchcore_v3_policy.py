@@ -37,9 +37,16 @@ from patchcore_v3_common import (  # noqa: E402
     normalize_maps_numpy,
     preprocess_full_frame,
     spatial_view_scores_torch,
+    top_k_percent_patch_count,
+    validate_aggregation_config,
 )
 from ad_common import PatchCoreViewModel as OfflinePatchCoreViewModel  # noqa: E402
 from MB_construction_2 import MB_CONFIGS, validate_config  # noqa: E402
+from patchcore_AD_2 import (  # noqa: E402
+    _classification_metrics,
+    _save_normalized_heatmap,
+    _selected_policy_document,
+)
 from patchcore_v3_common import native_patch_maps  # noqa: E402
 
 
@@ -114,7 +121,12 @@ class PatchCoreV3PolicyTests(unittest.TestCase):
         )
         aggregations = (
             {"method": "percentile", "percentile": 99.5},
-            {"method": "top_k_average", "top_k": 3},
+            {
+                "method": "top_k_percent_average",
+                "top_k_percent": 10.0,
+                "rounding": "ceil",
+                "minimum_patch_count": 1,
+            },
         )
         for method in methods:
             calibration = build_spatial_calibration(calibration_maps, method)
@@ -135,6 +147,65 @@ class PatchCoreV3PolicyTests(unittest.TestCase):
                 )
                 np.testing.assert_allclose(offline_tensor.numpy(), expected, rtol=1e-5, atol=1e-6)
                 torch.testing.assert_close(runtime_tensor, offline_tensor)
+
+    def test_ratio_top_k_uses_percentage_ceil_and_rejects_absolute_contract(self) -> None:
+        self.assertEqual(top_k_percent_patch_count(400, 1.0), 4)
+        self.assertEqual(top_k_percent_patch_count(784, 1.0), 8)
+        self.assertEqual(top_k_percent_patch_count(201, 1.0), 3)
+        self.assertEqual(top_k_percent_patch_count(20, 1.0), 1)
+        with self.assertRaisesRegex(ValueError, "지원하지 않는 aggregation"):
+            validate_aggregation_config({"method": "top_k_average", "top_k": 3})
+
+    def test_final_metrics_and_policy_summary_are_complete(self) -> None:
+        metrics = _classification_metrics((90, 10, 2, 98), 200)
+        self.assertEqual(metrics["confusion_matrix"]["matrix"], [[90, 10], [2, 98]])
+        self.assertAlmostEqual(metrics["recall"], 0.98)
+        self.assertAlmostEqual(metrics["precision"], 98 / 108)
+        self.assertAlmostEqual(metrics["fpr"], 0.1)
+        self.assertAlmostEqual(metrics["f1"], 196 / 208)
+
+        aggregation = {
+            "method": "top_k_percent_average",
+            "top_k_percent": 1.0,
+            "rounding": "ceil",
+            "minimum_patch_count": 1,
+        }
+        manifest = {
+            "candidate_selection": {"selected_candidate_id": "candidate-001"},
+            "spatial_scoring_policy": {
+                "normalization": {"method": "std_floor", "std_floor_ratio": 0.1},
+                "aggregation": aggregation,
+                "decision": {"target_product_fpr": 0.01},
+            },
+            "view_names": ["CAM_A_1", "CAM_B_1"],
+            "patch_grid_shapes": {"CAM_A_1": [20, 20], "CAM_B_1": [28, 28]},
+            "thresholds": {"CAM_A_1": 2.0, "CAM_B_1": 3.0},
+            "parameters_by_view": {"CAM_A_1": {}, "CAM_B_1": {}},
+            "preprocessing_by_view": {"CAM_A_1": {}, "CAM_B_1": {}},
+        }
+        summary = _selected_policy_document(manifest)
+        self.assertEqual(
+            summary["effective_top_k_patch_counts_by_view"],
+            {"CAM_A_1": 4, "CAM_B_1": 8},
+        )
+
+    def test_heatmap_and_annotated_overlay_are_both_written(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "CAM_A_1_normalized_heatmap.png"
+            _save_normalized_heatmap(
+                output,
+                torch.linspace(0, 1, 3 * 16 * 16).reshape(3, 16, 16),
+                np.asarray([[0.0, 1.0], [2.0, 3.0]], dtype=np.float32),
+                view_score=2.0,
+                threshold=1.5,
+                ratio_score=4.0 / 3.0,
+                prediction=True,
+            )
+            overlay = output.with_name("CAM_A_1_normalized_overlay.png")
+            self.assertTrue(output.is_file())
+            self.assertTrue(overlay.is_file())
+            self.assertIsNotNone(cv2.imread(str(output), cv2.IMREAD_COLOR))
+            self.assertIsNotNone(cv2.imread(str(overlay), cv2.IMREAD_COLOR))
 
     def test_product_threshold_uses_strict_four_view_or_fpr(self) -> None:
         base = np.arange(100, dtype=np.float64)

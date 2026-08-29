@@ -17,7 +17,7 @@ Master CaptureProduct
   → black-padding resize → 3-channel 복제 → ImageNet normalize
   → 카메라별 PatchCore memory bank 추론
   → native patch distance map의 artifact 위치 center/scale 정규화
-  → artifact percentile/top-k aggregation으로 view score 산출
+  → artifact percentile/ratio-based top-k aggregation으로 view score 산출
   → view score가 calibration B threshold보다 클 때만 view NG
   → 하나라도 NG이면 station NG, station score는 threshold ratio 최댓값
   → durable spool commit
@@ -74,11 +74,16 @@ patch grid와 정확히 일치해야 합니다. View score `S_v`가 `T_v`보다 
 보고 score는 `S_v/T_v`입니다. Margin은 사용하지 않습니다.
 
 Normalization/aggregation 방식은 네 view가 공유하지만 backbone, feature layer, 입력
-해상도, native patch grid, 위치 통계와 threshold는 view별 독립입니다. 절대 top-k는 각
-view의 patch 수 안에서 유효해야 합니다. Calibration/validation FPR은 네 view 최종 OR
+해상도, native patch grid, 위치 통계와 threshold는 view별 독립입니다. Ratio-based
+top-k는 상위 `1%, 2%, 5%, 10%`를 후보로 비교하며 `ceil`, 최소 1 patch를 사용합니다.
+Calibration/validation FPR은 네 view 최종 OR
 기준 1%이고, validation에서
 이 제약을 만족하면서 product recall이 최대인 후보만 배포됩니다. 선택 후보, 탈락 후보,
 dataset digest와 calibration B score도 manifest에 보존합니다.
+
+Ratio-based top-k가 선택된 artifact에는 `top_k_percent`, `rounding=ceil`,
+`minimum_patch_count=1`이 저장됩니다. 기존 절대 `top_k` aggregation을 담은 artifact는
+현재 v3 계약에서 거부되므로 새 memory bank를 생성해야 합니다.
 
 ## 장애와 session 정책
 

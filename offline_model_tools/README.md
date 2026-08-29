@@ -47,7 +47,7 @@ Calibration A에서 다음 후보를 만들고 네 view에 공통인 한 정책�
 - variance shrinkage: lambda `0.05, 0.1, 0.25, 0.5`
 - median/scaled MAD: epsilon ratio `0.001, 0.01, 0.1`
 - map percentile: `99.0, 99.5, 99.9, 100.0`
-- top-k average: 절대 patch 수 `1, 3, 5, 10`
+- ratio-based top-k average: 상위 patch 비율 `1%, 2%, 5%, 10%`
 
 기존 reweighted PatchCore image score와 위치 정규화 없는 aggregation도 baseline으로
 기록하지만 자동 선택 대상은 아닙니다. 후보 선택 순서는 다음과 같습니다.
@@ -63,8 +63,9 @@ Calibration A에서 다음 후보를 만들고 네 view에 공통인 한 정책�
 같은 artifact 설정의 `preprocessing_by_view`에서는 `CAM_A_1`~`CAM_B_1`별
 `v_threshold`를 독립 설정할 수 있으며, 해당 값은 각 view의 모든 dataset split과 runtime
 전처리에 동일하게 적용됩니다.
-그 결과 native patch grid가 view마다 달라도 허용됩니다. 절대 top-k 후보는 모든 view에서
-유효해야 하므로 각 view의 patch 수보다 작거나 같아야 합니다. View score `S_v`와
+그 결과 native patch grid가 view마다 달라도 허용됩니다. Ratio-based top-k는 각 view의
+전체 patch 중 선택된 상위 비율을 사용하고, patch 수는 `ceil(N × percent / 100)`, 최소
+1개로 결정합니다. View score `S_v`와
 calibration B threshold `T_v`에 대해 `S_v > T_v`일 때만 NG입니다.
 보고 score는 `S_v / T_v`이며 기존 customized margin은 사용하지 않습니다. Station A는
 세 view OR, Station B는 한 view, 최종 제품은 두 station OR로 판정합니다.
@@ -101,6 +102,10 @@ cd offline_model_tools
   --result-root /absolute/path/to/result
 ```
 
-Test 결과에는 product confusion/accuracy, view score 분포, FP/FN normalized heat map과
-Station A/B별 model-pipeline 및 full-frame end-to-end mean/median/p95/p99가 포함됩니다.
+평가 시작 시 artifact SHA-256, GPU, 선택 candidate ID, normalization/aggregation과
+파라미터, threshold 정책, view별 threshold·patch grid·CNN·전처리 설정을 출력합니다.
+Test 결과에는 confusion matrix, F1, recall, FPR, precision, view score 분포와 Station
+A/B별 model-forward-only, entire-model-pipeline 및 full-frame end-to-end
+mean/median/p95/p99가 포함됩니다. 모든 test 제품을 TP/TN/FP/FN 폴더로 분류하고 각
+view의 원본 PNG, model input, normalized heat map, overlay와 score JSON을 저장합니다.
 Heat map만 bilinear 확대하며 확대와 시각화는 판정에 영향을 주지 않습니다.

@@ -185,7 +185,12 @@ class PatchCoreContractTests(unittest.TestCase):
         }
         grids = {view: [2 + position, 2] for position, view in enumerate(views)}
         normalization = {"method": "std_floor", "std_floor_ratio": 0.1}
-        aggregation = {"method": "top_k_average", "top_k": 1}
+        aggregation = {
+            "method": "top_k_percent_average",
+            "top_k_percent": 1.0,
+            "rounding": "ceil",
+            "minimum_patch_count": 1,
+        }
         manifest = {
             "format_version": 3,
             "algorithm": "patchcore",

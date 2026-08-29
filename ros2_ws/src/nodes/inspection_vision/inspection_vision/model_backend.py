@@ -645,10 +645,11 @@ def spatial_view_scores(
             dim=1,
             interpolation="linear",
         )
-    if method == "top_k_average":
-        top_k = int(aggregation.get("top_k", 0))
-        if not 1 <= top_k <= flattened.shape[1]:
-            raise ArtifactContractError("v3 top_k is outside patch count")
+    if method == "top_k_percent_average":
+        percent = float(aggregation.get("top_k_percent", math.nan))
+        if not math.isfinite(percent) or not 0 < percent <= 100:
+            raise ArtifactContractError("v3 top_k_percent is invalid")
+        top_k = max(1, int(math.ceil(int(flattened.shape[1]) * percent / 100.0)))
         return flattened.topk(
             top_k, dim=1, largest=True, sorted=False
         ).values.mean(dim=1)
@@ -680,13 +681,16 @@ def _validate_spatial_policy_options(
             or float(aggregation["percentile"]) not in {99.0, 99.5, 99.9, 100.0}
         ):
             raise ArtifactContractError("artifact map percentile is invalid")
-    elif aggregation_method == "top_k_average":
+    elif aggregation_method == "top_k_percent_average":
         if (
-            set(aggregation) != {"method", "top_k"}
-            or type(aggregation["top_k"]) is not int
-            or int(aggregation["top_k"]) not in {1, 3, 5, 10}
+            set(aggregation)
+            != {"method", "top_k_percent", "rounding", "minimum_patch_count"}
+            or type(aggregation["top_k_percent"]) not in {int, float}
+            or float(aggregation["top_k_percent"]) not in {1.0, 2.0, 5.0, 10.0}
+            or aggregation["rounding"] != "ceil"
+            or aggregation["minimum_patch_count"] != 1
         ):
-            raise ArtifactContractError("artifact top-k option is invalid")
+            raise ArtifactContractError("artifact ratio-based top-k option is invalid")
     else:
         raise ArtifactContractError("artifact aggregation option is invalid")
 
@@ -1018,10 +1022,6 @@ class PatchCoreArtifactModel:
             grid = manifest["patch_grid_shapes"][view]
             if not isinstance(grid, list) or len(grid) != 2 or min(map(int, grid)) < 1:
                 raise ArtifactContractError(f"{view}: patch grid shape is invalid")
-            if aggregation["method"] == "top_k_average" and int(
-                aggregation["top_k"]
-            ) > int(grid[0]) * int(grid[1]):
-                raise ArtifactContractError(f"{view}: top_k exceeds patch count")
             scores = np.asarray(manifest["calibration_b_scores"][view], dtype=np.float64)
             if scores.size < 100 or not np.all(np.isfinite(scores)):
                 raise ArtifactContractError(f"{view}: calibration B scores are invalid")

@@ -66,6 +66,7 @@ NORMALIZATION_COMPLEXITY = {
     "mad": 3,
     "none": 99,
 }
+TOP_K_PERCENT_CANDIDATES = (1.0, 2.0, 5.0, 10.0)
 
 
 @dataclass(frozen=True)
@@ -329,15 +330,36 @@ def validate_aggregation_config(aggregation: Mapping[str, Any]) -> None:
         if percentile not in {99.0, 99.5, 99.9, 100.0}:
             raise ValueError("map percentile이 승인된 후보 집합에 없습니다.")
         return
-    if method == "top_k_average":
-        if set(aggregation) != {"method", "top_k"}:
-            raise ValueError("top-k aggregation key가 올바르지 않습니다.")
-        if type(aggregation["top_k"]) is not int or int(aggregation["top_k"]) < 1:
-            raise ValueError("top_k는 양의 정수여야 합니다.")
-        if int(aggregation["top_k"]) not in {1, 3, 5, 10}:
-            raise ValueError("top_k가 승인된 후보 집합에 없습니다.")
+    if method == "top_k_percent_average":
+        if set(aggregation) != {
+            "method",
+            "top_k_percent",
+            "rounding",
+            "minimum_patch_count",
+        }:
+            raise ValueError("ratio-based top-k aggregation key가 올바르지 않습니다.")
+        top_k_percent = aggregation["top_k_percent"]
+        if type(top_k_percent) not in {int, float} or not math.isfinite(
+            float(top_k_percent)
+        ):
+            raise ValueError("top_k_percent는 유한한 숫자여야 합니다.")
+        if float(top_k_percent) not in TOP_K_PERCENT_CANDIDATES:
+            raise ValueError("top_k_percent가 승인된 후보 집합에 없습니다.")
+        if aggregation["rounding"] != "ceil":
+            raise ValueError("ratio-based top-k rounding은 ceil이어야 합니다.")
+        if aggregation["minimum_patch_count"] != 1:
+            raise ValueError("ratio-based top-k minimum_patch_count는 1이어야 합니다.")
         return
     raise ValueError("지원하지 않는 aggregation config입니다.")
+
+
+def top_k_percent_patch_count(total_patches: int, top_k_percent: float) -> int:
+    if type(total_patches) is not int or total_patches < 1:
+        raise ValueError("total_patches는 양의 정수여야 합니다.")
+    percent = float(top_k_percent)
+    if not math.isfinite(percent) or not 0 < percent <= 100:
+        raise ValueError("top_k_percent는 0보다 크고 100 이하여야 합니다.")
+    return max(1, int(math.ceil(total_patches * percent / 100.0)))
 
 
 def build_spatial_calibration(
@@ -418,10 +440,10 @@ def aggregate_maps_numpy(maps: np.ndarray, aggregation: Mapping[str, Any]) -> np
         if not 0 <= percentile <= 100:
             raise ValueError("map percentile은 0~100이어야 합니다.")
         return np.percentile(flattened, percentile, axis=1, method="linear")
-    if method == "top_k_average":
-        top_k = int(aggregation["top_k"])
-        if not 1 <= top_k <= flattened.shape[1]:
-            raise ValueError("top_k가 patch 수 범위를 벗어났습니다.")
+    if method == "top_k_percent_average":
+        top_k = top_k_percent_patch_count(
+            int(flattened.shape[1]), float(aggregation["top_k_percent"])
+        )
         partitioned = np.partition(flattened, flattened.shape[1] - top_k, axis=1)
         return partitioned[:, -top_k:].mean(axis=1)
     raise ValueError(f"알 수 없는 aggregation method: {method}")
@@ -451,10 +473,10 @@ def spatial_view_scores_torch(
         if percentile == 100.0:
             return flattened.amax(dim=1)
         return torch.quantile(flattened, percentile / 100.0, dim=1, interpolation="linear")
-    if method == "top_k_average":
-        top_k = int(aggregation["top_k"])
-        if not 1 <= top_k <= flattened.shape[1]:
-            raise RuntimeError("artifact top_k가 patch 수 범위를 벗어났습니다.")
+    if method == "top_k_percent_average":
+        top_k = top_k_percent_patch_count(
+            int(flattened.shape[1]), float(aggregation["top_k_percent"])
+        )
         return flattened.topk(top_k, dim=1, largest=True, sorted=False).values.mean(dim=1)
     raise RuntimeError(f"지원하지 않는 v3 aggregation method: {method}")
 
@@ -478,8 +500,13 @@ def aggregation_candidates() -> list[dict[str, Any]]:
         for value in (99.0, 99.5, 99.9, 100.0)
     ]
     candidates.extend(
-        {"method": "top_k_average", "top_k": value}
-        for value in (1, 3, 5, 10)
+        {
+            "method": "top_k_percent_average",
+            "top_k_percent": value,
+            "rounding": "ceil",
+            "minimum_patch_count": 1,
+        }
+        for value in TOP_K_PERCENT_CANDIDATES
     )
     return candidates
 
@@ -532,10 +559,17 @@ def evaluate_product_scores(
     predictions = np.concatenate((normal_predictions.astype(np.int64), anomaly_predictions.astype(np.int64)))
     tn, fp, fn, tp = (int(value) for value in confusion_matrix(labels, predictions, labels=[0, 1]).ravel())
     fpr = fp / (fp + tn) if fp + tn else 0.0
+    recall = float(recall_score(labels, predictions, zero_division=0))
+    precision = float(precision_score(labels, predictions, zero_division=0))
     return {
+        "confusion_matrix": {
+            "labels": ["normal", "anomaly"],
+            "matrix": [[tn, fp], [fn, tp]],
+        },
         "accuracy": float(accuracy_score(labels, predictions)),
-        "recall": float(recall_score(labels, predictions, zero_division=0)),
-        "precision": float(precision_score(labels, predictions, zero_division=0)),
+        "f1": 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0,
+        "recall": recall,
+        "precision": precision,
         "fpr": float(fpr),
         "tn": tn,
         "fp": fp,
@@ -781,10 +815,6 @@ def validate_v3_manifest(
         grid = grids[view]
         if not isinstance(grid, list) or len(grid) != 2 or min(map(int, grid)) < 1:
             raise RuntimeError(f"{view}: patch grid shape가 올바르지 않습니다.")
-        if policy["aggregation"]["method"] == "top_k_average" and int(
-            policy["aggregation"]["top_k"]
-        ) > int(grid[0]) * int(grid[1]):
-            raise RuntimeError(f"{view}: top_k가 patch 수보다 큽니다.")
         shape = bank_shapes[view]
         if not isinstance(shape, list) or len(shape) != 2 or min(map(int, shape)) < 1:
             raise RuntimeError(f"{view}: memory bank shape가 올바르지 않습니다.")
