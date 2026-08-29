@@ -37,8 +37,8 @@
 /inspection/control_node:
   ros__parameters:
     comm.node_heartbeat_period_ms: 500
-    control.mega.port: ""
-    control.mega.baud_rate: 0
+    control.mega.port: "/dev/ttyACM0"
+    control.mega.baud_rate: 115200
     control.tb6600.upper_config: ""
     control.tb6600.lower_config: ""
     control.sensor_config: ""

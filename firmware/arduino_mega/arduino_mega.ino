@@ -49,18 +49,18 @@
 #define CONV2_EN    3
 
 // HC-SR04 #1 - tested pin map
-#define TRIG1 7
-#define ECHO1 6
+#define TRIG1 25
+#define ECHO1 24
 
 // HC-SR04 #2
 // TODO: change these two values if your actual wiring is different.
-#define TRIG2 12
-#define ECHO2 11
+#define TRIG2 31
+#define ECHO2 30
 
 // HC-SR04 #3
 // TODO: change these two values if your actual wiring is different.
-#define TRIG3 14
-#define ECHO3 15
+#define TRIG3 39
+#define ECHO3 38
 
 // MG996R - tested pin map
 #define SERVO_PIN 44
@@ -74,8 +74,8 @@ AccelStepper conveyor1(AccelStepper::DRIVER, CONV1_STEP, CONV1_DIR);
 AccelStepper conveyor2(AccelStepper::DRIVER, CONV2_STEP, CONV2_DIR);
 
 // Values confirmed in the component-test sketch.
-const long CONV1_SPEED = 3000;
-const long CONV2_SPEED = -3000;
+const long CONV1_SPEED = -4000;
+const long CONV2_SPEED = 4000;
 
 const long CONV_MAX_SPEED = 10000;
 const long CONV_ACCELERATION = 10000;
@@ -87,7 +87,9 @@ const long CONV_ACCELERATION = 10000;
 
 // Detection / release thresholds copied from servo_ultra.ino.
 const float DETECT_DISTANCE_CM  = 10.0f;
-const float RELEASE_DISTANCE_CM = 12.0f;
+// Keep a wider hysteresis band so a product leaving Sensor 3 does not
+// briefly re-arm and generate a second detection event.
+const float RELEASE_DISTANCE_CM = 20.0f;
 
 // Ping one sensor every 20 ms.
 // With 3 sensors, each individual sensor is measured about every 60 ms.
@@ -101,6 +103,10 @@ const unsigned long ECHO_TIMEOUT_US = 5000UL;
 // Reject obviously invalid readings.
 const float MIN_VALID_DISTANCE_CM = 1.5f;
 const float MAX_VALID_DISTANCE_CM = 80.0f;
+
+// A detection is confirmed only after this many consecutive valid
+// measurements at or below DETECT_DISTANCE_CM.
+const uint8_t REQUIRED_CONSECUTIVE_DETECTIONS = 3;
 
 
 // ============================================================
@@ -117,7 +123,7 @@ const int SERVO_WORK_ANGLE = 70;
 const unsigned long SERVO_MOVE_DELAY_MS = 500UL;
 
 // Time to keep the reject arm at the work angle.
-const unsigned long SERVO_WAIT_TIME_MS = 3000UL;
+const unsigned long SERVO_WAIT_TIME_MS = 2000UL;
 
 
 // ============================================================
@@ -161,13 +167,22 @@ struct UltrasonicSensor {
   bool detectionArmed;
   uint32_t detectionSequence;
   float lastDistanceCm;
+  uint8_t consecutiveDetectCount;
 };
 
 UltrasonicSensor sensors[3] = {
-  { TRIG1, ECHO1, 1, true, 0, -1.0f },
-  { TRIG2, ECHO2, 2, true, 0, -1.0f },
-  { TRIG3, ECHO3, 3, true, 0, -1.0f }
+  { TRIG1, ECHO1, 1, true, 0, -1.0f, 0 },
+  { TRIG2, ECHO2, 2, true, 0, -1.0f, 0 },
+  { TRIG3, ECHO3, 3, true, 0, -1.0f, 0 }
 };
+
+// One product can wait at each upstream sensor while its conveyor is busy
+// positioning the preceding product.  The stored value is the remaining
+// travel from the newly detected product to that conveyor's camera position.
+bool pendingSensor1Detection = false;
+long pendingSensor1RemainingSteps = 0;
+bool pendingSensor2Detection = false;
+long pendingSensor2RemainingSteps = 0;
 
 enum SonicState : uint8_t {
   SONIC_IDLE = 0,
@@ -378,6 +393,35 @@ void startContinuousRun(uint8_t index) {
   enableConveyor(conveyor);
   conveyor.motor->setSpeed(conveyor.runSpeed);
   conveyor.state = CONV_RUNNING;
+
+  // Service one detection that arrived while this conveyor was positioning
+  // the preceding product.  Processing it here prevents a valid Sensor 1/2
+  // edge from being lost simply because the conveyor was temporarily busy.
+  bool hasPendingDetection =
+    (index == 0) ? pendingSensor1Detection : pendingSensor2Detection;
+
+  if (hasPendingDetection) {
+    long remainingSteps =
+      (index == 0) ? pendingSensor1RemainingSteps : pendingSensor2RemainingSteps;
+
+    // Clear the slot before emitting the event / starting positioning so a
+    // later product can occupy it while this product is being processed.
+    if (index == 0) {
+      pendingSensor1Detection = false;
+      pendingSensor1RemainingSteps = 0;
+    } else {
+      pendingSensor2Detection = false;
+      pendingSensor2RemainingSteps = 0;
+    }
+
+    UltrasonicSensor& sensor = sensors[index];
+    ++sensor.detectionSequence;
+    sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
+
+    if (conveyor.cameraOffsetSteps > 0) {
+      startAutomaticPosition(index, remainingSteps, sensor.detectionSequence);
+    }
+  }
 }
 
 
@@ -465,16 +509,48 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   // Rearm only after the previous object has physically moved away.
   if (distanceCm >= RELEASE_DISTANCE_CM) {
     sensor.detectionArmed = true;
+    sensor.consecutiveDetectCount = 0;
     return;
   }
 
-  if (distanceCm > DETECT_DISTANCE_CM || !sensor.detectionArmed) {
+  // A value outside the detect zone breaks a consecutive-detection streak.
+  if (distanceCm > DETECT_DISTANCE_CM) {
+    sensor.consecutiveDetectCount = 0;
     return;
   }
+
+  if (!sensor.detectionArmed) {
+    return;
+  }
+
+  ++sensor.consecutiveDetectCount;
+
+  if (sensor.consecutiveDetectCount < REQUIRED_CONSECUTIVE_DETECTIONS) {
+    return;
+  }
+
+  // The required consecutive close measurements have now been confirmed.
+  sensor.consecutiveDetectCount = 0;
 
   // Sensor 1 is associated with Conveyor 1.
   if (sensor.sensorId == 1) {
     if (conveyors[0].state != CONV_RUNNING) {
+      // Keep one busy-period detection instead of discarding it.  Disarm this
+      // sensor so repeated readings of the same product cannot overwrite the
+      // pending product's remaining travel distance.
+      if (!pendingSensor1Detection) {
+        sensor.detectionArmed = false;
+        long currentRemaining = labs(conveyors[0].motor->distanceToGo());
+        long pendingRemaining =
+          conveyors[0].cameraOffsetSteps - currentRemaining;
+
+        pendingSensor1RemainingSteps = constrain(
+          pendingRemaining,
+          0,
+          conveyors[0].cameraOffsetSteps
+        );
+        pendingSensor1Detection = true;
+      }
       return;
     }
 
@@ -496,6 +572,20 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   // Sensor 2 is associated with Conveyor 2.
   if (sensor.sensorId == 2) {
     if (conveyors[1].state != CONV_RUNNING) {
+      // Symmetric one-slot pending buffer for Conveyor 2 / Sensor 2.
+      if (!pendingSensor2Detection) {
+        sensor.detectionArmed = false;
+        long currentRemaining = labs(conveyors[1].motor->distanceToGo());
+        long pendingRemaining =
+          conveyors[1].cameraOffsetSteps - currentRemaining;
+
+        pendingSensor2RemainingSteps = constrain(
+          pendingRemaining,
+          0,
+          conveyors[1].cameraOffsetSteps
+        );
+        pendingSensor2Detection = true;
+      }
       return;
     }
 
@@ -554,6 +644,9 @@ void finishPing(float distanceCm) {
     distanceCm <= MAX_VALID_DISTANCE_CM
   ) {
     handleDetection(activeSensorIndex, distanceCm);
+  } else {
+    // An invalid value must not count as one of the three consecutive reads.
+    sensor.consecutiveDetectCount = 0;
   }
 
   lastGlobalPingUs = micros();
@@ -566,7 +659,8 @@ void abortPing() {
   // No echo within the timeout means no nearby object was observed.
   // Re-arm the sensor so the next product can be detected.
   sensors[activeSensorIndex].detectionArmed = true;
-  sensors[activeSensorIndex].lastDistanceCm = -1.0f;
+  sensors[activeSensorIndex].lastDistanceCm = 15.0f;
+  sensors[activeSensorIndex].consecutiveDetectCount = 0;
 
   lastGlobalPingUs = micros();
   nextSensorIndex = (activeSensorIndex + 1) % 3;
