@@ -7,7 +7,7 @@
   ros__parameters:
     comm.master_heartbeat_period_ms: 500
     comm.node_heartbeat_timeout_ms: 5000
-    system.expected_interface_version: "2.0.0"
+    system.expected_interface_version: "2.1.0"
     system.config_version: "dev-001"
     system.init_timeout_ms: 10000
     retry.init_interval_ms: 1000
@@ -19,8 +19,8 @@
     master.sensor_ids.sensor_3: "SENSOR_3"
     master.sensor.accepted_edge: 1
     master.hardware_mapping_confirmed: false
-    master.camera_ids.station_a: []
-    master.camera_ids.station_b: []
+    master.camera_ids.station_a: ["DA9880512", "DA9880516", "DA7552836"]
+    master.camera_ids.station_b: ["DA7838410"]
     master.action.position_timeout_ms: 10000
     master.action.capture_timeout_ms: 30000
     master.action.actuation_timeout_ms: 10000
@@ -28,7 +28,7 @@
     master.action.conveyor_run_timeout_ms: 10000
     master.pause_stop_timeout_ms: 10000
     master.shutdown_stop_timeout_ms: 10000
-    master.log_spool_path: ""
+    master.log_spool_path: "/var/lib/inspection/spool/master.sqlite3"
     master.log_flush_period_ms: 1000
     master.log_spool_warning_bytes: 0
     master.log_spool_hard_bytes: 0
@@ -37,8 +37,8 @@
 /inspection/control_node:
   ros__parameters:
     comm.node_heartbeat_period_ms: 500
-    control.mega.port: ""
-    control.mega.baud_rate: 0
+    control.mega.port: "/dev/ttyACM0"
+    control.mega.baud_rate: 115200
     control.tb6600.upper_config: ""
     control.tb6600.lower_config: ""
     control.sensor_config: ""
@@ -50,28 +50,21 @@
 /inspection/vision_node:
   ros__parameters:
     comm.node_heartbeat_period_ms: 500
-    vision.trigger.mode: "GIGE_ACTION_COMMAND"
-    vision.camera_ids.station_a: []
-    vision.camera_ids.station_b: []
-    vision.gige_action.device_key: 0
-    vision.gige_action.group_key: 0
-    vision.gige_action.group_mask: 0
-    vision.frame_arrival_skew_limit_us: 0
-    vision.capture.max_attempts: 2
-    vision.queue.capacity: 0
-    vision.worker_count: 0
-    vision.inference_queue_total_timeout_ms: 0
-    vision.data_root: ""
-    vision.model.path: ""
 
 /inspection/log_node:
   ros__parameters:
     comm.node_heartbeat_period_ms: 500
-    log.database_path: ""
-    log.producer_spool_root: ""
-    log.data_root: ""
-    log.retention_policy: ""
+    log.database_path: "/var/lib/inspection/log/inspection.sqlite3"
+    log.producer_spool_root: "/var/lib/inspection/spool"
+    log.data_root: "/var/lib/inspection"
+    log.retention_policy: "completed_image_count_10000"
+    log.image_retention.max_completed_images: 10000
+    log.report_root: "/var/lib/inspection/reports"
+    log.timeout_tuning.auto_apply: false
+    log.timeout_tuning.generated_path: "/var/lib/inspection/config/vision_timeout_tuning.json"
+    log.timeout_tuning.minimum_samples: 10000
+    log.timeout_tuning.safety_factor: 1.2
 
-# TODO(HARDWARE_REQUIRED): 빈 값과 0을 각 폴더 README의 결정표에 따라 채웁니다.
+# TODO(HARDWARE_REQUIRED): TB6600/sensor/actuator와 위치 매핑은 Control 통합 시 확정합니다.
 # 미확정 상태에서는 worker node 초기화가 INIT_BLOCKED 되어야 정상입니다.
 # LED 제어 설정은 의도적으로 존재하지 않습니다(외부 controller 상시점등).

@@ -4,9 +4,11 @@
 
 ## 현재 산출물의 성격
 
-이 저장소는 수정 레퍼런스를 반영한 **modified v2 팀 협업용 통신·공정 구현**입니다. Message/Service/Action, 상태 소유권, 멱등성, 파일경로 FIFO, SQLite commit/ACK 경계와 Master의 8개 공정 블록이 들어 있습니다. 실제 MVS SDK, Mega serial protocol/TB6600·액추에이터 adapter, 추론 모델은 아직 placeholder입니다. 따라서 지금 상태를 생산 장비에 연결하면 안 됩니다.
+이 저장소는 **interface 2.1 공정 구현**입니다. Ubuntu MVS 5.0.2 Action1 adapter, Mono8 촬영 계약, packet-loss 검증, 4-view PatchCore artifact 전처리·CUDA 추론, A terminal NG의 B 취소, Sensor3 lock, Vision durable 결과/replay, Log 보고서·10,000장 보존까지 연결되어 있습니다. 4-view artifact v2는 배포되었으며, Mega serial protocol/TB6600·액추에이터 adapter와 실장비 인수 시험은 아직 필요합니다. 따라서 남은 설정과 검증 없이 생산 라인을 운전하면 안 됩니다.
 
-남은 값을 각 폴더 README의 `결정 필요` 표대로 확정해 전달하면, placeholder를 실제 장비 adapter와 추론 알고리즘으로 교체하고 통합 시험하는 단계로 진행할 수 있습니다.
+Vision Node의 확정값, 미결정 정책, 실험값, 모든 파라미터 수정 위치는 [Vision Node 완성 결정표](ros2_ws/src/nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)를 단일 기준으로 사용합니다. 해당 표의 구현 차단 항목을 확정하면 placeholder를 실제 장비 adapter와 추론 알고리즘으로 교체할 수 있고, 이후 실장비 인수시험을 통과해야 생산 승인이 됩니다.
+
+기존 `README_비전검수_워크플로우.pdf`도 현재 Action1·Mono8·비동기 추론 정책에 맞춰 갱신되어 있습니다. 세부 파라미터는 PDF 요약이 아니라 위 완성 결정표와 hardware YAML을 기준으로 합니다.
 
 ## 확정된 핵심 Workflow
 
@@ -16,10 +18,10 @@ Control PositionSettled
   → Vision GIGE_ACTION_COMMAND broadcast
   → station 필수 camera frame 전체 수신
   → host arrival monotonic 기준 frame_arrival_skew_us 검증
-  → demosaic RGB PNG atomic 저장 + SHA-256
+  → 2448×2048 Mono8 PNG atomic 저장 + SHA-256 + packet_loss=0 검증
   → FrameBatch(image file paths) bounded FIFO enqueue
   → CaptureProduct 성공
-  → 공유 모델 worker 병렬 추론
+  → A 3-view/B 1-view PyTorch batch worker 추론
   → Vision StationResult / StationInferenceFailed
   → Master A/B 결합
   → Sensor3에서 미완료 FORCED_NG 및 ProductResultLocked
@@ -32,7 +34,12 @@ Control PositionSettled
 - Queue에는 raw frame이 아닌 `frame_batch_id`와 절대 이미지 파일 경로만 들어갑니다.
 - FIFO는 worker가 꺼내는 순서까지 보장합니다. 병렬 완료 순서는 Master의 `fifo_sequence` reorder buffer가 정렬합니다.
 - 제품 결과 적용 deadline은 Sensor3입니다. 명시적 station 실패는 즉시 `FORCED_NG` 후보로 기록하고, Sensor3에서만 최종 판정을 잠금합니다. Sensor3 시 미완료도 `FORCED_NG`입니다.
-- RGB PNG가 canonical 파일입니다. OpenCV adapter는 로딩 직후 BGR→RGB 변환 후 모델에 전달해야 합니다.
+- 1-channel Mono8 PNG가 canonical 파일입니다. resize/normalization은 모델 계약 주입 전까지 placeholder입니다.
+- Action1은 즉시 실행(`scheduled=false`)하며 A=`key/mask 1/1`, B=`2/2`로 분리합니다. PTP 상태와 무관하게 host monotonic frame-arrival 시각만 skew 판정에 사용합니다.
+- 시작 시 네 카메라의 모델·serial·IP·firmware를 SDK로 조회합니다. hardware profile은 승인 firmware `V4.0.43 250414 1530132`와 네 대 모두 정확히 일치해야 하며 자동 firmware update는 하지 않습니다.
+- Station A terminal NG 또는 실패는 Station B의 미시작 촬영, 저장 후 enqueue, queued job, pre-forward, active-forward 결과를 단계별로 취소합니다. 시작된 forward 자체는 강제 종료하지 않습니다.
+- Vision terminal 결과는 local spool에 먼저 기록하며 Log가 같은 session에서 재전송할 수 있습니다.
+- 정상 프로그램 종료 때 제품별 CSV와 성능 summary를 만들고, 완성 이미지는 Log가 최근 10,000장만 유지합니다.
 - LED는 외부 controller로 상시점등합니다. ROS/Arduino에는 밝기나 ON/OFF 제어 계약이 없습니다.
 - trigger 요청 직전·반환 직후의 host monotonic/wall 시각과 각 camera raw/domain timestamp를 보존합니다. 동기화 여부가 미정인 camera timestamp는 skew 계산에 사용하지 않습니다.
 - 성공한 Capture Result는 `error_code=0`, `reason=""`입니다. 경고는 `warning_codes`가 아니라 `LogEvent`로 보냅니다.
@@ -44,13 +51,13 @@ Control PositionSettled
 |---|---|---|
 | `inspection_master` | 시스템 FSM, 제품 ID/FIFO, A/B 결합, 최종 잠금 | 해당 패키지 README |
 | `inspection_control` | Mega, 센서, TB6600, 액추에이터 | 해당 패키지 README |
-| `inspection_vision` | MVS capture, RGB 파일, queue/worker, station 결과 | 해당 패키지 README |
+| `inspection_vision` | MVS capture, Mono8 파일, queue/worker, station 결과 | 패키지 README와 `README_COMPLETION_CHECKLIST.md` |
 | `inspection_log` | SQLite, ACK, projection, 보존정책 | 해당 패키지 README |
 | `inspection_interfaces` | v2 노드 간 계약 | 해당 패키지와 msg/action/srv README |
 | `inspection_common` | ID/digest/QoS/초기화/spool | 해당 패키지 README |
 | `inspection_bringup` | sim/hardware 설정과 launch | config README |
 | `firmware/arduino_mega` | Mega firmware placeholder | firmware README |
-| `구현_전_상세설계` | 승인사항과 미결정사항 단일 목록 | 설계 README |
+| `구현_전_상세설계` | 노드 공통 승인 정책 요약 | 설계 README |
 
 ## 빌드와 검사
 
@@ -66,12 +73,12 @@ source install/setup.bash
 ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 ```
 
-`sim`도 카메라 fake adapter를 자동 생성하지 않습니다. 실제 capture 성공 시나리오는 Vision 담당자가 fake adapter test를 추가한 뒤 활성화합니다. `hardware`는 필수 설정과 adapter가 완성될 때까지 `INIT_BLOCKED`가 정상입니다.
+`sim`은 작은 Mono8 PNG를 만드는 fake capture/model 골격을 사용합니다. `hardware`는 acquisition/skew/timeout/model 계약과 실장비 검증이 끝날 때까지 `INIT_BLOCKED`가 정상입니다.
 
 ## 변경 금지 원칙
 
-- `inspection_interfaces` 2.0.0의 필드나 enum을 한 노드 담당자가 단독 변경하지 않습니다.
+- `inspection_interfaces` 2.1.0의 필드나 enum을 한 노드 담당자가 단독 변경하지 않습니다.
 - `product_id`, `fifo_sequence`, A/B 결합과 최종 판정은 Master만 소유합니다.
-- Vision은 이미지 파일을 소유하고 Log는 메타데이터·digest를 저장합니다. 삭제는 확정된 Log 보존정책만 수행합니다.
+- Vision은 완성 이미지 파일을 저장만 하고 Log가 메타데이터·digest와 삭제 권한을 소유합니다.
 - 미결정 값에 임의의 생산 기본값을 넣지 않습니다. `hardware.yaml`의 빈 값/0은 의도적인 fail-closed 표시입니다.
 - `build`, `install`, `log`, runtime data는 배포 ZIP에서 제외합니다.

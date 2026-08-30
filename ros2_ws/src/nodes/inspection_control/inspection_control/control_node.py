@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import rclpy
-from .mega_protocol import decode_frame, encode_frame, parse_event
 from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
+
+import rclpy
 from inspection_common import (
     ConveyorId,
     ErrorCode,
@@ -12,7 +14,9 @@ from inspection_common import (
     NodeHealthState,
     NodeId,
     SystemState,
+    canonical_json,
     new_uuid,
+    sha256_text,
 )
 from inspection_common.node_base import (
     InspectionNodeBase,
@@ -23,15 +27,23 @@ from inspection_common.node_base import (
 from inspection_interfaces.action import ActuateProduct
 from inspection_interfaces.msg import (
     EquipmentState,
+    LogEvent,
     PositionSettled,
     SensorEvent,
     SystemCommand,
 )
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
-import threading
-import time
+
+from .mega_protocol import (
+    Sensor3Telemetry,
+    decode_frame_diagnostic,
+    encode_frame,
+    parse_event,
+    parse_sensor3_telemetry,
+)
 
 try:
     import serial
@@ -65,12 +77,29 @@ class ControlNode(InspectionNodeBase):
         self._equipment_state_publisher = self.create_publisher(
             EquipmentState, "control/equipment_state", reliable_event_qos()
         )
+<<<<<<< Updated upstream
+=======
+        self._log_event_publisher = self.create_publisher(
+            LogEvent, "log/event", reliable_event_qos(depth=1000)
+        )
+        self._latest_equipment_state: tuple[int, int, bool, bool, bool, bool] | None = None
+>>>>>>> Stashed changes
         self._mega = None
         self._mega_thread: threading.Thread | None = None
         self._mega_lock = threading.RLock()
         self._mega_sequence = 0
         self._mega_events: dict[str, tuple[bool, str]] = {}
         self._mega_event = threading.Condition(self._mega_lock)
+        self._mega_diagnostic_counts: dict[str, int] = {
+            "ascii_decode_error": 0,
+            "missing_crc_field": 0,
+            "invalid_crc_text": 0,
+            "crc_mismatch": 0,
+            "sensor3_format_rejected": 0,
+            "sensor3_parsed": 0,
+            "sensor3_publish_attempted": 0,
+        }
+        self._mega_last_diagnostic_report: dict[str, float] = {}
         self._blocking_pool = ThreadPoolExecutor(
             max_workers=2, thread_name_prefix="control-blocking"
         )
@@ -301,7 +330,7 @@ class ControlNode(InspectionNodeBase):
     def _read_mega(self) -> None:
         while self._mega is not None:
             try:
-                fields = decode_frame(self._mega.readline())
+                raw_line = self._mega.readline()
             except OSError as exc:
                 self.get_logger().error(f"Mega serial disconnected: {exc}")
                 with self._mega_lock:
@@ -312,7 +341,14 @@ class ControlNode(InspectionNodeBase):
                     pass
                 self.set_health_state(NodeHealthState.DEGRADED)
                 return
-            if not fields:
+            decoded = decode_frame_diagnostic(raw_line)
+            fields = decoded.fields
+            if fields is None:
+                if decoded.rejection_reason != "empty_read":
+                    self._record_mega_frame_rejection(
+                        decoded.rejection_reason or "unknown_decode_error",
+                        raw_line,
+                    )
                 continue
             if fields[0] == "A" and len(fields) >= 3:
                 with self._mega_event:
@@ -320,6 +356,17 @@ class ControlNode(InspectionNodeBase):
                         fields[2] == "OK", fields[2], time.monotonic(),
                     )
                     self._mega_event.notify_all()
+                continue
+            telemetry = parse_sensor3_telemetry(fields)
+            if telemetry is not None:
+                self._mega_diagnostic_counts["sensor3_parsed"] += 1
+                self._publish_sensor3_telemetry(telemetry)
+                continue
+            if fields[:2] == ["LOG", "SENSOR3"]:
+                self._record_mega_frame_rejection(
+                    "sensor3_format_rejected",
+                    raw_line,
+                )
                 continue
             event = parse_event(fields)
             if event is None:
@@ -368,6 +415,103 @@ class ControlNode(InspectionNodeBase):
                     sensor_3_clear,
                     actuator_safe,
                 )
+
+    @staticmethod
+    def _safe_serial_preview(raw_line: bytes, limit: int = 240) -> str:
+        preview = raw_line[:limit].decode("ascii", errors="backslashreplace")
+        return preview.rstrip("\r\n")
+
+    def _record_mega_frame_rejection(self, reason: str, raw_line: bytes) -> None:
+        """Count every rejection and rate-limit durable diagnostic summaries."""
+
+        self._mega_diagnostic_counts.setdefault(reason, 0)
+        self._mega_diagnostic_counts[reason] += 1
+        now = time.monotonic()
+        last_report = self._mega_last_diagnostic_report.get(reason, float("-inf"))
+        if now - last_report < 5.0:
+            return
+        self._mega_last_diagnostic_report[reason] = now
+        preview = self._safe_serial_preview(raw_line)
+        self.get_logger().warning(
+            f"Mega serial frame rejected: reason={reason}, "
+            f"length={len(raw_line)}, preview={preview!r}"
+        )
+        self._publish_control_log_event(
+            "MEGA_SERIAL_FRAME_REJECTED",
+            {
+                "reason": reason,
+                "raw_length": len(raw_line),
+                "raw_preview": preview,
+                "preview_truncated": len(raw_line) > 240,
+                "diagnostic_counts": dict(self._mega_diagnostic_counts),
+            },
+            severity=LogEvent.WARNING,
+        )
+
+    def _publish_sensor3_telemetry(self, telemetry: Sensor3Telemetry) -> None:
+        """Mega Sensor3 진단 표본을 LogNode가 SQLite에 저장할 형태로 발행합니다."""
+
+        event_type = f"MEGA_SENSOR3_{telemetry.event}"
+        payload = {
+            "firmware_event": telemetry.event,
+            "firmware_millis": telemetry.firmware_millis,
+            "firmware_micros": telemetry.firmware_micros,
+            "distance_cm": telemetry.distance_cm,
+            "detection_armed": telemetry.detection_armed,
+            "consecutive_detect_count": telemetry.consecutive_detect_count,
+            "consecutive_release_count": telemetry.consecutive_release_count,
+            "echo_timeout": telemetry.event in {"TIMEOUT", "REARMED_TIMEOUT"},
+            "release_check": telemetry.event == "RELEASE_CHECK",
+            "rearmed": telemetry.event in {"REARMED", "REARMED_TIMEOUT"},
+        }
+        if self._publish_control_log_event(event_type, payload, severity=LogEvent.DEBUG):
+            self._mega_diagnostic_counts["sensor3_publish_attempted"] += 1
+
+    def _publish_control_log_event(
+        self,
+        event_type: str,
+        payload: dict[str, object],
+        *,
+        severity: int,
+    ) -> bool:
+        """Publish one Control-owned LogEvent for the active session."""
+
+        if not self.session_id:
+            return False
+        envelope = {
+            "schema_version": 2,
+            "event_type": event_type,
+            "severity": int(severity),
+            "source_node": NodeId.CONTROL.value,
+            "producer_instance_id": self.node_instance_id,
+            "session_id": self.session_id,
+            "product_id": "",
+            "payload": payload,
+        }
+        try:
+            payload_json = canonical_json(envelope)
+            payload_digest = sha256_text(payload_json)
+        except (TypeError, ValueError, OverflowError) as exc:
+            self.get_logger().error(
+                f"Control diagnostic serialization failed: {type(exc).__name__}"
+            )
+            return False
+        message = LogEvent()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.session_id = self.session_id
+        message.header.message_id = new_uuid()
+        message.log_id = new_uuid()
+        message.revision = 1
+        message.severity = severity
+        message.event_type = event_type
+        message.source_node = NodeId.CONTROL.value
+        message.producer_instance_id = self.node_instance_id
+        message.product_id = ""
+        message.payload_json = payload_json
+        message.payload_digest = payload_digest
+        message.occurred_at = message.header.stamp
+        self._log_event_publisher.publish(message)
+        return True
 
     def _publish_sensor_event(self, sensor_id: str, edge: str, sequence: str, step: str) -> None:
         message = SensorEvent()
@@ -483,7 +627,7 @@ class ControlNode(InspectionNodeBase):
 
 
 def main(args: list[str] | None = None) -> None:
-    rclpy.init(args=args)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     spin_node(ControlNode())
 
 

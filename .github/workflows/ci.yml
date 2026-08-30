@@ -3,7 +3,7 @@ name: Static checks
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, "feature/**"]
 
 jobs:
   skeleton-contract:
@@ -14,10 +14,39 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install static analysis
-        run: python3 -m pip install pyflakes==3.4.0
+        run: |
+          python3 -m pip install pyflakes==3.4.0 numpy opencv-python-headless
+          python3 -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
       - name: Check Python undefined names and import usage
-        run: pyflakes ros2_ws/src ros2_ws/tools
+        run: pyflakes ros2_ws/src ros2_ws/tools offline_model_tools
       - name: Verify package structure and interface contract
         run: python3 ros2_ws/tools/verify_skeleton.py
       - name: Test pure domain contracts
         run: python3 ros2_ws/tools/test_domain_contracts.py
+      - name: Test PatchCore preprocessing and fake MVS SDK
+        run: python3 ros2_ws/tools/test_vision_algorithms.py
+
+  ros-jazzy-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: jazzy
+      - name: Resolve ROS dependencies
+        run: |
+          sudo rosdep init 2>/dev/null || true
+          rosdep update
+          rosdep install --from-paths ros2_ws/src --ignore-src --rosdistro jazzy -y --skip-keys ament_python
+      - name: Build every ROS package with the ROS system Python
+        working-directory: ros2_ws
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --symlink-install --cmake-force-configure --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
+      - name: Run package tests and report every failure
+        working-directory: ros2_ws
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          colcon test --python-testing pytest --return-code-on-test-failure --event-handlers console_direct+
+          colcon test-result --verbose

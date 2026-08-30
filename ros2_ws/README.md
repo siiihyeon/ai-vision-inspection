@@ -1,6 +1,8 @@
 # ROS 2 Jazzy Workspace
 
-`src/basic_packages`는 공통 계약, `src/nodes`는 네 실행 노드입니다. 인터페이스 2.0.0은 breaking baseline입니다.
+`src/basic_packages`는 공통 계약, `src/nodes`는 네 실행 노드입니다. 인터페이스 2.1.0은 Vision cancellation/replay baseline입니다.
+
+Vision Node를 완성하기 위한 확정·미결정·실험 항목과 파라미터 위치는 [Vision Node 완성 결정표](src/nodes/inspection_vision/README_COMPLETION_CHECKLIST.md)를 기준으로 합니다.
 
 ## 검증 순서
 
@@ -8,7 +10,9 @@
 source /opt/ros/jazzy/setup.bash
 python3 tools/verify_skeleton.py
 python3 tools/test_domain_contracts.py
-colcon build --symlink-install
+python3 tools/test_vision_algorithms.py
+colcon build --symlink-install --cmake-force-configure \
+  --cmake-args -DPython3_EXECUTABLE=/usr/bin/python3
 source install/setup.bash
 ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 ```
@@ -28,6 +32,9 @@ ros2 launch inspection_bringup inspection_system.launch.py profile:=sim
 | `/inspection/control/position_settled` | `PositionSettled` | Control → Master (Mega 자율 이동 결과, Action 아님) |
 | `/inspection/vision/capture_product` | `CaptureProduct` Action | Master → Vision |
 | `/inspection/vision/station_result` | `StationResult` | Vision → Master |
+| `/inspection/master/inference_cancellation` | `InferenceCancellation` | Master → Vision |
+| `/inspection/vision/inference_cancellation_ack` | `InferenceCancellationAck` | Vision → Master |
+| `/inspection/log/replay_station_results` | `ReplayStationResults` Service | Master → Log |
 | `/inspection/master/product_result_locked` | `ProductResultLocked` | Master → Vision/Control/Log |
 | `/inspection/control/actuate_product` | `ActuateProduct` Action | Master → Control |
 | `/inspection/log/event` | `LogEvent` | all → Log |

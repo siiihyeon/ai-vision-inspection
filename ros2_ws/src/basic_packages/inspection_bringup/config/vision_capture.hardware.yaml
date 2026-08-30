@@ -1,0 +1,44 @@
+/inspection/vision_node:
+  ros__parameters:
+    vision.trigger.mode: "GIGE_ACTION_COMMAND"
+    vision.camera_ids.station_a: ["DA9880512", "DA9880516", "DA7552836"]
+    vision.camera_ids.station_b: ["DA7838410"]
+    vision.camera_network_map_json: '{"DA9880512":"192.168.10.13","DA9880516":"192.168.10.11","DA7552836":"192.168.10.14","DA7838410":"192.168.10.12"}'
+    vision.nic.ipv4: "192.168.10.10"
+    vision.nic.prefix_length: 24
+    # 모든 자동/영상 보정은 코드에서 OFF로 강제합니다.
+    vision.camera_acquisition_map_json: '{"DA9880512":{"exposure_time_us":5000,"gain_db":0},"DA9880516":{"exposure_time_us":5000,"gain_db":0},"DA7552836":{"exposure_time_us":5000,"gain_db":0},"DA7838410":{"exposure_time_us":5000,"gain_db":0}}'
+    # MVS Action1: 모든 카메라는 DeviceKey=1, station별 key/mask로 분리합니다.
+    vision.gige_action.device_key: 1
+    vision.gige_action.station_a.group_key: 1
+    vision.gige_action.station_a.group_mask: 1
+    vision.gige_action.station_b.group_key: 2
+    vision.gige_action.station_b.group_mask: 2
+    vision.gige_action.broadcast_address: "255.255.255.255"
+    vision.gige_action.ack_timeout_ms: 100
+    vision.gige_action.scheduled: false     # 즉시 Action; PTP clock에 의존하지 않음
+    vision.frame_arrival_skew_limit_us: 50000
+    vision.capture.acquisition_timeout_ms: 250
+    vision.capture.max_attempts: 2
+    vision.gige.packet_size: 1500
+    vision.gige.packet_delay_ticks: 5000  # 초기값, packet l.oss/skew 시험 후 조정
+    vision.gige.packet_resend.enabled: true
+    vision.gige.packet_resend.max_percent: 10
+    vision.gige.packet_resend.timeout_ms: 50
+    vision.gige.packet_resend.max_retry_times: 3
+    vision.gige.packet_resend.interval_ms: 10
+    vision.ptp.enabled: false             # skew 판정은 항상 host monotonic arrival 사용
+    vision.camera.expected_model: "MV-CS050-10GC"
+    # 2026-08-25 MVS 열거로 네 카메라에서 동일하게 확인한 승인 버전입니다.
+    vision.camera.expected_firmware_version: "V4.0.43 250414 1530132"
+    vision.mvs.python_import_dir: "/opt/MVS/Samples/64/Python/MvImport"
+    vision.mvs.runtime_root: "/opt/MVS/lib"
+    vision.mvs.sdk_image_buffer_nodes: 8
+    vision.camera.disconnect_pause_after_ms: 5000
+    vision.camera.reconnect_interval_ms: 1000
+    vision.camera.reconnect_max_attempts: 5
+    vision.image.sensor_width: 2448
+    vision.image.sensor_height: 2048
+    vision.image.canonical_pixel_format: "MONO8_PNG"
+    vision.image.png_compression_level: 3
+    vision.data_root: "/var/lib/inspection/images"

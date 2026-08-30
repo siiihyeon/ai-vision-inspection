@@ -1,0 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cu132
+numpy==2.5.2
+opencv-python==5.0.0.93
+torch==2.12.1+cu132
+torchvision==0.27.1+cu132
