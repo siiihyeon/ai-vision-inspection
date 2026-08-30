@@ -49,21 +49,21 @@
 #define CONV2_EN    3
 
 // HC-SR04 #1 - tested pin map
-#define TRIG1 7
-#define ECHO1 6
+#define TRIG1 25
+#define ECHO1 24
 
 // HC-SR04 #2
 // TODO: change these two values if your actual wiring is different.
-#define TRIG2 12
-#define ECHO2 11
+#define TRIG2 31
+#define ECHO2 30
 
 // HC-SR04 #3
 // TODO: change these two values if your actual wiring is different.
-#define TRIG3 14
-#define ECHO3 15
+#define TRIG3 45
+#define ECHO3 40
 
 // MG996R - tested pin map
-#define SERVO_PIN 44
+#define SERVO_PIN 52
 
 
 // ============================================================
@@ -74,8 +74,8 @@ AccelStepper conveyor1(AccelStepper::DRIVER, CONV1_STEP, CONV1_DIR);
 AccelStepper conveyor2(AccelStepper::DRIVER, CONV2_STEP, CONV2_DIR);
 
 // Values confirmed in the component-test sketch.
-const long CONV1_SPEED = 3000;
-const long CONV2_SPEED = -3000;
+const long CONV1_SPEED = -4000;
+const long CONV2_SPEED = 4000;
 
 const long CONV_MAX_SPEED = 10000;
 const long CONV_ACCELERATION = 10000;
@@ -93,7 +93,7 @@ const float RELEASE_DISTANCE_CM = 12.0f;
 // With 3 sensors, each individual sensor is measured about every 60 ms.
 // This also reduces ultrasonic crosstalk compared with triggering all
 // three sensors at once.
-const unsigned long GLOBAL_PING_INTERVAL_US = 20000UL;
+const unsigned long GLOBAL_PING_INTERVAL_US = 10000UL;
 
 // Same timeout used in the test sketches.
 const unsigned long ECHO_TIMEOUT_US = 5000UL;
@@ -101,6 +101,16 @@ const unsigned long ECHO_TIMEOUT_US = 5000UL;
 // Reject obviously invalid readings.
 const float MIN_VALID_DISTANCE_CM = 1.5f;
 const float MAX_VALID_DISTANCE_CM = 80.0f;
+
+// A detection is confirmed only after this many consecutive valid
+// measurements at or below DETECT_DISTANCE_CM.
+const uint8_t REQUIRED_CONSECUTIVE_DETECTIONS = 5;
+
+// A previously detected product is considered gone, and the sensor becomes
+// armed again, only after this many consecutive no-object readings.
+// A no-echo timeout and a valid reading beyond RELEASE_DISTANCE_CM both count
+// as a no-object reading.
+const uint8_t REQUIRED_CONSECUTIVE_RELEASES = 10;
 
 
 // ============================================================
@@ -117,7 +127,7 @@ const int SERVO_WORK_ANGLE = 70;
 const unsigned long SERVO_MOVE_DELAY_MS = 500UL;
 
 // Time to keep the reject arm at the work angle.
-const unsigned long SERVO_WAIT_TIME_MS = 3000UL;
+const unsigned long SERVO_WAIT_TIME_MS = 500UL;
 
 
 // ============================================================
@@ -161,12 +171,14 @@ struct UltrasonicSensor {
   bool detectionArmed;
   uint32_t detectionSequence;
   float lastDistanceCm;
+  uint8_t consecutiveDetectCount;
+  uint8_t consecutiveReleaseCount;
 };
 
 UltrasonicSensor sensors[3] = {
-  { TRIG1, ECHO1, 1, true, 0, -1.0f },
-  { TRIG2, ECHO2, 2, true, 0, -1.0f },
-  { TRIG3, ECHO3, 3, true, 0, -1.0f }
+  { TRIG1, ECHO1, 1, true, 0, -1.0f, 0, 0 },
+  { TRIG2, ECHO2, 2, true, 0, -1.0f, 0, 0 },
+  { TRIG3, ECHO3, 3, true, 0, -1.0f, 0, 0 }
 };
 
 enum SonicState : uint8_t {
@@ -318,11 +330,32 @@ void sendEquipmentState() {
     "E|STATE|%d|%d|%d|%d|%d|%d",
     (int)conveyors[0].state,
     (int)conveyors[1].state,
-    sensors[0].lastDistanceCm >= RELEASE_DISTANCE_CM ? 1 : 0,
-    sensors[1].lastDistanceCm >= RELEASE_DISTANCE_CM ? 1 : 0,
-    sensors[2].lastDistanceCm >= RELEASE_DISTANCE_CM ? 1 : 0,
+    sensors[0].detectionArmed ? 1 : 0,
+    sensors[1].detectionArmed ? 1 : 0,
+    sensors[2].detectionArmed ? 1 : 0,
     servoState == SERVO_READY ? 1 : 0
   );
+  sendFrame(body);
+}
+
+
+void logSensor3Event(const char* event, float distanceCm, bool armed) {
+  UltrasonicSensor& sensor = sensors[2];
+  char body[180];
+
+  snprintf(
+    body,
+    sizeof(body),
+    "LOG|SENSOR3|%s|millis=%lu|micros=%lu|distanceCm=%.2f|armed=%d|detectCount=%u|releaseCount=%u",
+    event,
+    (unsigned long)millis(),
+    (unsigned long)micros(),
+    distanceCm,
+    armed ? 1 : 0,
+    (unsigned)sensor.consecutiveDetectCount,
+    (unsigned)sensor.consecutiveReleaseCount
+  );
+
   sendFrame(body);
 }
 
@@ -330,9 +363,10 @@ void sendEquipmentState() {
 void updateEquipmentStateReport() {
   int upperState = (int)conveyors[0].state;
   int lowerState = (int)conveyors[1].state;
-  bool sensor1Clear = sensors[0].lastDistanceCm >= RELEASE_DISTANCE_CM;
-  bool sensor2Clear = sensors[1].lastDistanceCm >= RELEASE_DISTANCE_CM;
-  bool sensor3Clear = sensors[2].lastDistanceCm >= RELEASE_DISTANCE_CM;
+  // A sensor is clear only after its two-sample release check completes.
+  bool sensor1Clear = sensors[0].detectionArmed;
+  bool sensor2Clear = sensors[1].detectionArmed;
+  bool sensor3Clear = sensors[2].detectionArmed;
   bool servoReady = servoState == SERVO_READY;
 
   bool changed =
@@ -462,15 +496,56 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
 
   UltrasonicSensor& sensor = sensors[sensorIndex];
 
-  // Rearm only after the previous object has physically moved away.
+  if (sensor.sensorId == 3) {
+    logSensor3Event("READ", distanceCm, sensor.detectionArmed);
+  }
+
+  // A valid far-distance echo also counts as one no-object reading.
+  // Do not re-arm after only one such reading: the previous product may still
+  // be in the sensor area or the reading may be noisy.
   if (distanceCm >= RELEASE_DISTANCE_CM) {
-    sensor.detectionArmed = true;
+    if (sensor.sensorId == 3) {
+      logSensor3Event("RELEASE_CHECK", distanceCm, sensor.detectionArmed);
+    }
+
+    sensor.consecutiveDetectCount = 0;
+    if (!sensor.detectionArmed &&
+        sensor.consecutiveReleaseCount < REQUIRED_CONSECUTIVE_RELEASES) {
+      ++sensor.consecutiveReleaseCount;
+      if (sensor.consecutiveReleaseCount >= REQUIRED_CONSECUTIVE_RELEASES) {
+        sensor.detectionArmed = true;
+        sensor.consecutiveReleaseCount = 0;
+        if (sensor.sensorId == 3) {
+          logSensor3Event("REARMED", distanceCm, sensor.detectionArmed);
+        }
+      }
+    }
     return;
   }
 
-  if (distanceCm > DETECT_DISTANCE_CM || !sensor.detectionArmed) {
+  // A value outside the detect zone breaks a consecutive-detection streak.
+  if (distanceCm > DETECT_DISTANCE_CM) {
+    sensor.consecutiveDetectCount = 0;
+    // This is neither close enough to detect nor far enough to release.
+    sensor.consecutiveReleaseCount = 0;
     return;
   }
+
+  // Any close echo means the previous product has not left yet.
+  sensor.consecutiveReleaseCount = 0;
+
+  if (!sensor.detectionArmed) {
+    return;
+  }
+
+  ++sensor.consecutiveDetectCount;
+
+  if (sensor.consecutiveDetectCount < REQUIRED_CONSECUTIVE_DETECTIONS) {
+    return;
+  }
+
+  // The required consecutive close measurements have now been confirmed.
+  sensor.consecutiveDetectCount = 0;
 
   // Sensor 1 is associated with Conveyor 1.
   if (sensor.sensorId == 1) {
@@ -479,6 +554,7 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
     }
 
     sensor.detectionArmed = false;
+    sensor.consecutiveReleaseCount = 0;
     ++sensor.detectionSequence;
 
     // Report the edge before beginning the local positioning cycle.
@@ -500,6 +576,7 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
     }
 
     sensor.detectionArmed = false;
+    sensor.consecutiveReleaseCount = 0;
     ++sensor.detectionSequence;
 
     sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
@@ -517,8 +594,10 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   // It never changes Conveyor 2 state.
   if (sensor.sensorId == 3) {
     sensor.detectionArmed = false;
+    sensor.consecutiveReleaseCount = 0;
     ++sensor.detectionSequence;
 
+    logSensor3Event("RELEASED", distanceCm, sensor.detectionArmed);
     sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
   }
 }
@@ -554,6 +633,10 @@ void finishPing(float distanceCm) {
     distanceCm <= MAX_VALID_DISTANCE_CM
   ) {
     handleDetection(activeSensorIndex, distanceCm);
+  } else {
+    // An invalid value must not count as one of the three consecutive reads.
+    sensor.consecutiveDetectCount = 0;
+    sensor.consecutiveReleaseCount = 0;
   }
 
   lastGlobalPingUs = micros();
@@ -563,10 +646,29 @@ void finishPing(float distanceCm) {
 
 
 void abortPing() {
-  // No echo within the timeout means no nearby object was observed.
-  // Re-arm the sensor so the next product can be detected.
-  sensors[activeSensorIndex].detectionArmed = true;
-  sensors[activeSensorIndex].lastDistanceCm = -1.0f;
+  UltrasonicSensor& sensor = sensors[activeSensorIndex];
+
+  // No echo is one no-object reading, not an immediate release.  A sensor
+  // that has already detected a product is re-armed only after two
+  // consecutive timeouts (or valid far-distance readings in handleDetection).
+  sensor.lastDistanceCm = -1.0f;
+  sensor.consecutiveDetectCount = 0;
+
+  if (sensor.sensorId == 3) {
+    logSensor3Event("TIMEOUT", -1.0f, sensor.detectionArmed);
+  }
+
+  if (!sensor.detectionArmed &&
+      sensor.consecutiveReleaseCount < REQUIRED_CONSECUTIVE_RELEASES) {
+    ++sensor.consecutiveReleaseCount;
+    if (sensor.consecutiveReleaseCount >= REQUIRED_CONSECUTIVE_RELEASES) {
+      sensor.detectionArmed = true;
+      sensor.consecutiveReleaseCount = 0;
+      if (sensor.sensorId == 3) {
+        logSensor3Event("REARMED_TIMEOUT", -1.0f, sensor.detectionArmed);
+      }
+    }
+  }
 
   lastGlobalPingUs = micros();
   nextSensorIndex = (activeSensorIndex + 1) % 3;
