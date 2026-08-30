@@ -1,5 +1,20 @@
 # inspection_control
 
+## Sensor3 진단 로그
+
+Mega firmware의 CRC-framed
+`LOG|SENSOR3|<event>|millis=...|micros=...|distanceCm=...|armed=...|detectCount=...|releaseCount=...`
+메시지는 Control Node가 검증한 뒤 `MEGA_SENSOR3_<event>` DEBUG LogEvent로 변환합니다.
+Log Node가 실행 중이면 원본 표본은 SQLite `log_events`에 저장되며 payload에는
+`distance_cm`, `detection_armed`, detect/release 연속 횟수, release 판정,
+재무장 및 echo timeout 여부가 포함됩니다. `READ`는 Sensor3의 모든 유효 측정을
+기록하므로 장기 운영 전에는 데이터 증가량과 retention 정책을 별도로 확정해야 합니다.
+
+CRC/ASCII/필드 형식 검증에서 탈락한 실제 serial 입력은 이유별로 모두 카운트합니다.
+동일 원인의 경고와 `MEGA_SERIAL_FRAME_REJECTED` SQLite 이벤트는 최대 5초에 한 번만
+기록하며, payload에 전체 누적 카운터, 입력 길이 및 최대 240자의 안전한 원문 미리보기를
+포함합니다. serial timeout으로 생기는 빈 read는 오류 카운터에서 제외합니다.
+
 Control은 Mega, sensor 원신호, TB6600 실제 동작과 actuator 완료의 유일한 소유자입니다. 카메라 trigger와 LED를 제어하지 않습니다.
 
 ## 골격에 구현된 경계

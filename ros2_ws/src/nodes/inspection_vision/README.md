@@ -27,6 +27,11 @@ Master CaptureProduct
 `vision.data_root/diagnostics` 아래에 저장합니다. 완성 canonical 이미지는
 Vision이 삭제하지 않으며 Log Node가 보존 정책을 소유합니다.
 
+완성 canonical 이미지 batch 디렉터리는 제품 투입 순서를 바로 확인할 수 있도록
+`vision.data_root/raw/station_<1|2>/product_<6자리 fifo_sequence>_<frame_batch_id>/`
+형식으로 저장합니다. 앞의 제품 번호로 정렬하고, 뒤의 UUID는 session 재시작이나
+재촬영에서도 경로가 충돌하지 않게 하며 기존 추적 identity로 계속 사용합니다.
+
 ## 카메라 계약
 
 | View | Serial | IP | Exposure | Gain |

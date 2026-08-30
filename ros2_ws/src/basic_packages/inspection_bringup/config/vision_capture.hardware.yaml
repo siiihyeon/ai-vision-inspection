@@ -7,7 +7,7 @@
     vision.nic.ipv4: "192.168.10.10"
     vision.nic.prefix_length: 24
     # 모든 자동/영상 보정은 코드에서 OFF로 강제합니다.
-    vision.camera_acquisition_map_json: '{"DA9880512":{"exposure_time_us":8000,"gain_db":0},"DA9880516":{"exposure_time_us":5000,"gain_db":0},"DA7552836":{"exposure_time_us":5000,"gain_db":0},"DA7838410":{"exposure_time_us":10000,"gain_db":0}}'
+    vision.camera_acquisition_map_json: '{"DA9880512":{"exposure_time_us":5000,"gain_db":0},"DA9880516":{"exposure_time_us":5000,"gain_db":0},"DA7552836":{"exposure_time_us":5000,"gain_db":0},"DA7838410":{"exposure_time_us":5000,"gain_db":0}}'
     # MVS Action1: 모든 카메라는 DeviceKey=1, station별 key/mask로 분리합니다.
     vision.gige_action.device_key: 1
     vision.gige_action.station_a.group_key: 1
@@ -21,7 +21,7 @@
     vision.capture.acquisition_timeout_ms: 250
     vision.capture.max_attempts: 2
     vision.gige.packet_size: 1500
-    vision.gige.packet_delay_ticks: 5000  # 초기값, packet loss/skew 시험 후 조정
+    vision.gige.packet_delay_ticks: 5000  # 초기값, packet l.oss/skew 시험 후 조정
     vision.gige.packet_resend.enabled: true
     vision.gige.packet_resend.max_percent: 10
     vision.gige.packet_resend.timeout_ms: 50

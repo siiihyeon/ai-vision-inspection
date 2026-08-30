@@ -463,6 +463,7 @@ class MvsFakeSdkTests(unittest.TestCase):
                 backend.initialize()
                 batch = backend.capture_station(
                     product_id="product-1",
+                    fifo_sequence=1,
                     station_id=2,
                     capture_id="capture-1",
                     attempt=1,
@@ -472,6 +473,10 @@ class MvsFakeSdkTests(unittest.TestCase):
             self.assertEqual(batch.images[0].camera_id, "DA7838410")
             self.assertEqual(batch.images[0].packet_loss_count, 0)
             self.assertTrue(Path(batch.images[0].file_path).is_file())
+            self.assertEqual(
+                Path(batch.images[0].file_path).parent.name,
+                f"product_000001_{batch.frame_batch_id}",
+            )
             self.assertIn(("enum", "ExposureAuto", "Off"), _FakeCamera.configured)
             self.assertIn(("enum", "GainAuto", "Off"), _FakeCamera.configured)
             self.assertIn(("enum", "BalanceWhiteAuto", "Off"), _FakeCamera.configured)

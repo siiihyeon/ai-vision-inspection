@@ -1460,6 +1460,7 @@ class VisionNode(InspectionNodeBase):
                 batch = await self._run_blocking(
                     self.capture_backend.capture_station,
                     product_id=request.product_id,
+                    fifo_sequence=request.fifo_sequence,
                     station_id=request.station_id,
                     capture_id=request.capture_id,
                     attempt=attempt,
