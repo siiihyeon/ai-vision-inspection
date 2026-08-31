@@ -457,7 +457,14 @@ class MasterNode(InspectionNodeBase):
             EquipmentState,
             "/inspection/control/equipment_state",
             self._handle_equipment_state,
-            state_qos(),
+            # depth=1이면 같은 loop() pass 안에서 컨베이어가
+            # RUNNING -> POSITIONING으로 곧바로 되돌아갈 때(다음 제품이 이미
+            # 센서에 대기 중이던 경우) RUNNING 샘플이 다음 상태에 덮어써져
+            # 구독 콜백에 한 번도 전달되지 않을 수 있다. 그러면 station
+            # 재가동 확인(_confirm_pending_resume)이 그 전이를 영영 못 보고,
+            # 물리적으로는 이미 재가동된 제품이 FLIPPING으로 전이되지 않은
+            # 채로 남는다.
+            state_qos(depth=8),
         )
         self._queue_subscription = self.create_subscription(
             VisionQueueState,
@@ -2008,8 +2015,6 @@ class MasterNode(InspectionNodeBase):
 
         if message.header.session_id != self.session_id:
             return
-        was_upper_running = self.equipment.conveyor_running.get(ConveyorId.UPPER)
-        was_lower_running = self.equipment.conveyor_running.get(ConveyorId.LOWER)
         self.update_equipment_snapshot(
             upper_running=message.upper_running,
             upper_stopped=message.upper_stopped,
@@ -2020,9 +2025,14 @@ class MasterNode(InspectionNodeBase):
             sensor_3_clear=message.sensor_3_clear,
             actuator_safe=message.actuator_safe,
         )
-        if message.upper_running and not was_upper_running:
+        # 이전엔 "정지 -> 가동" 전이 샘플에만(rising edge) 반응했다. depth=1
+        # 시절엔 그 전이 샘플 자체가 유실될 수 있어 재가동 확인이 영영 안
+        # 오는 경우가 있었다. _confirm_pending_resume -> confirm_conveyor_resumed는
+        # 이미 RESUME_PENDING이 아니면 조용히 무시하는 멱등 호출이라, 이렇게
+        # running=True인 메시지마다 매번 확인을 시도해도 안전하다.
+        if message.upper_running:
             self._confirm_pending_resume(ConveyorId.UPPER)
-        if message.lower_running and not was_lower_running:
+        if message.lower_running:
             self._confirm_pending_resume(ConveyorId.LOWER)
         if self._pending_run_confirmation and self.equipment.all_conveyors_running():
             self.confirm_all_conveyors_running()
