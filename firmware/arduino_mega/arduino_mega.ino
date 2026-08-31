@@ -104,7 +104,7 @@ const float MAX_VALID_DISTANCE_CM = 80.0f;
 
 // A detection is confirmed only after this many consecutive valid
 // measurements at or below DETECT_DISTANCE_CM.
-const uint8_t REQUIRED_CONSECUTIVE_DETECTIONS = 5;
+const uint8_t REQUIRED_CONSECUTIVE_DETECTIONS = 3;
 
 // A previously detected product is considered gone, and the sensor becomes
 // armed again, only after this many consecutive no-object readings.
@@ -472,7 +472,15 @@ bool startAutomaticPosition(uint8_t index, long targetSteps, long sensorSequence
 
   enableConveyor(conveyor);
 
+  // setCurrentPosition() resets AccelStepper's internal speed to 0, even
+  // though the belt is still physically moving at conveyor.runSpeed from
+  // CONV_RUNNING. move() computes its first speed step immediately, so
+  // setMaxSpeed()/setAcceleration()/setSpeed() must all be restored before
+  // move() runs, or positioning starts by re-accelerating from a standstill.
   conveyor.motor->setCurrentPosition(0);
+  conveyor.motor->setMaxSpeed(labs(conveyor.runSpeed));
+  conveyor.motor->setAcceleration(CONV_ACCELERATION);
+  conveyor.motor->setSpeed(conveyor.runSpeed);
 
   // Both tested conveyor speeds are negative, so move in the same
   // physical direction by using a negative relative target.
@@ -480,8 +488,6 @@ bool startAutomaticPosition(uint8_t index, long targetSteps, long sensorSequence
     (conveyor.runSpeed < 0) ? -labs(targetSteps) : labs(targetSteps);
 
   conveyor.motor->move(signedOffset);
-  conveyor.motor->setMaxSpeed(labs(conveyor.runSpeed));
-  conveyor.motor->setAcceleration(CONV_ACCELERATION);
   conveyor.positionSensorSequence = sensorSequence;
   conveyor.positionTargetSteps = targetSteps;
 
