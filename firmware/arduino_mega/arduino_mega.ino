@@ -131,8 +131,9 @@ const int SERVO_WORK_ANGLE = 70;
 // Time allowed for the servo to physically reach each angle.
 const unsigned long SERVO_MOVE_DELAY_MS = 500UL;
 
-// Time to keep the reject arm at the work angle.
-const unsigned long SERVO_WAIT_TIME_MS = 500UL;
+// Sensor 3 stores Conveyor 2's position when the product arrives.  For an
+// NG product, the arm returns home only after this many later TB6600 pulses.
+const long SERVO_RETURN_AFTER_STEPS = 12000L;
 
 
 // ============================================================
@@ -226,6 +227,11 @@ enum ServoState : uint8_t {
 ServoState servoState = SERVO_READY;
 unsigned long servoStateStartMs = 0;
 
+// Captured at the confirmed Sensor 3 edge.  This is a software count of the
+// STEP pulses issued by AccelStepper, not a physical encoder measurement.
+long sensor3Conveyor2StartPosition = 0;
+bool sensor3StepReferenceValid = false;
+
 // Tracks the equipment state last reported to the host, so
 // updateEquipmentStateReport() only sends E|STATE when something
 // actually changed instead of on a fixed period.
@@ -241,6 +247,11 @@ bool lastReportedServoReady = false;
 // command's sequence must be cached here to echo it back once the
 // reject cycle actually completes in updateServo().
 long pendingActuationSequence = 0;
+
+// Control Node performs HELLO before a new ROS run.  The first RUN after that
+// handshake must initialise the sorter and start both conveyors.  Later RUN
+// commands resume only the requested conveyor after camera positioning.
+bool rosStartupPending = true;
 
 
 // ============================================================
@@ -466,6 +477,22 @@ void startContinuousRun(uint8_t index) {
       startAutomaticPosition(index, remainingSteps, sensorSequence);
     }
   }
+}
+
+
+// Run once at the beginning of each ROS session. This is deliberately not
+// called by normal post-camera RUN commands, because those must not interrupt
+// an in-progress reject cycle or restart the other conveyor.
+void startRosSession() {
+  sorterServo.write(SERVO_HOME_ANGLE);
+  servoState = SERVO_READY;
+  servoStateStartMs = millis();
+  pendingActuationSequence = 0;
+  sensor3StepReferenceValid = false;
+
+  startContinuousRun(0);
+  startContinuousRun(1);
+  rosStartupPending = false;
 }
 
 
@@ -727,6 +754,8 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
     ++sensor.detectionSequence;
 
     logSensor3Event("RELEASED", distanceCm, sensor.detectionArmed);
+    sensor3Conveyor2StartPosition = conveyors[1].motor->currentPosition();
+    sensor3StepReferenceValid = true;
     sendSensorEvent(
       sensor.sensorId,
       sensor.detectionSequence,
@@ -849,7 +878,8 @@ void updateUltrasonicSensors() {
 // ============================================================
 
 bool startRejectCycle(long sequence) {
-  if (servoState != SERVO_READY) {
+  // An NG command must correspond to a product that already reached Sensor 3.
+  if (servoState != SERVO_READY || !sensor3StepReferenceValid) {
     return false;
   }
 
@@ -880,8 +910,14 @@ void updateServo() {
       break;
 
     case SERVO_WAITING:
-      // Hold the reject arm at 70 degrees for the configured time.
-      if (now - servoStateStartMs >= SERVO_WAIT_TIME_MS) {
+      // Return based on Conveyor 2 travel measured from Sensor 3, not on a
+      // fixed dwell time. This keeps the arm out until this product passes.
+      if (
+        labs(
+          conveyors[1].motor->currentPosition() -
+          sensor3Conveyor2StartPosition
+        ) >= SERVO_RETURN_AFTER_STEPS
+      ) {
         sorterServo.write(SERVO_HOME_ANGLE);
         servoState = SERVO_MOVING_HOME;
         servoStateStartMs = now;
@@ -895,6 +931,7 @@ void updateServo() {
         servoState = SERVO_READY;
         sendActuationEvent("OK", pendingActuationSequence);
         pendingActuationSequence = 0;
+        sensor3StepReferenceValid = false;
       }
       break;
   }
@@ -959,6 +996,8 @@ void handleCommand(char* line) {
       versionText != nullptr &&
       atoi(versionText) == PROTOCOL_VERSION
     ) {
+      // Mark the next RUN as a new ROS session start.
+      rosStartupPending = true;
       acknowledge(sequence, "OK");
     } else {
       acknowledge(sequence, "ERR_VERSION");
@@ -1007,7 +1046,13 @@ void handleCommand(char* line) {
     int conveyorId = atoi(conveyorText);
 
     if (conveyorId == 1 || conveyorId == 2) {
-      startContinuousRun(conveyorId - 1);
+      if (rosStartupPending) {
+        // ROS start often sends only RUN|1.  Start both conveyors here so
+        // Conveyor 2 cannot remain stopped waiting for a separate RUN|2.
+        startRosSession();
+      } else {
+        startContinuousRun(conveyorId - 1);
+      }
       acknowledge(sequence, "OK");
     } else {
       acknowledge(sequence, "ERR");
@@ -1063,6 +1108,7 @@ void handleCommand(char* line) {
     }
     else if (actuatorCommand == 2) {
       // Normal product: intentionally no servo motion.
+      sensor3StepReferenceValid = false;
       acknowledge(sequence, "OK");
       sendActuationEvent("OK", sequence);
     }
