@@ -125,8 +125,8 @@ const bool SENSOR3_DIAGNOSTIC_LOG_ENABLED = false;
 
 Servo sorterServo;
 
-const int SERVO_HOME_ANGLE = 0;
-const int SERVO_WORK_ANGLE = 70;
+const int SERVO_HOME_ANGLE = 70;
+const int SERVO_WORK_ANGLE = 0;
 
 // Time allowed for the servo to physically reach each angle.
 const unsigned long SERVO_MOVE_DELAY_MS = 500UL;
