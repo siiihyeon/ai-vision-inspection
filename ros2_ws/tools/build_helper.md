@@ -12,12 +12,9 @@ launch를 띄운 첫 번째 터미널은 그대로 두고, 운전 명령(`op`)�
 cd ~/ai-vision-inspection-main/ros2_ws
 source /opt/ros/jazzy/setup.bash
 source install/setup.bash
-<<<<<<< Updated upstream
-=======
 grep -qxF "alias op='~/ai-vision-inspection-main/ros2_ws/tools/operator_command.sh'" ~/.bash_aliases 2>/dev/null || \
   echo "alias op='~/ai-vision-inspection-main/ros2_ws/tools/operator_command.sh'" >> ~/.bash_aliases
 source ~/.bash_aliases
->>>>>>> Stashed changes
 ```
 
 ### 실행 노드 확인

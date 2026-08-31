@@ -66,6 +66,7 @@
     log.timeout_tuning.minimum_samples: 10000
     log.timeout_tuning.safety_factor: 1.2
 
-# TODO(HARDWARE_REQUIRED): TB6600/sensor/actuator와 위치 매핑은 Control 통합 시 확정합니다.
-# 미확정 상태에서는 worker node 초기화가 INIT_BLOCKED 되어야 정상입니다.
+# TODO(HARDWARE_REQUIRED): TB6600/sensor/actuator 설정값은 firmware/arduino_mega/arduino_mega.ino의
+# 현재 핀맵·상수를 그대로 옮긴 것입니다. 실물 배선으로 최종 검증된 값은 아니므로,
+# Control 담당자가 실장비로 확인 후 필요하면 갱신해야 합니다.
 # LED 제어 설정은 의도적으로 존재하지 않습니다(외부 controller 상시점등).
