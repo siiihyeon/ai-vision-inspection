@@ -421,33 +421,49 @@ void startContinuousRun(uint8_t index) {
   conveyor.motor->setSpeed(conveyor.runSpeed);
   conveyor.state = CONV_RUNNING;
 
-  // Service one detection that arrived while this conveyor was positioning
-  // the preceding product. Processing it here prevents a valid Sensor 1/2
-  // edge from being lost simply because the conveyor was temporarily busy.
+  // A queued detection (if any) is serviced later, from loop(), after
+  // updateEquipmentStateReport() has already sent this RUNNING transition.
+  // Servicing it here instead would emit the Sensor edge before Control /
+  // Master ever see the conveyor as running again, so Master would reject
+  // the new product as "station already owns" the one still being released.
+}
+
+
+void servicePendingDetection(uint8_t index) {
+  if (index > 1) return;
+
+  ConveyorController& conveyor = conveyors[index];
+
+  if (conveyor.state != CONV_RUNNING) {
+    return;
+  }
+
   bool hasPendingDetection =
     (index == 0) ? pendingSensor1Detection : pendingSensor2Detection;
 
-  if (hasPendingDetection) {
-    long remainingSteps =
-      (index == 0) ? pendingSensor1RemainingSteps : pendingSensor2RemainingSteps;
+  if (!hasPendingDetection) {
+    return;
+  }
 
-    // Clear the slot before emitting the event / starting positioning so a
-    // later product can occupy it while this product is being processed.
-    if (index == 0) {
-      pendingSensor1Detection = false;
-      pendingSensor1RemainingSteps = 0;
-    } else {
-      pendingSensor2Detection = false;
-      pendingSensor2RemainingSteps = 0;
-    }
+  long remainingSteps =
+    (index == 0) ? pendingSensor1RemainingSteps : pendingSensor2RemainingSteps;
 
-    UltrasonicSensor& sensor = sensors[index];
-    ++sensor.detectionSequence;
-    sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
+  // Clear the slot before emitting the event / starting positioning so a
+  // later product can occupy it while this product is being processed.
+  if (index == 0) {
+    pendingSensor1Detection = false;
+    pendingSensor1RemainingSteps = 0;
+  } else {
+    pendingSensor2Detection = false;
+    pendingSensor2RemainingSteps = 0;
+  }
 
-    if (conveyor.cameraOffsetSteps > 0) {
-      startAutomaticPosition(index, remainingSteps, sensor.detectionSequence);
-    }
+  UltrasonicSensor& sensor = sensors[index];
+  ++sensor.detectionSequence;
+  sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
+
+  if (conveyor.cameraOffsetSteps > 0) {
+    startAutomaticPosition(index, remainingSteps, sensor.detectionSequence);
   }
 }
 
@@ -1160,4 +1176,10 @@ void loop() {
   updateServo();
 
   updateEquipmentStateReport();
+
+  // Must run after updateEquipmentStateReport() so a queued detection's
+  // Sensor edge is never transmitted before the RUNNING state that frees
+  // Master's station slot for it.
+  servicePendingDetection(0);
+  servicePendingDetection(1);
 }
