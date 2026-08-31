@@ -181,6 +181,14 @@ UltrasonicSensor sensors[3] = {
   { TRIG3, ECHO3, 3, true, 0, -1.0f, 0, 0 }
 };
 
+// One product can wait at each upstream sensor while its conveyor is busy
+// positioning the preceding product. The stored value is the remaining
+// travel from the newly detected product to that conveyor's camera position.
+bool pendingSensor1Detection = false;
+long pendingSensor1RemainingSteps = 0;
+bool pendingSensor2Detection = false;
+long pendingSensor2RemainingSteps = 0;
+
 enum SonicState : uint8_t {
   SONIC_IDLE = 0,
   WAIT_ECHO_HIGH,
@@ -412,6 +420,35 @@ void startContinuousRun(uint8_t index) {
   enableConveyor(conveyor);
   conveyor.motor->setSpeed(conveyor.runSpeed);
   conveyor.state = CONV_RUNNING;
+
+  // Service one detection that arrived while this conveyor was positioning
+  // the preceding product. Processing it here prevents a valid Sensor 1/2
+  // edge from being lost simply because the conveyor was temporarily busy.
+  bool hasPendingDetection =
+    (index == 0) ? pendingSensor1Detection : pendingSensor2Detection;
+
+  if (hasPendingDetection) {
+    long remainingSteps =
+      (index == 0) ? pendingSensor1RemainingSteps : pendingSensor2RemainingSteps;
+
+    // Clear the slot before emitting the event / starting positioning so a
+    // later product can occupy it while this product is being processed.
+    if (index == 0) {
+      pendingSensor1Detection = false;
+      pendingSensor1RemainingSteps = 0;
+    } else {
+      pendingSensor2Detection = false;
+      pendingSensor2RemainingSteps = 0;
+    }
+
+    UltrasonicSensor& sensor = sensors[index];
+    ++sensor.detectionSequence;
+    sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
+
+    if (conveyor.cameraOffsetSteps > 0) {
+      startAutomaticPosition(index, remainingSteps, sensor.detectionSequence);
+    }
+  }
 }
 
 
@@ -550,6 +587,23 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   // Sensor 1 is associated with Conveyor 1.
   if (sensor.sensorId == 1) {
     if (conveyors[0].state != CONV_RUNNING) {
+      // Keep one busy-period detection instead of discarding it. Disarm this
+      // sensor so repeated readings of the same product cannot overwrite the
+      // pending product's remaining travel distance.
+      if (!pendingSensor1Detection) {
+        sensor.detectionArmed = false;
+        sensor.consecutiveReleaseCount = 0;
+        long currentRemaining = labs(conveyors[0].motor->distanceToGo());
+        long pendingRemaining =
+          conveyors[0].cameraOffsetSteps - currentRemaining;
+
+        pendingSensor1RemainingSteps = constrain(
+          pendingRemaining,
+          0,
+          conveyors[0].cameraOffsetSteps
+        );
+        pendingSensor1Detection = true;
+      }
       return;
     }
 
@@ -572,6 +626,21 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   // Sensor 2 is associated with Conveyor 2.
   if (sensor.sensorId == 2) {
     if (conveyors[1].state != CONV_RUNNING) {
+      // Symmetric one-slot pending buffer for Conveyor 2 / Sensor 2.
+      if (!pendingSensor2Detection) {
+        sensor.detectionArmed = false;
+        sensor.consecutiveReleaseCount = 0;
+        long currentRemaining = labs(conveyors[1].motor->distanceToGo());
+        long pendingRemaining =
+          conveyors[1].cameraOffsetSteps - currentRemaining;
+
+        pendingSensor2RemainingSteps = constrain(
+          pendingRemaining,
+          0,
+          conveyors[1].cameraOffsetSteps
+        );
+        pendingSensor2Detection = true;
+      }
       return;
     }
 

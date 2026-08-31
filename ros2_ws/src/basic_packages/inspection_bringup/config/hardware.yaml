@@ -14,11 +14,12 @@
     retry.warning_after_attempts: 3
     master.fifo.soft_limit: 18
     master.fifo.hard_capacity: 20
+    master.station_b.skip_after_station_a_ng: false
     master.sensor_ids.sensor_1: "SENSOR_1"
     master.sensor_ids.sensor_2: "SENSOR_2"
     master.sensor_ids.sensor_3: "SENSOR_3"
     master.sensor.accepted_edge: 1
-    master.hardware_mapping_confirmed: false
+    master.hardware_mapping_confirmed: True
     master.camera_ids.station_a: ["DA9880512", "DA9880516", "DA7552836"]
     master.camera_ids.station_b: ["DA7838410"]
     master.action.position_timeout_ms: 10000
@@ -39,10 +40,10 @@
     comm.node_heartbeat_period_ms: 500
     control.mega.port: "/dev/ttyACM0"
     control.mega.baud_rate: 115200
-    control.tb6600.upper_config: ""
-    control.tb6600.lower_config: ""
-    control.sensor_config: ""
-    control.actuator_config: ""
+    control.tb6600.upper_config: "fw_v2;conveyor=1;step=10;dir=9;enable=8;enable_active=LOW;speed=-4000;max_speed=10000;accel=10000;offset_steps=15100"
+    control.tb6600.lower_config: "fw_v2;conveyor=2;step=5;dir=4;enable=3;enable_active=LOW;speed=4000;max_speed=10000;accel=10000;offset_steps=7700"
+    control.sensor_config: "fw_v2;sensor1=HC-SR04:trig25:echo24;sensor2=HC-SR04:trig31:echo30;sensor3=HC-SR04:trig45:echo40;detect_cm=10;release_cm=12;edge=RISING"
+    control.actuator_config: "fw_v2;type=MG996R;pin=52;home_deg=0;reject_deg=70;move_ms=500;hold_ms=500;NG=1;PASS=2"
     control.actuator.timeout_ms: 10000
     control.station_a.position_offset_steps: 15100
     control.station_b.position_offset_steps: 7700
