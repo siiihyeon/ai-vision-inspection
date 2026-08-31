@@ -18,8 +18,10 @@
 //
 // 3) HC-SR04 #2 does the same thing for Conveyor 2.
 //
-// 4) HC-SR04 #3 only reports product arrival.
+// 4) HC-SR04 #3 detects product arrival.
 //    -> Conveyor 2 does NOT stop.
+//    -> The servo moves to the reject angle immediately, then returns home
+//       after Conveyor 2 has travelled SERVO_RETURN_AFTER_STEPS steps.
 //
 // 5) Control Node sends ACTUATE|1 for defective product.
 //    -> angle-controlled MG996R moves 0 deg -> 70 deg -> waits -> 0 deg.
@@ -120,14 +122,20 @@ const uint8_t REQUIRED_CONSECUTIVE_RELEASES = 10;
 
 Servo sorterServo;
 
-const int SERVO_HOME_ANGLE = 50;
+const int SERVO_HOME_ANGLE = 70;
 const int SERVO_WORK_ANGLE = 0;
 
 // Time allowed for the servo to physically reach each angle.
 const unsigned long SERVO_MOVE_DELAY_MS = 300UL;
 
-// Time to keep the reject arm at the work angle.
-const unsigned long SERVO_WAIT_TIME_MS = 1300UL;
+// Time to keep the reject arm at the work angle when it was started by an
+// ACTUATE|1 command. Sensor 3 uses the step-based setting below instead.
+const unsigned long SERVO_WAIT_TIME_MS = 3000UL;
+
+// Calibrate this value for the distance from Sensor 3 to the point at which
+// the reject arm must be out of the product's path. This is a TB6600 pulse
+// count, so it changes if the driver's microstep setting is changed.
+const long SERVO_RETURN_AFTER_STEPS = 12000L;
 
 
 // ============================================================
@@ -193,6 +201,14 @@ long pendingSensor1RemainingSteps = 0;
 bool pendingSensor2Detection = false;
 long pendingSensor2RemainingSteps = 0;
 
+// Sensor 1 starts moving on its first close reading. It is not reported to
+// Control Node until the second and third close readings confirm the product.
+bool sensor1TentativePositioning = false;
+
+// Sensor 2 uses the same first-read positioning / three-read confirmation
+// guard as Sensor 1.
+bool sensor2TentativePositioning = false;
+
 enum SonicState : uint8_t {
   SONIC_IDLE = 0,
   WAIT_ECHO_HIGH,
@@ -223,6 +239,11 @@ enum ServoState : uint8_t {
 ServoState servoState = SERVO_READY;
 unsigned long servoStateStartMs = 0;
 
+// Step-based Sensor 3 cycle: memorize Conveyor 2's position at detection,
+// then compare the number of pulses issued by AccelStepper.
+bool servoReturnByConveyorSteps = false;
+long servoStartConveyor2Position = 0;
+
 // Tracks the equipment state last reported to the host, so
 // updateEquipmentStateReport() only sends E|STATE when something
 // actually changed instead of on a fixed period.
@@ -238,6 +259,10 @@ bool lastReportedServoReady = false;
 // command's sequence must be cached here to echo it back once the
 // reject cycle actually completes in updateServo().
 long pendingActuationSequence = 0;
+
+// Defined in the servo section below; declared here because Sensor 3's
+// detection handler invokes it earlier in this file.
+bool startSensor3ServoCycle();
 
 
 // ============================================================
@@ -465,6 +490,43 @@ void startContinuousRun(uint8_t index) {
 }
 
 
+// Reject a Sensor 1 candidate that did not achieve three consecutive close
+// readings. The active positioning target is abandoned and the belt resumes
+// normal continuous movement. No SENSOR or POSITION event is emitted.
+void cancelSensor1TentativePositioning() {
+  if (!sensor1TentativePositioning) {
+    return;
+  }
+
+  sensor1TentativePositioning = false;
+  sensors[0].consecutiveDetectCount = 0;
+  sensors[0].consecutiveReleaseCount = 0;
+  sensors[0].detectionArmed = true;
+
+  if (conveyors[0].state == CONV_POSITIONING) {
+    startContinuousRun(0);
+  }
+}
+
+
+// Reject an unconfirmed Sensor 2 candidate and resume Conveyor 2's normal
+// continuous movement. No camera-facing event is emitted for this candidate.
+void cancelSensor2TentativePositioning() {
+  if (!sensor2TentativePositioning) {
+    return;
+  }
+
+  sensor2TentativePositioning = false;
+  sensors[1].consecutiveDetectCount = 0;
+  sensors[1].consecutiveReleaseCount = 0;
+  sensors[1].detectionArmed = true;
+
+  if (conveyors[1].state == CONV_POSITIONING) {
+    startContinuousRun(1);
+  }
+}
+
+
 void servicePendingDetection(uint8_t index) {
   if (index > 1) return;
 
@@ -562,6 +624,15 @@ void updateConveyor(uint8_t index) {
       conveyor.motor->run();
 
       if (conveyor.motor->distanceToGo() == 0) {
+        // Never signal a camera stop for an unconfirmed Sensor 1/2 candidate.
+        // Wait for its next reads to either confirm or cancel the candidate.
+        if (
+          (index == 0 && sensor1TentativePositioning) ||
+          (index == 1 && sensor2TentativePositioning)
+        ) {
+          break;
+        }
+
         conveyor.state = CONV_WAIT_CAMERA;
 
         // The host command sequence correlates this event with one product.
@@ -603,6 +674,13 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
       logSensor3Event("RELEASE_CHECK", distanceCm, sensor.detectionArmed);
     }
 
+    if (sensor.sensorId == 1 && sensor1TentativePositioning) {
+      cancelSensor1TentativePositioning();
+    }
+    if (sensor.sensorId == 2 && sensor2TentativePositioning) {
+      cancelSensor2TentativePositioning();
+    }
+
     sensor.consecutiveDetectCount = 0;
     if (!sensor.detectionArmed &&
         sensor.consecutiveReleaseCount < REQUIRED_CONSECUTIVE_RELEASES) {
@@ -620,6 +698,13 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
 
   // A value outside the detect zone breaks a consecutive-detection streak.
   if (distanceCm > DETECT_DISTANCE_CM) {
+    if (sensor.sensorId == 1 && sensor1TentativePositioning) {
+      cancelSensor1TentativePositioning();
+    }
+    if (sensor.sensorId == 2 && sensor2TentativePositioning) {
+      cancelSensor2TentativePositioning();
+    }
+
     sensor.consecutiveDetectCount = 0;
     // This is neither close enough to detect nor far enough to release.
     sensor.consecutiveReleaseCount = 0;
@@ -629,6 +714,60 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   // Any close echo means the previous product has not left yet.
   sensor.consecutiveReleaseCount = 0;
 
+  // Sensor 1 is already moving from the first close read. Keep collecting its
+  // second/third reads even though detectionArmed is false during this trial.
+  if (sensor.sensorId == 1 && sensor1TentativePositioning) {
+    sensor.detectionDistanceCm[sensor.consecutiveDetectCount] = distanceCm;
+    ++sensor.consecutiveDetectCount;
+
+    if (sensor.consecutiveDetectCount < REQUIRED_CONSECUTIVE_DETECTIONS) {
+      return;
+    }
+
+    // Accept the candidate. Its motor move began at the first close read, so
+    // do not issue a second positioning command.
+    sensor1TentativePositioning = false;
+    sensor.consecutiveDetectCount = 0;
+    sensor.detectionArmed = false;
+    sensor.consecutiveReleaseCount = 0;
+    ++sensor.detectionSequence;
+    conveyors[0].positionSensorSequence = sensor.detectionSequence;
+
+    sendSensorDetectionDistances(
+      sensor.sensorId,
+      sensor.detectionSequence,
+      sensor.detectionDistanceCm
+    );
+    sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
+    return;
+  }
+
+  // Sensor 2 follows the same candidate rule as Sensor 1: its positioning
+  // began on the first close read, but events wait for all three reads.
+  if (sensor.sensorId == 2 && sensor2TentativePositioning) {
+    sensor.detectionDistanceCm[sensor.consecutiveDetectCount] = distanceCm;
+    ++sensor.consecutiveDetectCount;
+
+    if (sensor.consecutiveDetectCount < REQUIRED_CONSECUTIVE_DETECTIONS) {
+      return;
+    }
+
+    sensor2TentativePositioning = false;
+    sensor.consecutiveDetectCount = 0;
+    sensor.detectionArmed = false;
+    sensor.consecutiveReleaseCount = 0;
+    ++sensor.detectionSequence;
+    conveyors[1].positionSensorSequence = sensor.detectionSequence;
+
+    sendSensorDetectionDistances(
+      sensor.sensorId,
+      sensor.detectionSequence,
+      sensor.detectionDistanceCm
+    );
+    sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
+    return;
+  }
+
   if (!sensor.detectionArmed) {
     return;
   }
@@ -637,6 +776,46 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   // above resets consecutiveDetectCount, so index 0 always starts a new set.
   sensor.detectionDistanceCm[sensor.consecutiveDetectCount] = distanceCm;
   ++sensor.consecutiveDetectCount;
+
+  // Begin Sensor 1 positioning at the first close read. Camera-facing events
+  // are deferred until the candidate receives three consecutive close reads.
+  if (
+    sensor.sensorId == 1 &&
+    sensor.consecutiveDetectCount == 1 &&
+    conveyors[0].state == CONV_RUNNING &&
+    conveyors[0].cameraOffsetSteps > 0
+  ) {
+    if (startAutomaticPosition(
+          0,
+          conveyors[0].cameraOffsetSteps,
+          0
+        )) {
+      sensor1TentativePositioning = true;
+      sensor.detectionArmed = false;
+      sensor.consecutiveReleaseCount = 0;
+    }
+    return;
+  }
+
+  // Begin Sensor 2 positioning on its first close read too. Its 3-read guard
+  // remains active in the candidate block above.
+  if (
+    sensor.sensorId == 2 &&
+    sensor.consecutiveDetectCount == 1 &&
+    conveyors[1].state == CONV_RUNNING &&
+    conveyors[1].cameraOffsetSteps > 0
+  ) {
+    if (startAutomaticPosition(
+          1,
+          conveyors[1].cameraOffsetSteps,
+          0
+        )) {
+      sensor2TentativePositioning = true;
+      sensor.detectionArmed = false;
+      sensor.consecutiveReleaseCount = 0;
+    }
+    return;
+  }
 
   if (sensor.consecutiveDetectCount < REQUIRED_CONSECUTIVE_DETECTIONS) {
     return;
@@ -757,6 +936,7 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
 
     logSensor3Event("RELEASED", distanceCm, sensor.detectionArmed);
     sendSensorEvent(sensor.sensorId, sensor.detectionSequence);
+    startSensor3ServoCycle();
   }
 }
 
@@ -793,6 +973,12 @@ void finishPing(float distanceCm) {
     handleDetection(activeSensorIndex, distanceCm);
   } else {
     // An invalid value must not count as one of the three consecutive reads.
+    if (activeSensorIndex == 0 && sensor1TentativePositioning) {
+      cancelSensor1TentativePositioning();
+    }
+    if (activeSensorIndex == 1 && sensor2TentativePositioning) {
+      cancelSensor2TentativePositioning();
+    }
     sensor.consecutiveDetectCount = 0;
     sensor.consecutiveReleaseCount = 0;
   }
@@ -810,6 +996,12 @@ void abortPing() {
   // that has already detected a product is re-armed only after two
   // consecutive timeouts (or valid far-distance readings in handleDetection).
   sensor.lastDistanceCm = -1.0f;
+  if (activeSensorIndex == 0 && sensor1TentativePositioning) {
+    cancelSensor1TentativePositioning();
+  }
+  if (activeSensorIndex == 1 && sensor2TentativePositioning) {
+    cancelSensor2TentativePositioning();
+  }
   sensor.consecutiveDetectCount = 0;
 
   if (sensor.sensorId == 3) {
@@ -883,7 +1075,26 @@ bool startRejectCycle(long sequence) {
   servoState = SERVO_MOVING_TO_WORK;
   servoStateStartMs = millis();
   pendingActuationSequence = sequence;
+  servoReturnByConveyorSteps = false;
 
+  return true;
+}
+
+
+// Called once Sensor 3 has passed its three-consecutive-read confirmation.
+// Conveyor 2 continues running; only its step counter is memorized here.
+bool startSensor3ServoCycle() {
+  if (servoState != SERVO_READY) {
+    return false;
+  }
+
+  servoStartConveyor2Position = conveyor2.currentPosition();
+  servoReturnByConveyorSteps = true;
+  pendingActuationSequence = 0;  // This cycle was not requested by ACTUATE.
+
+  sorterServo.write(SERVO_WORK_ANGLE);
+  servoState = SERVO_MOVING_TO_WORK;
+  servoStateStartMs = millis();
   return true;
 }
 
@@ -905,8 +1116,15 @@ void updateServo() {
       break;
 
     case SERVO_WAITING:
-      // Hold the reject arm at 70 degrees for the configured time.
-      if (now - servoStateStartMs >= SERVO_WAIT_TIME_MS) {
+      // Sensor 3 cycles use Conveyor 2's pulse count; ACTUATE cycles retain
+      // their original time-based hold behaviour.
+      if (
+        (servoReturnByConveyorSteps &&
+         labs(conveyor2.currentPosition() - servoStartConveyor2Position) >=
+           SERVO_RETURN_AFTER_STEPS) ||
+        (!servoReturnByConveyorSteps &&
+         now - servoStateStartMs >= SERVO_WAIT_TIME_MS)
+      ) {
         sorterServo.write(SERVO_HOME_ANGLE);
         servoState = SERVO_MOVING_HOME;
         servoStateStartMs = now;
@@ -918,8 +1136,12 @@ void updateServo() {
       // report completion to the Control Node.
       if (now - servoStateStartMs >= SERVO_MOVE_DELAY_MS) {
         servoState = SERVO_READY;
-        sendActuationEvent("OK", pendingActuationSequence);
+        // Only a host-requested ACTUATE command needs a completion reply.
+        if (pendingActuationSequence != 0) {
+          sendActuationEvent("OK", pendingActuationSequence);
+        }
         pendingActuationSequence = 0;
+        servoReturnByConveyorSteps = false;
       }
       break;
   }
