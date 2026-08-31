@@ -43,6 +43,7 @@ from inspection_interfaces.action import (
     InitializeNode,
 )
 from inspection_interfaces.msg import (
+    ConveyorResumed,
     EquipmentState,
     InferenceCancellation,
     InferenceCancellationAck,
@@ -465,6 +466,12 @@ class MasterNode(InspectionNodeBase):
             # 물리적으로는 이미 재가동된 제품이 FLIPPING으로 전이되지 않은
             # 채로 남는다.
             state_qos(depth=8),
+        )
+        self._conveyor_resumed_subscription = self.create_subscription(
+            ConveyorResumed,
+            "/inspection/control/conveyor_resumed",
+            self._handle_conveyor_resumed,
+            reliable_event_qos(),
         )
         self._queue_subscription = self.create_subscription(
             VisionQueueState,
@@ -2047,6 +2054,27 @@ class MasterNode(InspectionNodeBase):
             )
             if guards_satisfied:
                 self.confirm_reset_completed()
+
+    def _handle_conveyor_resumed(self, message: ConveyorResumed) -> None:
+        """Control이 Mega RUN ACK을 확인하고 보낸 확정 재가동 이벤트를 반영합니다.
+
+        `_handle_equipment_state`의 running 전이 감지와 함께 쓰는 이중
+        경로입니다. `EquipmentState`는 depth가 낮은 상태 스냅샷이라 짧은
+        시간 안에 상태가 연달아 바뀌면 중간 RUNNING 전이가 구독 콜백에
+        아예 전달되지 않을 수 있는데, 이 이벤트는 Mega의 확정 ACK을
+        근거로 하므로 그 유실 경로와 무관합니다. `_confirm_pending_resume`은
+        이미 RESUME_PENDING이 아닌 cycle에는 조용히 무시하는 멱등 호출이라,
+        두 경로가 같은 재가동을 각자 알려와도 안전합니다.
+        """
+
+        if message.header.session_id != self.session_id:
+            return
+        try:
+            conveyor_id = ConveyorId(message.conveyor_id)
+        except ValueError:
+            self._fault_stop("ConveyorResumed contains invalid conveyor_id")
+            return
+        self._confirm_pending_resume(conveyor_id)
 
     def _confirm_pending_resume(self, conveyor_id: ConveyorId) -> None:
         """새로 돌기 시작한 컨베이어를 기다리던 station cycle을 확인 처리합니다."""

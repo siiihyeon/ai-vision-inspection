@@ -26,6 +26,14 @@ Control은 Mega, sensor 원신호, TB6600 실제 동작과 actuator 완료의 �
 - `SystemCommand`의 전체 컨베이어 PAUSE/RESUME을 Mega `STOP`/`RUN`으로 전달하는 확장점 (RESET은 별도 Mega 명령 없음 - FAULT_STOP 진입 시 이미 STOP됨)
 - hardware 필수 설정 누락과 adapter 미구현 시 READY 차단
 - Mega의 `E|STATE` 이벤트를 `EquipmentState`로 옮기는 발행 경로 (변경 시에만 발행)
+- Station 개별 재가동(`handle_targeted_conveyor_command`)이 보낸 `RUN`의 Mega
+  ACK을 확인하면 `ConveyorResumed`를 1회성으로 발행 (`_handle_run_ack` ->
+  `_publish_conveyor_resumed`). `EquipmentState`는 depth가 낮은 상태
+  스냅샷이라 같은 시각 상태가 연달아 바뀌면 중간 RUNNING 전이가 구독자에
+  아예 전달되지 않을 수 있는데, 이 이벤트는 Mega의 확정 ACK을 근거로 하므로
+  그 유실 경로와 무관합니다. 전체 컨베이어 RESUME(`handle_all_conveyors_command`)에는
+  적용하지 않습니다 — 그쪽 확인(`confirm_all_conveyors_running`)은 이미
+  level 체크라 이 문제에 노출되지 않습니다.
 
 Position은 Master가 명령하지 않습니다. Mega가 센서 감지 후 `SET_OFFSET`으로
 받아둔 step 수만큼 자율로 이동·정지하고, `E|POSITION`을 그대로

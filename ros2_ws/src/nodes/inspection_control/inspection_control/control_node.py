@@ -27,6 +27,7 @@ from inspection_common.node_base import (
 )
 from inspection_interfaces.action import ActuateProduct
 from inspection_interfaces.msg import (
+    ConveyorResumed,
     EquipmentState,
     LogEvent,
     PositionSettled,
@@ -83,6 +84,9 @@ class ControlNode(InspectionNodeBase):
         self._equipment_state_publisher = self.create_publisher(
             EquipmentState, "control/equipment_state", state_qos()
         )
+        self._conveyor_resumed_publisher = self.create_publisher(
+            ConveyorResumed, "control/conveyor_resumed", reliable_event_qos()
+        )
         self._log_event_publisher = self.create_publisher(
             LogEvent, "log/event", reliable_event_qos(depth=1000)
         )
@@ -93,6 +97,12 @@ class ControlNode(InspectionNodeBase):
         self._mega_sequence = 0
         self._mega_events: dict[str, tuple[bool, str]] = {}
         self._mega_event = threading.Condition(self._mega_lock)
+        # RUN 명령의 sequence -> (conveyor_id, 전송 시각). Mega의 확정 ACK이
+        # 오면 여기서 꺼내 ConveyorResumed 이벤트로 승격한다. EquipmentState는
+        # depth가 낮은 상태 스냅샷이라 짧은 시간 안에 상태가 연달아 바뀌면
+        # 중간 RUNNING 전이가 Master에 아예 전달되지 않을 수 있는데, ACK
+        # 기반 이 이벤트는 그 유실 경로와 무관하다.
+        self._pending_run_acks: dict[int, tuple[int, float]] = {}
         self._mega_diagnostic_counts: dict[str, int] = {
             "ascii_decode_error": 0,
             "missing_crc_field": 0,
@@ -249,6 +259,30 @@ class ControlNode(InspectionNodeBase):
         settled.settled_at = settled.header.stamp
         self._position_settled_publisher.publish(settled)
 
+    def _handle_run_ack(self, sequence_text: str, ok: bool) -> None:
+        """Mega의 RUN ACK을 확인해 대기 중이던 재가동을 이벤트로 승격합니다."""
+
+        try:
+            sequence = int(sequence_text)
+        except ValueError:
+            return
+        with self._mega_lock:
+            pending = self._pending_run_acks.pop(sequence, None)
+        if pending is None or not ok:
+            return
+        conveyor_id, _requested_at = pending
+        self._publish_conveyor_resumed(conveyor_id)
+
+    def _publish_conveyor_resumed(self, conveyor_id: int) -> None:
+        """RUN을 Mega가 실제로 확정 처리했다는 1회성 이벤트를 발행합니다."""
+
+        resumed = ConveyorResumed()
+        resumed.header.stamp = self.get_clock().now().to_msg()
+        resumed.header.session_id = self.session_id
+        resumed.header.message_id = new_uuid()
+        resumed.conveyor_id = conveyor_id
+        self._conveyor_resumed_publisher.publish(resumed)
+
     def handle_targeted_conveyor_command(self, message: SystemCommand) -> None:
         """Station 촬영 후 해당 층 컨베이어만 재가동하는 진입점."""
 
@@ -269,9 +303,14 @@ class ControlNode(InspectionNodeBase):
             return
         if self.profile == "hardware":
             try:
-                self._send_mega("RUN", int(conveyor_id))
+                sequence = self._send_mega("RUN", int(conveyor_id))
             except (RuntimeError, OSError) as exc:
                 self.get_logger().error(str(exc))
+                return
+            with self._mega_lock:
+                self._pending_run_acks[sequence] = (
+                    int(conveyor_id), time.monotonic(),
+                )
 
     def handle_all_conveyors_command(self, message: SystemCommand) -> None:
         """전체 컨베이어 대상 PAUSE/RESUME을 Mega STOP/RUN으로 전달합니다."""
@@ -338,6 +377,16 @@ class ControlNode(InspectionNodeBase):
             stale = [key for key, value in self._mega_events.items() if value[2] < cutoff]
             for key in stale:
                 del self._mega_events[key]
+            # RUN ACK가 끝내 오지 않은 경우(예: 그 사이 시리얼 연결 끊김)를 위한
+            # 동일한 안전망. 정상 흐름에서는 ACK 수신 시 바로 pop되므로 여기서
+            # 걸릴 일이 거의 없다.
+            stale_acks = [
+                sequence
+                for sequence, (_conveyor_id, requested_at) in self._pending_run_acks.items()
+                if requested_at < cutoff
+            ]
+            for sequence in stale_acks:
+                del self._pending_run_acks[sequence]
 
     def _run_blocking(self, fn, *args) -> Future:
         """블로킹 호출을 스레드 풀에 넘기고 rclpy Future로 결과를 받습니다.
@@ -394,6 +443,7 @@ class ControlNode(InspectionNodeBase):
                         fields[2] == "OK", fields[2], time.monotonic(),
                     )
                     self._mega_event.notify_all()
+                self._handle_run_ack(fields[1], fields[2] == "OK")
                 continue
             telemetry = parse_sensor3_telemetry(fields)
             if telemetry is not None:

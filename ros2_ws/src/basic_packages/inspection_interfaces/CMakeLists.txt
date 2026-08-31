@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SensorEvent.msg"
   "msg/PositionSettled.msg"
   "msg/EquipmentState.msg"
+  "msg/ConveyorResumed.msg"
   "msg/ImageReference.msg"
   "msg/StationResult.msg"
   "msg/StationInferenceFailed.msg"
