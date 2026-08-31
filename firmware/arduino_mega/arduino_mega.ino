@@ -93,7 +93,7 @@ const float RELEASE_DISTANCE_CM = 12.0f;
 // With 3 sensors, each individual sensor is measured about every 60 ms.
 // This also reduces ultrasonic crosstalk compared with triggering all
 // three sensors at once.
-const unsigned long GLOBAL_PING_INTERVAL_US = 10000UL;
+const unsigned long GLOBAL_PING_INTERVAL_US = 20000UL;
 
 // Same timeout used in the test sketches.
 const unsigned long ECHO_TIMEOUT_US = 5000UL;
@@ -184,12 +184,15 @@ struct UltrasonicSensor {
   float lastDistanceCm;
   uint8_t consecutiveDetectCount;
   uint8_t consecutiveReleaseCount;
+  // Diagnostic-only flood guard after a detection is deliberately dropped.
+  // It never participates in product detection or conveyor control.
+  bool diagnosticDropSuppressed;
 };
 
 UltrasonicSensor sensors[3] = {
-  { TRIG1, ECHO1, 1, true, 0, -1.0f, 0, 0 },
-  { TRIG2, ECHO2, 2, true, 0, -1.0f, 0, 0 },
-  { TRIG3, ECHO3, 3, true, 0, -1.0f, 0, 0 }
+  { TRIG1, ECHO1, 1, true, 0, -1.0f, 0, 0, false },
+  { TRIG2, ECHO2, 2, true, 0, -1.0f, 0, 0, false },
+  { TRIG3, ECHO3, 3, true, 0, -1.0f, 0, 0, false }
 };
 
 // One product can wait at each upstream sensor while its conveyor is busy
@@ -334,6 +337,44 @@ void sendSensorEvent(
     sensorId,
     (unsigned long)sensorSequence,
     estimatedStep
+  );
+  sendFrame(body);
+}
+
+
+void sendSensorDiagnostic(
+  uint8_t sensorIndex,
+  const char* event,
+  float distanceCm,
+  uint32_t sensorSequence,
+  const char* reason
+) {
+  if (sensorIndex > 1) return;
+
+  UltrasonicSensor& sensor = sensors[sensorIndex];
+  ConveyorController& conveyor = conveyors[sensorIndex];
+  bool pendingDetection =
+    (sensorIndex == 0) ? pendingSensor1Detection : pendingSensor2Detection;
+
+  // E|SENSOR_DIAGNOSTIC|SENSOR_n|event|sequence|millis|micros|
+  //   distance|armed|detect_count|release_count|conveyor_state|pending|reason
+  char body[156];
+  snprintf(
+    body,
+    sizeof(body),
+    "E|SENSOR_DIAGNOSTIC|SENSOR_%u|%s|%lu|%lu|%lu|%.2f|%u|%u|%u|%u|%u|%s",
+    sensor.sensorId,
+    event,
+    (unsigned long)sensorSequence,
+    (unsigned long)millis(),
+    (unsigned long)micros(),
+    distanceCm,
+    sensor.detectionArmed ? 1U : 0U,
+    (unsigned)sensor.consecutiveDetectCount,
+    (unsigned)sensor.consecutiveReleaseCount,
+    (unsigned)conveyor.state,
+    pendingDetection ? 1U : 0U,
+    reason
   );
   sendFrame(body);
 }
@@ -675,12 +716,41 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
       logSensor3Event("RELEASE_CHECK", distanceCm, sensor.detectionArmed);
     }
 
+    if (sensor.sensorId <= 2 && sensor.consecutiveDetectCount > 0) {
+      sendSensorDiagnostic(
+        sensorIndex,
+        "DETECTION_RESET_FAR",
+        distanceCm,
+        sensor.detectionSequence + 1,
+        "FAR_READING"
+      );
+    }
     sensor.consecutiveDetectCount = 0;
+    sensor.diagnosticDropSuppressed = false;
     if (!sensor.detectionArmed &&
         sensor.consecutiveReleaseCount < REQUIRED_CONSECUTIVE_RELEASES) {
       ++sensor.consecutiveReleaseCount;
+      if (sensor.sensorId <= 2) {
+        sendSensorDiagnostic(
+          sensorIndex,
+          "RELEASE_ECHO",
+          distanceCm,
+          sensor.detectionSequence,
+          "FAR_READING"
+        );
+      }
       if (sensor.consecutiveReleaseCount >= REQUIRED_CONSECUTIVE_RELEASES) {
         sensor.detectionArmed = true;
+        if (sensor.sensorId <= 2) {
+          // Preserve the completed release count in the durable event.
+          sendSensorDiagnostic(
+            sensorIndex,
+            "REARMED",
+            distanceCm,
+            sensor.detectionSequence,
+            "RELEASE_GUARD_COMPLETE"
+          );
+        }
         sensor.consecutiveReleaseCount = 0;
         if (sensor.sensorId == 3) {
           logSensor3Event("REARMED", distanceCm, sensor.detectionArmed);
@@ -692,6 +762,15 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
 
   // A value outside the detect zone breaks a consecutive-detection streak.
   if (distanceCm > DETECT_DISTANCE_CM) {
+    if (sensor.sensorId <= 2 && sensor.consecutiveDetectCount > 0) {
+      sendSensorDiagnostic(
+        sensorIndex,
+        "DETECTION_RESET_HYSTERESIS",
+        distanceCm,
+        sensor.detectionSequence + 1,
+        "HYSTERESIS_READING"
+      );
+    }
     sensor.consecutiveDetectCount = 0;
     // This is neither close enough to detect nor far enough to release.
     sensor.consecutiveReleaseCount = 0;
@@ -706,6 +785,15 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   }
 
   ++sensor.consecutiveDetectCount;
+  if (sensor.sensorId <= 2 && !sensor.diagnosticDropSuppressed) {
+    sendSensorDiagnostic(
+      sensorIndex,
+      "CLOSE_SAMPLE",
+      distanceCm,
+      sensor.detectionSequence + 1,
+      "DETECTION_CANDIDATE"
+    );
+  }
 
   if (sensor.consecutiveDetectCount < REQUIRED_CONSECUTIVE_DETECTIONS) {
     return;
@@ -725,6 +813,16 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
         conveyors[0].state != CONV_POSITIONING &&
         conveyors[0].state != CONV_WAIT_CAMERA
       ) {
+        if (!sensor.diagnosticDropSuppressed) {
+          sendSensorDiagnostic(
+            sensorIndex,
+            "DETECTION_DROPPED",
+            distanceCm,
+            sensor.detectionSequence + 1,
+            "CONVEYOR_STOPPED"
+          );
+          sensor.diagnosticDropSuppressed = true;
+        }
         return;
       }
 
@@ -752,6 +850,23 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
           sensor.detectionSequence,
           detectedStep
         );
+        sendSensorDiagnostic(
+          sensorIndex,
+          "EVENT_SENT",
+          distanceCm,
+          sensor.detectionSequence,
+          "PENDING_POSITION"
+        );
+        sensor.diagnosticDropSuppressed = false;
+      } else if (!sensor.diagnosticDropSuppressed) {
+        sendSensorDiagnostic(
+          sensorIndex,
+          "DETECTION_DROPPED",
+          distanceCm,
+          sensor.detectionSequence + 1,
+          "PENDING_SLOT_FULL"
+        );
+        sensor.diagnosticDropSuppressed = true;
       }
       return;
     }
@@ -766,6 +881,14 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
       sensor.detectionSequence,
       conveyors[0].motor->currentPosition()
     );
+    sendSensorDiagnostic(
+      sensorIndex,
+      "EVENT_SENT",
+      distanceCm,
+      sensor.detectionSequence,
+      "RUNNING_POSITION"
+    );
+    sensor.diagnosticDropSuppressed = false;
     if (conveyors[0].cameraOffsetSteps > 0) {
       startAutomaticPosition(
         0,
@@ -784,6 +907,16 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
         conveyors[1].state != CONV_POSITIONING &&
         conveyors[1].state != CONV_WAIT_CAMERA
       ) {
+        if (!sensor.diagnosticDropSuppressed) {
+          sendSensorDiagnostic(
+            sensorIndex,
+            "DETECTION_DROPPED",
+            distanceCm,
+            sensor.detectionSequence + 1,
+            "CONVEYOR_STOPPED"
+          );
+          sensor.diagnosticDropSuppressed = true;
+        }
         return;
       }
 
@@ -809,6 +942,23 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
           sensor.detectionSequence,
           detectedStep
         );
+        sendSensorDiagnostic(
+          sensorIndex,
+          "EVENT_SENT",
+          distanceCm,
+          sensor.detectionSequence,
+          "PENDING_POSITION"
+        );
+        sensor.diagnosticDropSuppressed = false;
+      } else if (!sensor.diagnosticDropSuppressed) {
+        sendSensorDiagnostic(
+          sensorIndex,
+          "DETECTION_DROPPED",
+          distanceCm,
+          sensor.detectionSequence + 1,
+          "PENDING_SLOT_FULL"
+        );
+        sensor.diagnosticDropSuppressed = true;
       }
       return;
     }
@@ -822,6 +972,14 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
       sensor.detectionSequence,
       conveyors[1].motor->currentPosition()
     );
+    sendSensorDiagnostic(
+      sensorIndex,
+      "EVENT_SENT",
+      distanceCm,
+      sensor.detectionSequence,
+      "RUNNING_POSITION"
+    );
+    sensor.diagnosticDropSuppressed = false;
     if (conveyors[1].cameraOffsetSteps > 0) {
       startAutomaticPosition(
         1,
@@ -883,7 +1041,16 @@ void finishPing(float distanceCm) {
   ) {
     handleDetection(activeSensorIndex, distanceCm);
   } else {
-    // An invalid value must not count as one of the three consecutive reads.
+    // An invalid value must not count as one of the consecutive reads.
+    if (sensor.sensorId <= 2 && sensor.consecutiveDetectCount > 0) {
+      sendSensorDiagnostic(
+        activeSensorIndex,
+        "DETECTION_RESET_INVALID",
+        distanceCm,
+        sensor.detectionSequence + 1,
+        "INVALID_DISTANCE"
+      );
+    }
     sensor.consecutiveDetectCount = 0;
     sensor.consecutiveReleaseCount = 0;
   }
@@ -901,6 +1068,15 @@ void abortPing() {
   // that has already detected a product is re-armed only after two
   // consecutive timeouts (or valid far-distance readings in handleDetection).
   sensor.lastDistanceCm = -1.0f;
+  if (sensor.sensorId <= 2 && sensor.consecutiveDetectCount > 0) {
+    sendSensorDiagnostic(
+      activeSensorIndex,
+      "DETECTION_RESET_TIMEOUT",
+      -1.0f,
+      sensor.detectionSequence + 1,
+      "ECHO_TIMEOUT"
+    );
+  }
   sensor.consecutiveDetectCount = 0;
 
   if (sensor.sensorId == 3) {
@@ -910,8 +1086,27 @@ void abortPing() {
   if (!sensor.detectionArmed &&
       sensor.consecutiveReleaseCount < REQUIRED_CONSECUTIVE_RELEASES) {
     ++sensor.consecutiveReleaseCount;
+    if (sensor.sensorId <= 2) {
+      sendSensorDiagnostic(
+        activeSensorIndex,
+        "RELEASE_TIMEOUT",
+        -1.0f,
+        sensor.detectionSequence,
+        "ECHO_TIMEOUT"
+      );
+    }
     if (sensor.consecutiveReleaseCount >= REQUIRED_CONSECUTIVE_RELEASES) {
       sensor.detectionArmed = true;
+      sensor.diagnosticDropSuppressed = false;
+      if (sensor.sensorId <= 2) {
+        sendSensorDiagnostic(
+          activeSensorIndex,
+          "REARMED",
+          -1.0f,
+          sensor.detectionSequence,
+          "RELEASE_GUARD_COMPLETE"
+        );
+      }
       sensor.consecutiveReleaseCount = 0;
       if (sensor.sensorId == 3) {
         logSensor3Event("REARMED_TIMEOUT", -1.0f, sensor.detectionArmed);

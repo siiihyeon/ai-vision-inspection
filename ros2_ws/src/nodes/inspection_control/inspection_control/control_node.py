@@ -39,11 +39,13 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
 
 from .mega_protocol import (
+    SensorDiagnosticEvent,
     SensorDistanceEvent,
     Sensor3Telemetry,
     decode_frame_diagnostic,
     encode_frame,
     parse_event,
+    parse_sensor_diagnostic,
     parse_sensor_distance,
     parse_sensor3_telemetry,
 )
@@ -96,6 +98,9 @@ class ControlNode(InspectionNodeBase):
             "missing_crc_field": 0,
             "invalid_crc_text": 0,
             "crc_mismatch": 0,
+            "sensor_diagnostic_format_rejected": 0,
+            "sensor_diagnostic_parsed": 0,
+            "sensor_diagnostic_publish_attempted": 0,
             "sensor_distance_format_rejected": 0,
             "sensor_distance_parsed": 0,
             "sensor_distance_publish_attempted": 0,
@@ -401,6 +406,17 @@ class ControlNode(InspectionNodeBase):
                     raw_line,
                 )
                 continue
+            sensor_diagnostic = parse_sensor_diagnostic(fields)
+            if sensor_diagnostic is not None:
+                self._mega_diagnostic_counts["sensor_diagnostic_parsed"] += 1
+                self._publish_sensor_diagnostic(sensor_diagnostic)
+                continue
+            if fields[:2] == ["E", "SENSOR_DIAGNOSTIC"]:
+                self._record_mega_frame_rejection(
+                    "sensor_diagnostic_format_rejected",
+                    raw_line,
+                )
+                continue
             sensor_distance = parse_sensor_distance(fields)
             if sensor_distance is not None:
                 self._mega_diagnostic_counts["sensor_distance_parsed"] += 1
@@ -513,6 +529,39 @@ class ControlNode(InspectionNodeBase):
         }
         if self._publish_control_log_event(event_type, payload, severity=LogEvent.DEBUG):
             self._mega_diagnostic_counts["sensor3_publish_attempted"] += 1
+
+    def _publish_sensor_diagnostic(
+        self, event: SensorDiagnosticEvent
+    ) -> None:
+        """Persist Sensor 1/2 guard decisions without operator-terminal output."""
+
+        payload = {
+            "sensor_id": event.sensor_id,
+            "firmware_event": event.event,
+            "sensor_sequence": event.sensor_sequence,
+            "firmware_millis": event.firmware_millis,
+            "firmware_micros": event.firmware_micros,
+            "distance_cm": event.distance_cm,
+            "detection_armed": event.detection_armed,
+            "consecutive_detect_count": event.consecutive_detect_count,
+            "consecutive_release_count": event.consecutive_release_count,
+            "conveyor_state": event.conveyor_state,
+            "pending_detection": event.pending_detection,
+            "reason": event.reason,
+        }
+        severity = (
+            LogEvent.WARNING
+            if event.event == "DETECTION_DROPPED"
+            else LogEvent.DEBUG
+        )
+        if self._publish_control_log_event(
+            "MEGA_SENSOR_DIAGNOSTIC",
+            payload,
+            severity=severity,
+        ):
+            self._mega_diagnostic_counts[
+                "sensor_diagnostic_publish_attempted"
+            ] += 1
 
     def _publish_sensor_distance(self, event: SensorDistanceEvent) -> None:
         """Publish Sensor 1/2's three detection samples for SQLite persistence."""

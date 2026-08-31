@@ -54,6 +54,38 @@ class SensorDistanceEvent:
     distances_cm: tuple[float, float, float]
 
 
+@dataclass(frozen=True)
+class SensorDiagnosticEvent:
+    sensor_id: str
+    event: str
+    sensor_sequence: int
+    firmware_millis: int
+    firmware_micros: int
+    distance_cm: float
+    detection_armed: bool
+    consecutive_detect_count: int
+    consecutive_release_count: int
+    conveyor_state: int
+    pending_detection: bool
+    reason: str
+
+
+SENSOR_DIAGNOSTIC_EVENTS = frozenset(
+    {
+        "CLOSE_SAMPLE",
+        "DETECTION_DROPPED",
+        "DETECTION_RESET_FAR",
+        "DETECTION_RESET_HYSTERESIS",
+        "DETECTION_RESET_INVALID",
+        "DETECTION_RESET_TIMEOUT",
+        "EVENT_SENT",
+        "REARMED",
+        "RELEASE_ECHO",
+        "RELEASE_TIMEOUT",
+    }
+)
+
+
 SENSOR3_TELEMETRY_EVENTS = frozenset(
     {
         "READ",
@@ -93,6 +125,63 @@ def parse_sensor_distance(fields: list[str]) -> SensorDistanceEvent | None:
         sensor_id=sensor_id,
         sensor_sequence=sensor_sequence,
         distances_cm=distances,
+    )
+
+
+def parse_sensor_diagnostic(fields: list[str]) -> SensorDiagnosticEvent | None:
+    """Parse one bounded Sensor 1/2 firmware diagnostic observation."""
+
+    if len(fields) != 14 or fields[:2] != ["E", "SENSOR_DIAGNOSTIC"]:
+        return None
+    sensor_id, event = fields[2], fields[3]
+    if sensor_id not in {"SENSOR_1", "SENSOR_2"}:
+        return None
+    if event not in SENSOR_DIAGNOSTIC_EVENTS:
+        return None
+    try:
+        sensor_sequence = int(fields[4])
+        firmware_millis = int(fields[5])
+        firmware_micros = int(fields[6])
+        distance_cm = float(fields[7])
+        armed = int(fields[8])
+        detect_count = int(fields[9])
+        release_count = int(fields[10])
+        conveyor_state = int(fields[11])
+        pending = int(fields[12])
+    except ValueError:
+        return None
+    reason = fields[13]
+    reason_characters_valid = bool(reason) and all(
+        character == "_" or character.isdigit() or "A" <= character <= "Z"
+        for character in reason
+    )
+    if (
+        sensor_sequence < 0
+        or firmware_millis < 0
+        or firmware_micros < 0
+        or not math.isfinite(distance_cm)
+        or distance_cm < -1.0
+        or armed not in {0, 1}
+        or not 0 <= detect_count <= 255
+        or not 0 <= release_count <= 255
+        or conveyor_state not in {0, 1, 2, 3}
+        or pending not in {0, 1}
+        or not reason_characters_valid
+    ):
+        return None
+    return SensorDiagnosticEvent(
+        sensor_id=sensor_id,
+        event=event,
+        sensor_sequence=sensor_sequence,
+        firmware_millis=firmware_millis,
+        firmware_micros=firmware_micros,
+        distance_cm=distance_cm,
+        detection_armed=bool(armed),
+        consecutive_detect_count=detect_count,
+        consecutive_release_count=release_count,
+        conveyor_state=conveyor_state,
+        pending_detection=bool(pending),
+        reason=reason,
     )
 
 
