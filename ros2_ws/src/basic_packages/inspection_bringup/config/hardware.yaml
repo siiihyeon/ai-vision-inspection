@@ -24,7 +24,7 @@
     master.camera_ids.station_b: ["DA7838410"]
     master.action.position_timeout_ms: 10000
     master.action.capture_timeout_ms: 30000
-    master.action.actuation_timeout_ms: 10000
+    master.action.actuation_timeout_ms: 40000
     master.action.conveyor_resume_timeout_ms: 10000
     master.action.conveyor_run_timeout_ms: 10000
     master.pause_stop_timeout_ms: 10000
@@ -40,12 +40,12 @@
     comm.node_heartbeat_period_ms: 500
     control.mega.port: "/dev/ttyACM0"
     control.mega.baud_rate: 115200
-    control.tb6600.upper_config: "fw_v2;conveyor=1;step=10;dir=9;enable=8;enable_active=LOW;speed=-4000;max_speed=10000;accel=10000;offset_steps=15100"
+    control.tb6600.upper_config: "fw_v2;conveyor=1;step=10;dir=9;enable=8;enable_active=LOW;speed=-4000;max_speed=10000;accel=10000;offset_steps=14500"
     control.tb6600.lower_config: "fw_v2;conveyor=2;step=5;dir=4;enable=3;enable_active=LOW;speed=4000;max_speed=10000;accel=10000;offset_steps=7700"
     control.sensor_config: "fw_v2;sensor1=HC-SR04:trig25:echo24;sensor2=HC-SR04:trig31:echo30;sensor3=HC-SR04:trig45:echo40;detect_cm=10;release_cm=12;edge=RISING"
     control.actuator_config: "fw_v2;type=MG996R;pin=52;home_deg=0;reject_deg=70;move_ms=500;hold_ms=500;NG=1;PASS=2"
-    control.actuator.timeout_ms: 10000
-    control.station_a.position_offset_steps: 15100
+    control.actuator.timeout_ms: 30000
+    control.station_a.position_offset_steps: 14300
     control.station_b.position_offset_steps: 7700
 
 /inspection/vision_node:

@@ -39,10 +39,12 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.task import Future
 
 from .mega_protocol import (
+    SensorDistanceEvent,
     Sensor3Telemetry,
     decode_frame_diagnostic,
     encode_frame,
     parse_event,
+    parse_sensor_distance,
     parse_sensor3_telemetry,
 )
 
@@ -59,6 +61,7 @@ class ControlNode(InspectionNodeBase):
         super().__init__(NodeId.CONTROL, provides_initialize_action=True)
         self.declare_parameter("control.mega.port", "")
         self.declare_parameter("control.mega.baud_rate", 0)
+        self.declare_parameter("control.mega.boot_delay_ms", 2000)
         self.declare_parameter("control.tb6600.upper_config", "")
         self.declare_parameter("control.tb6600.lower_config", "")
         self.declare_parameter("control.sensor_config", "")
@@ -93,6 +96,9 @@ class ControlNode(InspectionNodeBase):
             "missing_crc_field": 0,
             "invalid_crc_text": 0,
             "crc_mismatch": 0,
+            "sensor_distance_format_rejected": 0,
+            "sensor_distance_parsed": 0,
+            "sensor_distance_publish_attempted": 0,
             "sensor3_format_rejected": 0,
             "sensor3_parsed": 0,
             "sensor3_publish_attempted": 0,
@@ -128,6 +134,8 @@ class ControlNode(InspectionNodeBase):
         if self.profile == "hardware":
             if int(self.get_parameter("control.mega.baud_rate").value) <= 0:
                 missing.append("control.mega.baud_rate")
+            if int(self.get_parameter("control.mega.boot_delay_ms").value) < 0:
+                missing.append("control.mega.boot_delay_ms")
             if int(self.get_parameter("control.station_a.position_offset_steps").value) <= 0:
                 missing.append("control.station_a.position_offset_steps")
             if int(self.get_parameter("control.station_b.position_offset_steps").value) <= 0:
@@ -139,6 +147,7 @@ class ControlNode(InspectionNodeBase):
             if serial is None:
                 return NodeInitializationOutcome(False, "pyserial is not installed")
             try:
+                opened_serial = False
                 if self._mega_thread is None or not self._mega_thread.is_alive():
                     self._mega = serial.Serial(
                         str(self.get_parameter("control.mega.port").value),
@@ -149,6 +158,18 @@ class ControlNode(InspectionNodeBase):
                         target=self._read_mega, daemon=True
                     )
                     self._mega_thread.start()
+                    opened_serial = True
+                if opened_serial:
+                    # Opening a Mega serial port normally toggles DTR and
+                    # enters the bootloader. Sending HELLO immediately is
+                    # therefore intermittently lost and caused every first
+                    # initialisation attempt to time out in the field logs.
+                    await self._run_blocking(
+                        time.sleep,
+                        int(
+                            self.get_parameter("control.mega.boot_delay_ms").value
+                        ) / 1000.0,
+                    )
                 sequence = self._send_mega("HELLO", 2)
                 status = await self._run_blocking(
                     self._wait_for_mega, f"ACK:{sequence}", 2.0
@@ -380,6 +401,17 @@ class ControlNode(InspectionNodeBase):
                     raw_line,
                 )
                 continue
+            sensor_distance = parse_sensor_distance(fields)
+            if sensor_distance is not None:
+                self._mega_diagnostic_counts["sensor_distance_parsed"] += 1
+                self._publish_sensor_distance(sensor_distance)
+                continue
+            if fields[:2] == ["E", "SENSOR_DISTANCE"]:
+                self._record_mega_frame_rejection(
+                    "sensor_distance_format_rejected",
+                    raw_line,
+                )
+                continue
             event = parse_event(fields)
             if event is None:
                 continue
@@ -444,10 +476,13 @@ class ControlNode(InspectionNodeBase):
             return
         self._mega_last_diagnostic_report[reason] = now
         preview = self._safe_serial_preview(raw_line)
-        self.get_logger().warning(
-            f"Mega serial frame rejected: reason={reason}, "
-            f"length={len(raw_line)}, preview={preview!r}"
-        )
+        # Malformed legacy Sensor3 telemetry is retained in the durable
+        # diagnostic summary, but it must not flood the operator terminal.
+        if reason != "sensor3_format_rejected":
+            self.get_logger().warning(
+                f"Mega serial frame rejected: reason={reason}, "
+                f"length={len(raw_line)}, preview={preview!r}"
+            )
         self._publish_control_log_event(
             "MEGA_SERIAL_FRAME_REJECTED",
             {
@@ -478,6 +513,24 @@ class ControlNode(InspectionNodeBase):
         }
         if self._publish_control_log_event(event_type, payload, severity=LogEvent.DEBUG):
             self._mega_diagnostic_counts["sensor3_publish_attempted"] += 1
+
+    def _publish_sensor_distance(self, event: SensorDistanceEvent) -> None:
+        """Publish Sensor 1/2's three detection samples for SQLite persistence."""
+
+        d1, d2, d3 = event.distances_cm
+        payload = {
+            "sensor_id": event.sensor_id,
+            "sensor_sequence": event.sensor_sequence,
+            "distance_1_cm": d1,
+            "distance_2_cm": d2,
+            "distance_3_cm": d3,
+        }
+        if self._publish_control_log_event(
+            "MEGA_SENSOR_DISTANCE",
+            payload,
+            severity=LogEvent.DEBUG,
+        ):
+            self._mega_diagnostic_counts["sensor_distance_publish_attempted"] += 1
 
     def _publish_control_log_event(
         self,

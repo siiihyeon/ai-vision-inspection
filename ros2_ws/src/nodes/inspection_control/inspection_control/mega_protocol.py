@@ -47,6 +47,13 @@ class Sensor3Telemetry:
     consecutive_release_count: int
 
 
+@dataclass(frozen=True)
+class SensorDistanceEvent:
+    sensor_id: str
+    sensor_sequence: int
+    distances_cm: tuple[float, float, float]
+
+
 SENSOR3_TELEMETRY_EVENTS = frozenset(
     {
         "READ",
@@ -63,6 +70,30 @@ def parse_event(fields: list[str]) -> MegaEvent | None:
     if len(fields) < 2 or fields[0] != "E":
         return None
     return MegaEvent(fields[1], tuple(fields[2:]))
+
+
+def parse_sensor_distance(fields: list[str]) -> SensorDistanceEvent | None:
+    """Parse the three detection samples emitted for Sensor 1 or Sensor 2."""
+
+    if len(fields) != 7 or fields[:2] != ["E", "SENSOR_DISTANCE"]:
+        return None
+    sensor_id = fields[2]
+    if sensor_id not in {"SENSOR_1", "SENSOR_2"}:
+        return None
+    try:
+        sensor_sequence = int(fields[3])
+        distances = tuple(float(value) for value in fields[4:7])
+    except ValueError:
+        return None
+    if sensor_sequence < 0 or any(
+        not math.isfinite(distance) or distance < 0.0 for distance in distances
+    ):
+        return None
+    return SensorDistanceEvent(
+        sensor_id=sensor_id,
+        sensor_sequence=sensor_sequence,
+        distances_cm=distances,
+    )
 
 
 def decode_frame_diagnostic(line: bytes) -> FrameDecodeResult:

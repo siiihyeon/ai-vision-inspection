@@ -5,6 +5,7 @@ from inspection_control.mega_protocol import (
     decode_frame_diagnostic,
     encode_frame,
     parse_event,
+    parse_sensor_distance,
     parse_sensor3_telemetry,
 )
 
@@ -41,6 +42,26 @@ class MegaProtocolTest(unittest.TestCase):
         event = parse_event(["E", "SENSOR", "SENSOR_3", "1", "9", "0"])
         self.assertEqual(event.kind, "SENSOR")
         self.assertEqual(event.values[0], "SENSOR_3")
+
+    def test_sensor_distance_event_is_parsed(self):
+        frame = encode_frame(
+            "E", "SENSOR_DISTANCE", "SENSOR_2", 42, "10.25", "10.50", "10.75"
+        )
+        event = parse_sensor_distance(decode_frame(frame))
+        self.assertEqual(event.sensor_id, "SENSOR_2")
+        self.assertEqual(event.sensor_sequence, 42)
+        self.assertEqual(event.distances_cm, (10.25, 10.5, 10.75))
+
+    def test_malformed_sensor_distance_event_is_rejected(self):
+        invalid_frames = (
+            ["E", "SENSOR_DISTANCE", "SENSOR_3", "1", "1", "2", "3"],
+            ["E", "SENSOR_DISTANCE", "SENSOR_1", "-1", "1", "2", "3"],
+            ["E", "SENSOR_DISTANCE", "SENSOR_1", "1", "1", "nan", "3"],
+            ["E", "SENSOR_DISTANCE", "SENSOR_1", "1", "1", "2"],
+        )
+        for fields in invalid_frames:
+            with self.subTest(fields=fields):
+                self.assertIsNone(parse_sensor_distance(fields))
 
     def test_sensor3_telemetry_is_parsed(self):
         frame = encode_frame(

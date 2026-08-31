@@ -1881,8 +1881,23 @@ class MasterNode(InspectionNodeBase):
         if existing is not None:
             if existing.product_id == product_id:
                 return
-            self._fault_stop(
-                f"station {station_id.name} already owns product {existing.product_id}"
+            # Sensor1/2 can physically detect the following product while the
+            # preceding product is still positioning, being captured, or
+            # waiting for conveyor resume. The firmware preserves that edge's
+            # step/remaining-distance reference, so retain the matching Master
+            # work item instead of treating normal station overlap as an
+            # ownership conflict. A and B use independent station-keyed queues.
+            self._deferred_station_starts.add((product_id, station_id))
+            self._emit_log_event(
+                severity=LogEvent.INFO,
+                event_type="STATION_START_DEFERRED_UNTIL_RESUME",
+                product_id=product_id,
+                payload={
+                    "station_id": station_id.name,
+                    "owning_product_id": existing.product_id,
+                    "owning_phase": existing.phase.value,
+                    "deferred_product_id": product_id,
+                },
             )
             return
         context = self.ledger.get(product_id, fifo_sequence)
@@ -2408,7 +2423,31 @@ class MasterNode(InspectionNodeBase):
             product_id=product_id,
             payload=context.snapshot(),
         )
+        self._start_next_deferred_station_cycle(station_id)
         return True
+
+    def _start_next_deferred_station_cycle(self, station_id: StationId) -> None:
+        """Start the oldest product deferred behind a RESUME_PENDING owner."""
+
+        if self.system_state != SystemState.RUN_SYS:
+            return
+        candidates = []
+        for product_id, deferred_station_id in tuple(self._deferred_station_starts):
+            if deferred_station_id != station_id:
+                continue
+            context = self.ledger.get_by_id(product_id)
+            if context is None or context.removed:
+                self._deferred_station_starts.discard((product_id, station_id))
+                continue
+            candidates.append(context)
+        if not candidates:
+            return
+        context = min(candidates, key=lambda item: item.fifo_sequence)
+        self._start_station_cycle(
+            context.product_id,
+            context.fifo_sequence,
+            station_id,
+        )
 
     def _pause_station_for_recovery(self, station_id: StationId, reason: str) -> None:
         if self._ignore_operation_while_fault_stopped(
