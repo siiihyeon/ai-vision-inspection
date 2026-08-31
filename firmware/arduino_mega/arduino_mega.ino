@@ -120,14 +120,14 @@ const uint8_t REQUIRED_CONSECUTIVE_RELEASES = 10;
 
 Servo sorterServo;
 
-const int SERVO_HOME_ANGLE = 0;
-const int SERVO_WORK_ANGLE = 70;
+const int SERVO_HOME_ANGLE = 50;
+const int SERVO_WORK_ANGLE = 0;
 
 // Time allowed for the servo to physically reach each angle.
-const unsigned long SERVO_MOVE_DELAY_MS = 500UL;
+const unsigned long SERVO_MOVE_DELAY_MS = 300UL;
 
 // Time to keep the reject arm at the work angle.
-const unsigned long SERVO_WAIT_TIME_MS = 500UL;
+const unsigned long SERVO_WAIT_TIME_MS = 1300UL;
 
 
 // ============================================================
@@ -173,6 +173,10 @@ struct UltrasonicSensor {
   float lastDistanceCm;
   uint8_t consecutiveDetectCount;
   uint8_t consecutiveReleaseCount;
+
+  // Raw values that make up the current consecutive-detection decision.
+  // Sensors 1 and 2 send these to the Control Node when all three are valid.
+  float detectionDistanceCm[REQUIRED_CONSECUTIVE_DETECTIONS];
 };
 
 UltrasonicSensor sensors[3] = {
@@ -300,6 +304,38 @@ void sendSensorEvent(uint8_t sensorId, uint32_t sensorSequence) {
     "E|SENSOR|SENSOR_%u|1|%lu|0",
     sensorId,
     (unsigned long)sensorSequence
+  );
+  sendFrame(body);
+}
+
+
+// E|SENSOR_DISTANCE|SENSOR_n|sensor_sequence|distance_1_cm|distance_2_cm|distance_3_cm
+// This is emitted immediately before Sensor 1 or 2's normal E|SENSOR event.
+// dtostrf() is used instead of snprintf("%.2f") because AVR printf does not
+// reliably include floating-point formatting.
+void sendSensorDetectionDistances(
+  uint8_t sensorId,
+  uint32_t sensorSequence,
+  const float distances[REQUIRED_CONSECUTIVE_DETECTIONS]
+) {
+  char d1[12];
+  char d2[12];
+  char d3[12];
+  char body[128];
+
+  dtostrf(distances[0], 0, 2, d1);
+  dtostrf(distances[1], 0, 2, d2);
+  dtostrf(distances[2], 0, 2, d3);
+
+  snprintf(
+    body,
+    sizeof(body),
+    "E|SENSOR_DISTANCE|SENSOR_%u|%lu|%s|%s|%s",
+    sensorId,
+    (unsigned long)sensorSequence,
+    d1,
+    d2,
+    d3
   );
   sendFrame(body);
 }
@@ -597,6 +633,9 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
     return;
   }
 
+  // Save every value used to confirm this detection.  An interrupted streak
+  // above resets consecutiveDetectCount, so index 0 always starts a new set.
+  sensor.detectionDistanceCm[sensor.consecutiveDetectCount] = distanceCm;
   ++sensor.consecutiveDetectCount;
 
   if (sensor.consecutiveDetectCount < REQUIRED_CONSECUTIVE_DETECTIONS) {
@@ -604,6 +643,15 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   }
 
   // The required consecutive close measurements have now been confirmed.
+  // Give Sensors 1/2's next ordinary event sequence to the raw-distance
+  // frame too, so Control Node can associate both frames with one product.
+  if (sensor.sensorId == 1 || sensor.sensorId == 2) {
+    sendSensorDetectionDistances(
+      sensor.sensorId,
+      sensor.detectionSequence + 1,
+      sensor.detectionDistanceCm
+    );
+  }
   sensor.consecutiveDetectCount = 0;
 
   // Sensor 1 is associated with Conveyor 1.
