@@ -587,6 +587,17 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   // Sensor 1 is associated with Conveyor 1.
   if (sensor.sensorId == 1) {
     if (conveyors[0].state != CONV_RUNNING) {
+      // Only POSITIONING/WAIT_CAMERA are a genuine mid-cycle busy period with
+      // a valid distanceToGo() reading. CONV_STOPPED (paused) has no active
+      // move() target, so distanceToGo() would be stale garbage there -
+      // silently drop the detection instead of queuing a bogus position.
+      if (
+        conveyors[0].state != CONV_POSITIONING &&
+        conveyors[0].state != CONV_WAIT_CAMERA
+      ) {
+        return;
+      }
+
       // Keep one busy-period detection instead of discarding it. Disarm this
       // sensor so repeated readings of the same product cannot overwrite the
       // pending product's remaining travel distance.
@@ -626,6 +637,14 @@ void handleDetection(uint8_t sensorIndex, float distanceCm) {
   // Sensor 2 is associated with Conveyor 2.
   if (sensor.sensorId == 2) {
     if (conveyors[1].state != CONV_RUNNING) {
+      // Same CONV_STOPPED exclusion as Sensor 1 above.
+      if (
+        conveyors[1].state != CONV_POSITIONING &&
+        conveyors[1].state != CONV_WAIT_CAMERA
+      ) {
+        return;
+      }
+
       // Symmetric one-slot pending buffer for Conveyor 2 / Sensor 2.
       if (!pendingSensor2Detection) {
         sensor.detectionArmed = false;
