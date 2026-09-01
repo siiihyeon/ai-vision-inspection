@@ -356,19 +356,25 @@ void sendSensorDiagnostic(
   bool pendingDetection =
     (sensorIndex == 0) ? pendingSensor1Detection : pendingSensor2Detection;
 
+  // AVR's default snprintf() has no %f support, so distanceCm would
+  // otherwise print as a literal "?" (the same issue already fixed once
+  // for the old SENSOR_DISTANCE frame via dtostrf()).
+  char distanceText[12];
+  dtostrf(distanceCm, 0, 2, distanceText);
+
   // E|SENSOR_DIAGNOSTIC|SENSOR_n|event|sequence|millis|micros|
   //   distance|armed|detect_count|release_count|conveyor_state|pending|reason
   char body[156];
   snprintf(
     body,
     sizeof(body),
-    "E|SENSOR_DIAGNOSTIC|SENSOR_%u|%s|%lu|%lu|%lu|%.2f|%u|%u|%u|%u|%u|%s",
+    "E|SENSOR_DIAGNOSTIC|SENSOR_%u|%s|%lu|%lu|%lu|%s|%u|%u|%u|%u|%u|%s",
     sensor.sensorId,
     event,
     (unsigned long)sensorSequence,
     (unsigned long)millis(),
     (unsigned long)micros(),
-    distanceCm,
+    distanceText,
     sensor.detectionArmed ? 1U : 0U,
     (unsigned)sensor.consecutiveDetectCount,
     (unsigned)sensor.consecutiveReleaseCount,
