@@ -87,7 +87,7 @@ const long CONV_ACCELERATION = 10000;
 
 // Detection / release thresholds copied from servo_ultra.ino.
 const float DETECT_DISTANCE_CM  = 10.0f;
-const float RELEASE_DISTANCE_CM = 12.0f;
+const float RELEASE_DISTANCE_CM = 14.0f;
 
 // Ping one sensor every 20 ms.
 // With 3 sensors, each individual sensor is measured about every 60 ms.
