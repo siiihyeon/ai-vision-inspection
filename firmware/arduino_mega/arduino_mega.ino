@@ -110,7 +110,7 @@ const uint8_t REQUIRED_CONSECUTIVE_DETECTIONS = 5;
 // armed again, only after this many consecutive no-object readings.
 // A no-echo timeout and a valid reading beyond RELEASE_DISTANCE_CM both count
 // as a no-object reading.
-const uint8_t REQUIRED_CONSECUTIVE_RELEASES = 10;
+const uint8_t REQUIRED_CONSECUTIVE_RELEASES = 5;
 
 // Sensor 3 raw echo telemetry is useful during bench diagnosis, but emitting
 // it for every ping can delay safety-critical sensor events on the same serial
