@@ -78,13 +78,38 @@ station별 재가동 확인(`_confirm_pending_resume` → `confirm_conveyor_resu
 사용합니다. 필드는 상·하층 실제 RUN/STOP, Sensor1/2/3 CLEAR, 액추에이터 안전
 위치뿐이며, 작업 구역 CLEAR와 E-stop은 보고할 센서가 없어 포함하지 않습니다.
 
-다음 계약은 아직 Control 담당자와 확정되지 않았습니다.
+`EquipmentState`는 depth가 낮은(`state_qos`) 상태 스냅샷이라, 같은 시각
+안에 상태가 연달아 여러 번 바뀌면(예: 촬영 재가동 직후 다음 제품이 이미
+센서에 대기 중이어서 RUNNING -> POSITIONING으로 곧바로 되돌아가는 경우)
+중간 RUNNING 전이가 구독 콜백에 아예 전달되지 않을 수 있습니다. 이 상태로
+재가동 확인이 "정지 -> 가동" rising edge에만 반응했다면, 그 전이 샘플이
+유실된 순간 재가동 확인이 영영 안 와서 물리적으로는 이미 재가동된 제품이
+FLIPPING으로 전이되지 않은 채 남고, 이후 Sensor2가 그 제품을 실제로
+감지하면 원장에 FLIPPING 제품이 없어 `Sensor2/FIFO mismatch`로
+FAULT_STOP됩니다. 대응으로 두 가지를 함께 적용했습니다:
+1. `_equipment_state_subscription`의 큐 depth를 늘려(`state_qos(depth=8)`)
+   빠른 연속 전이가 콜백까지 도달할 여지를 넓혔습니다.
+2. `_confirm_pending_resume` 호출 조건을 rising edge에서 level 체크로
+   바꿨습니다(running=True인 메시지마다 매번 확인 시도). `confirm_conveyor_resumed`가
+   이미 RESUME_PENDING이 아닌 cycle은 조용히 무시하는 멱등 호출이라 안전합니다.
+
+여기에 더해 `ConveyorResumed`(Control이 Mega의 RUN ACK을 확인하고 보내는
+1회성 확정 이벤트, `conveyor_id`만 포함)를 `_handle_conveyor_resumed`가
+구독해 `_confirm_pending_resume`을 똑같이 호출합니다. `EquipmentState`
+전이 감지와 완전히 독립된 두 번째 경로라, 한쪽이 유실돼도 다른 쪽이
+재가동을 확인할 수 있습니다.
+
+다음 계약은 아직 Control 담당자와 확정되지 않았습니다. `ConveyorResumed`는
+아래 `EquipmentCommandResult`의 축소판이 아니라, 촬영 후 층별 재가동 확인
+문제만 좁게 해결하는 별도 이벤트입니다 — `command_id` 상관관계, 명령
+종류, 오류 코드 등 전체 RUN/STOP/RESET 결과를 다루는 계약은 여전히
+미확정입니다.
 
 | 계약 | 포함해야 할 정보 | 사용 목적 |
 |---|---|---|
-| `EquipmentCommandResult` 성격의 완료 event | 원본 `command_id`, 명령 종류, 대상 컨베이어, 성공 여부, 실제 상태, 오류 코드·사유 | 전체 RUN/STOP/RESET 확인, 촬영 후 층별 재가동 확인 |
+| `EquipmentCommandResult` 성격의 완료 event | 원본 `command_id`, 명령 종류, 대상 컨베이어, 성공 여부, 실제 상태, 오류 코드·사유 | 전체 RUN/STOP/RESET 확인 |
 
-단순 현재 상태만 보고 층별 재가동을 확정하면 다른 명령의 결과를 잘못 연결할
+단순 현재 상태만 보고 명령 결과를 확정하면 다른 명령의 결과를 잘못 연결할
 수 있으므로 완료 event에는 원본 `command_id` 상관관계가 필요합니다.
 Control의 장시간 Position·Actuation 실행 루프는 cancel 요청을 주기적으로
 확인하고, RESET 또는 `command_epoch` 변경 시 이전 명령을 폐기해야 합니다.
@@ -93,7 +118,8 @@ Action server가 cancel 요청을 수락했다는 사실만으로 물리 정지�
 START 확인(`confirm_all_conveyors_running`)에도 쓰입니다 — 두 컨베이어가 모두
 running으로 확인되면 `_handle_equipment_state`가 바로 호출하며,
 `master.action.conveyor_run_timeout_ms` 타임아웃은 이 확인이 오지 않는
-실제 고장 상황을 위한 안전망으로만 남습니다.
+실제 고장 상황을 위한 안전망으로만 남습니다. 이쪽은 이미 level 체크라
+`ConveyorResumed`를 적용하지 않았습니다.
 
 ## 개발용 터미널 명령
 

@@ -62,12 +62,19 @@ def reliable_event_qos(depth: int = 100) -> QoSProfile:
     )
 
 
-def state_qos() -> QoSProfile:
-    """최신 상태 한 건을 재구독자에게 전달하는 QoS."""
+def state_qos(depth: int = 1) -> QoSProfile:
+    """최신 상태를 재구독자에게 전달하는 QoS.
 
+    depth=1(기본값)은 발행자 대부분에 맞는 "최신 스냅샷 한 건"이지만,
+    한 발행 주기 안에서 상태가 연달아 여러 번 바뀔 수 있는 구독자는 더 큰
+    depth를 지정해야 중간 전이가 유실되지 않습니다.
+    """
+
+    if depth < 1:
+        raise ValueError("depth must be positive")
     return QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
-        depth=1,
+        depth=depth,
         reliability=ReliabilityPolicy.RELIABLE,
         durability=DurabilityPolicy.TRANSIENT_LOCAL,
     )

@@ -43,6 +43,7 @@ from inspection_interfaces.action import (
     InitializeNode,
 )
 from inspection_interfaces.msg import (
+    ConveyorResumed,
     EquipmentState,
     InferenceCancellation,
     InferenceCancellationAck,
@@ -457,7 +458,20 @@ class MasterNode(InspectionNodeBase):
             EquipmentState,
             "/inspection/control/equipment_state",
             self._handle_equipment_state,
-            state_qos(),
+            # depth=1이면 같은 loop() pass 안에서 컨베이어가
+            # RUNNING -> POSITIONING으로 곧바로 되돌아갈 때(다음 제품이 이미
+            # 센서에 대기 중이던 경우) RUNNING 샘플이 다음 상태에 덮어써져
+            # 구독 콜백에 한 번도 전달되지 않을 수 있다. 그러면 station
+            # 재가동 확인(_confirm_pending_resume)이 그 전이를 영영 못 보고,
+            # 물리적으로는 이미 재가동된 제품이 FLIPPING으로 전이되지 않은
+            # 채로 남는다.
+            state_qos(depth=8),
+        )
+        self._conveyor_resumed_subscription = self.create_subscription(
+            ConveyorResumed,
+            "/inspection/control/conveyor_resumed",
+            self._handle_conveyor_resumed,
+            reliable_event_qos(),
         )
         self._queue_subscription = self.create_subscription(
             VisionQueueState,
@@ -1881,8 +1895,23 @@ class MasterNode(InspectionNodeBase):
         if existing is not None:
             if existing.product_id == product_id:
                 return
-            self._fault_stop(
-                f"station {station_id.name} already owns product {existing.product_id}"
+            # Sensor1/2 can physically detect the following product while the
+            # preceding product is still positioning, being captured, or
+            # waiting for conveyor resume. The firmware preserves that edge's
+            # step/remaining-distance reference, so retain the matching Master
+            # work item instead of treating normal station overlap as an
+            # ownership conflict. A and B use independent station-keyed queues.
+            self._deferred_station_starts.add((product_id, station_id))
+            self._emit_log_event(
+                severity=LogEvent.INFO,
+                event_type="STATION_START_DEFERRED_UNTIL_RESUME",
+                product_id=product_id,
+                payload={
+                    "station_id": station_id.name,
+                    "owning_product_id": existing.product_id,
+                    "owning_phase": existing.phase.value,
+                    "deferred_product_id": product_id,
+                },
             )
             return
         context = self.ledger.get(product_id, fifo_sequence)
@@ -1993,8 +2022,6 @@ class MasterNode(InspectionNodeBase):
 
         if message.header.session_id != self.session_id:
             return
-        was_upper_running = self.equipment.conveyor_running.get(ConveyorId.UPPER)
-        was_lower_running = self.equipment.conveyor_running.get(ConveyorId.LOWER)
         self.update_equipment_snapshot(
             upper_running=message.upper_running,
             upper_stopped=message.upper_stopped,
@@ -2005,9 +2032,14 @@ class MasterNode(InspectionNodeBase):
             sensor_3_clear=message.sensor_3_clear,
             actuator_safe=message.actuator_safe,
         )
-        if message.upper_running and not was_upper_running:
+        # 이전엔 "정지 -> 가동" 전이 샘플에만(rising edge) 반응했다. depth=1
+        # 시절엔 그 전이 샘플 자체가 유실될 수 있어 재가동 확인이 영영 안
+        # 오는 경우가 있었다. _confirm_pending_resume -> confirm_conveyor_resumed는
+        # 이미 RESUME_PENDING이 아니면 조용히 무시하는 멱등 호출이라, 이렇게
+        # running=True인 메시지마다 매번 확인을 시도해도 안전하다.
+        if message.upper_running:
             self._confirm_pending_resume(ConveyorId.UPPER)
-        if message.lower_running and not was_lower_running:
+        if message.lower_running:
             self._confirm_pending_resume(ConveyorId.LOWER)
         if self._pending_run_confirmation and self.equipment.all_conveyors_running():
             self.confirm_all_conveyors_running()
@@ -2022,6 +2054,27 @@ class MasterNode(InspectionNodeBase):
             )
             if guards_satisfied:
                 self.confirm_reset_completed()
+
+    def _handle_conveyor_resumed(self, message: ConveyorResumed) -> None:
+        """Control이 Mega RUN ACK을 확인하고 보낸 확정 재가동 이벤트를 반영합니다.
+
+        `_handle_equipment_state`의 running 전이 감지와 함께 쓰는 이중
+        경로입니다. `EquipmentState`는 depth가 낮은 상태 스냅샷이라 짧은
+        시간 안에 상태가 연달아 바뀌면 중간 RUNNING 전이가 구독 콜백에
+        아예 전달되지 않을 수 있는데, 이 이벤트는 Mega의 확정 ACK을
+        근거로 하므로 그 유실 경로와 무관합니다. `_confirm_pending_resume`은
+        이미 RESUME_PENDING이 아닌 cycle에는 조용히 무시하는 멱등 호출이라,
+        두 경로가 같은 재가동을 각자 알려와도 안전합니다.
+        """
+
+        if message.header.session_id != self.session_id:
+            return
+        try:
+            conveyor_id = ConveyorId(message.conveyor_id)
+        except ValueError:
+            self._fault_stop("ConveyorResumed contains invalid conveyor_id")
+            return
+        self._confirm_pending_resume(conveyor_id)
 
     def _confirm_pending_resume(self, conveyor_id: ConveyorId) -> None:
         """새로 돌기 시작한 컨베이어를 기다리던 station cycle을 확인 처리합니다."""
@@ -2408,7 +2461,31 @@ class MasterNode(InspectionNodeBase):
             product_id=product_id,
             payload=context.snapshot(),
         )
+        self._start_next_deferred_station_cycle(station_id)
         return True
+
+    def _start_next_deferred_station_cycle(self, station_id: StationId) -> None:
+        """Start the oldest product deferred behind a RESUME_PENDING owner."""
+
+        if self.system_state != SystemState.RUN_SYS:
+            return
+        candidates = []
+        for product_id, deferred_station_id in tuple(self._deferred_station_starts):
+            if deferred_station_id != station_id:
+                continue
+            context = self.ledger.get_by_id(product_id)
+            if context is None or context.removed:
+                self._deferred_station_starts.discard((product_id, station_id))
+                continue
+            candidates.append(context)
+        if not candidates:
+            return
+        context = min(candidates, key=lambda item: item.fifo_sequence)
+        self._start_station_cycle(
+            context.product_id,
+            context.fifo_sequence,
+            station_id,
+        )
 
     def _pause_station_for_recovery(self, station_id: StationId, reason: str) -> None:
         if self._ignore_operation_while_fault_stopped(
