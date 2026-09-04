@@ -855,6 +855,7 @@ class HikrobotMvsCaptureBackend:
         self,
         *,
         product_id: str,
+        fifo_sequence: int,
         station_id: int,
         capture_id: str,
         attempt: int,
@@ -867,7 +868,7 @@ class HikrobotMvsCaptureBackend:
             required_camera_ids
         ) != set(expected_ids):
             raise ValueError("required cameras differ from configured station group")
-        if not product_id or not capture_id or attempt < 1:
+        if not product_id or fifo_sequence < 1 or not capture_id or attempt < 1:
             raise ValueError("capture identity is incomplete")
         if not self._initialized:
             self.initialize_with_reconnect()
@@ -877,7 +878,7 @@ class HikrobotMvsCaptureBackend:
             self.settings.data_root
             / "raw"
             / f"station_{station_id}"
-            / frame_batch_id
+            / f"product_{fifo_sequence:06d}_{frame_batch_id}"
         )
         batch_dir.mkdir(parents=True, exist_ok=False)
         paths = {serial: batch_dir / f"{serial}.png" for serial in expected_ids}

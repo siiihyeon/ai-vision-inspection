@@ -196,6 +196,7 @@ class CaptureBackend(Protocol):
         self,
         *,
         product_id: str,
+        fifo_sequence: int,
         station_id: int,
         capture_id: str,
         attempt: int,
@@ -335,17 +336,28 @@ class FakeCaptureBackend:
         self,
         *,
         product_id: str,
+        fifo_sequence: int,
         station_id: int,
         capture_id: str,
         attempt: int,
         required_camera_ids: tuple[str, ...],
     ) -> CaptureBatch:
+        if fifo_sequence < 1:
+            raise ValueError("fifo_sequence must be positive")
         now_ns = time.monotonic_ns()
         wall_ns = time.time_ns()
+        frame_batch_id = uuid.uuid4().hex
+        batch_dir = (
+            self._data_root
+            / "raw"
+            / f"station_{station_id}"
+            / f"product_{fifo_sequence:06d}_{frame_batch_id}"
+        )
+        batch_dir.mkdir(parents=True, exist_ok=False)
         images = []
         for camera_id in required_camera_ids:
             width, height = 64, 48
-            path = self._data_root / f"{capture_id}_{camera_id}_{attempt}.png"
+            path = batch_dir / f"{camera_id}.png"
             _write_fake_png(path, width, height, MONO8_PNG)
             content = path.read_bytes()
             images.append(
@@ -371,7 +383,7 @@ class FakeCaptureBackend:
             product_id=product_id,
             station_id=station_id,
             capture_id=capture_id,
-            frame_batch_id=uuid.uuid4().hex,
+            frame_batch_id=frame_batch_id,
             attempt=attempt,
             trigger_requested_monotonic_ns=now_ns,
             trigger_returned_monotonic_ns=now_ns + 1,
