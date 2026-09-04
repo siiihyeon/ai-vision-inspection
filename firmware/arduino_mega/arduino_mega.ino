@@ -133,7 +133,7 @@ const unsigned long SERVO_MOVE_DELAY_MS = 500UL;
 
 // Sensor 3 stores Conveyor 2's travelled-step count when a product arrives.
 // For an NG product, the arm returns home only after this many later pulses.
-const unsigned long SERVO_RETURN_AFTER_STEPS = 12000UL;
+const unsigned long SERVO_RETURN_AFTER_STEPS = 10000UL;
 
 // Fixed-size FIFO for overlapping products that reach Sensor 3 before an
 // earlier actuation has completed. This mirrors the Master's product FIFO
