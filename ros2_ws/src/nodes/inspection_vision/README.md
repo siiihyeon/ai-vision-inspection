@@ -16,6 +16,7 @@ Master CaptureProduct
   → ACK·필수 frame·packet loss 0·host-arrival skew 검증
   → 2448×2048 Mono8 PNG를 fsync + atomic rename
   → path-only bounded FIFO enqueue
+  → Station A 파일 decode·전처리를 최대 3개 worker로 병렬 실행
   → 카메라별 V threshold와 largest-component crop
   → black-padding resize → 3-channel 복제 → ImageNet normalize
   → 카메라별 PatchCore memory bank 추론
@@ -29,8 +30,10 @@ Master CaptureProduct
 
 전경이 검출되지 않으면 정상 판정이 아니라 `PREPROCESSING` 추론 실패입니다.
 `crop_1`과 `crop_2`는 메모리에서만 만들고 NG 또는 전처리 실패 때만
-`vision.data_root/diagnostics` 아래에 저장합니다. 완성 canonical 이미지는
-Vision이 삭제하지 않으며 Log Node가 보존 정책을 소유합니다.
+`vision.data_root/diagnostics` 아래에 저장합니다. NG view에는 실제 PatchCore
+spatial map으로 만든 `anomaly_heatmap.png`, `anomaly_overlay.png`, 위치·점수·판정
+기준을 담은 `anomaly_metadata.json`도 같은 폴더에 저장합니다. 완성 canonical
+이미지는 Vision이 삭제하지 않으며 Log Node가 보존 정책을 소유합니다.
 
 완성 canonical 이미지 batch 디렉터리는 제품 투입 순서를 바로 확인할 수 있도록
 `vision.data_root/raw/station_<1|2>/product_<6자리 fifo_sequence>_<frame_batch_id>/`
@@ -83,9 +86,9 @@ patch grid와 정확히 일치해야 합니다. View score `S_v`가 `T_v`보다 
 
 Normalization/aggregation 방식은 네 view가 공유하지만 backbone, feature layer, 입력
 해상도, native patch grid, 위치 통계와 threshold는 view별 독립입니다. Ratio-based
-top-k는 상위 `1%, 2%, 5%, 10%`를 후보로 비교하며 `ceil`, 최소 1 patch를 사용합니다.
-Calibration/validation FPR은 네 view 최종 OR
-기준 1%이고, validation에서
+top-k는 상위 `0.5%, 1%, 2%, 5%, 10%, 15%, 20%, 25%`를 후보로 비교하며 `ceil`,
+최소 1 patch를 사용합니다. Calibration/validation FPR은 네 view 최종 OR 기준 10%이고,
+validation에서
 이 제약을 만족하면서 product recall이 최대인 후보만 배포됩니다. 선택 후보, 탈락 후보,
 dataset digest와 calibration B score도 manifest에 보존합니다.
 

@@ -9,3 +9,4 @@
     vision.model.warmup_runs: 10
     vision.model.serialize_access: true  # GPU 시험 후에만 false 검토
     vision.worker_count: 1              # 초기값; GPU 시험 후 조정
+    vision.image_load_worker_count: 3   # Station A PNG decode/전처리 병렬도

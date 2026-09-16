@@ -8,6 +8,7 @@ import struct
 import time
 import uuid
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -87,36 +88,52 @@ class CaptureBatch:
             and expected_pixel_format not in SUPPORTED_CANONICAL_PIXEL_FORMATS
         ):
             raise ValueError("expected canonical pixel format is unsupported")
-        for image in self.images:
-            path = Path(image.file_path)
-            if image.pixel_format not in SUPPORTED_CANONICAL_PIXEL_FORMATS:
-                raise ValueError("canonical image pixel format is unsupported")
-            if (
-                expected_pixel_format is not None
-                and image.pixel_format != expected_pixel_format
-            ):
-                raise ValueError("canonical image pixel format differs from configuration")
-            if image.packet_loss_count < 0 or image.packet_resend_count < 0:
-                raise ValueError("packet counters must not be negative")
-            if image.packet_loss_count != 0:
-                raise CapturePacketLossError(
-                    "capture contains unrecovered packet loss"
-                )
-            if not path.is_absolute():
-                raise ValueError("image file_path must be absolute")
-            if len(image.sha256) != 64 or image.file_size_bytes < 1:
-                raise ValueError("image digest/size metadata is incomplete")
-            if not path.is_file() or path.stat().st_size != image.file_size_bytes:
-                raise ValueError("image file is missing or size metadata mismatches")
-            content = path.read_bytes()
-            if hashlib.sha256(content).hexdigest() != image.sha256:
-                raise ValueError("image SHA-256 metadata mismatches")
-            _validate_canonical_png(
-                content,
-                image.width,
-                image.height,
-                image.pixel_format,
+
+        def validate_image(image: ImageArtifact) -> None:
+            _validate_image_artifact(
+                image,
+                expected_pixel_format=expected_pixel_format,
             )
+
+        if len(self.images) == 1:
+            validate_image(self.images[0])
+            return
+        # Station A의 세 PNG hash/CRC/decompression 검증은 서로 독립적입니다.
+        # map 결과를 소비해야 worker 예외가 호출 스레드로 전파됩니다.
+        with ThreadPoolExecutor(
+            max_workers=len(self.images),
+            thread_name_prefix="capture-validation",
+        ) as executor:
+            tuple(executor.map(validate_image, self.images))
+
+
+def _validate_image_artifact(
+    image: ImageArtifact,
+    *,
+    expected_pixel_format: str | None,
+) -> None:
+    path = Path(image.file_path)
+    if image.pixel_format not in SUPPORTED_CANONICAL_PIXEL_FORMATS:
+        raise ValueError("canonical image pixel format is unsupported")
+    if (
+        expected_pixel_format is not None
+        and image.pixel_format != expected_pixel_format
+    ):
+        raise ValueError("canonical image pixel format differs from configuration")
+    if image.packet_loss_count < 0 or image.packet_resend_count < 0:
+        raise ValueError("packet counters must not be negative")
+    if image.packet_loss_count != 0:
+        raise CapturePacketLossError("capture contains unrecovered packet loss")
+    if not path.is_absolute():
+        raise ValueError("image file_path must be absolute")
+    if len(image.sha256) != 64 or image.file_size_bytes < 1:
+        raise ValueError("image digest/size metadata is incomplete")
+    if not path.is_file() or path.stat().st_size != image.file_size_bytes:
+        raise ValueError("image file is missing or size metadata mismatches")
+    content = path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != image.sha256:
+        raise ValueError("image SHA-256 metadata mismatches")
+    _validate_canonical_png(content, image.width, image.height, image.pixel_format)
 
 
 def _validate_canonical_png(

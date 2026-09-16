@@ -66,7 +66,9 @@ NORMALIZATION_COMPLEXITY = {
     "mad": 3,
     "none": 99,
 }
-TOP_K_PERCENT_CANDIDATES = (1.0, 2.0, 5.0, 10.0)
+EPSILON_RATIO_CANDIDATES = (0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2)
+MAP_PERCENTILE_CANDIDATES = (95.0, 97.0, 98.0, 98.5, 99.0, 99.25, 99.5, 99.75, 99.9, 100.0)
+TOP_K_PERCENT_CANDIDATES = (0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0)
 
 
 @dataclass(frozen=True)
@@ -310,7 +312,7 @@ def validate_normalization_config(normalization: Mapping[str, Any], *, allow_non
     if method == "shrinkage" and value > 1:
         raise ValueError("shrinkage_lambda는 0보다 크고 1 이하여야 합니다.")
     allowed_values = {
-        "epsilon": {0.001, 0.01, 0.1},
+        "epsilon": set(EPSILON_RATIO_CANDIDATES),
         "std_floor": {0.05, 0.1, 0.2},
         "shrinkage": {0.05, 0.1, 0.25, 0.5},
         "mad": {0.001, 0.01, 0.1},
@@ -327,7 +329,7 @@ def validate_aggregation_config(aggregation: Mapping[str, Any]) -> None:
         percentile = float(aggregation["percentile"])
         if not math.isfinite(percentile) or not 0 <= percentile <= 100:
             raise ValueError("map percentile은 0~100이어야 합니다.")
-        if percentile not in {99.0, 99.5, 99.9, 100.0}:
+        if percentile not in MAP_PERCENTILE_CANDIDATES:
             raise ValueError("map percentile이 승인된 후보 집합에 없습니다.")
         return
     if method == "top_k_percent_average":
@@ -483,7 +485,7 @@ def spatial_view_scores_torch(
 
 def normalization_candidates() -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
-    for ratio in (0.001, 0.01, 0.1):
+    for ratio in EPSILON_RATIO_CANDIDATES:
         candidates.append({"method": "epsilon", "epsilon_ratio": ratio})
     for ratio in (0.05, 0.1, 0.2):
         candidates.append({"method": "std_floor", "std_floor_ratio": ratio})
@@ -497,7 +499,7 @@ def normalization_candidates() -> list[dict[str, Any]]:
 def aggregation_candidates() -> list[dict[str, Any]]:
     candidates = [
         {"method": "percentile", "percentile": value}
-        for value in (99.0, 99.5, 99.9, 100.0)
+        for value in MAP_PERCENTILE_CANDIDATES
     ]
     candidates.extend(
         {
@@ -523,7 +525,7 @@ def find_product_fpr_thresholds(
         raise ValueError("calibration B view score 수가 다릅니다.")
     sample_count = arrays[0].size
     if sample_count < 100:
-        raise ValueError("1% product FPR calibration에는 calibration_set_B 제품 100개 이상이 필요합니다.")
+        raise ValueError("product FPR calibration에는 calibration_set_B 제품 100개 이상이 필요합니다.")
     if any(not np.all(np.isfinite(array)) for array in arrays):
         raise ValueError("calibration B score에 NaN/Inf가 있습니다.")
     # 0.01% 간격은 4-view 보정 percentile을 충분히 세밀하게 탐색한다.
@@ -792,8 +794,8 @@ def validate_v3_manifest(
     if decision.get("comparison") != "strict_greater_than" or decision.get("view_score_normalization") != "divide_by_threshold":
         raise RuntimeError("artifact v3 decision 정책이 다릅니다.")
     target_fpr = float(decision.get("target_product_fpr", math.nan))
-    if not math.isfinite(target_fpr) or target_fpr != 0.01:
-        raise RuntimeError("artifact target product FPR은 0.01이어야 합니다.")
+    if not math.isfinite(target_fpr) or target_fpr != 0.1:
+        raise RuntimeError("artifact target product FPR은 0.1이어야 합니다.")
     for view in views:
         parameters = parameters_by_view[view]
         if not isinstance(parameters, dict) or set(parameters) != PATCHCORE_V3_PARAMETER_KEYS:

@@ -45,8 +45,8 @@
     control.sensor_config: "fw_v2;sensor1=HC-SR04:trig25:echo24;sensor2=HC-SR04:trig31:echo30;sensor3=HC-SR04:trig36:echo37;detect_cm=10;release_cm=12;edge=RISING"
     control.actuator_config: "fw_v2;type=MG996R;pin=44;home_deg=0;reject_deg=70;move_ms=500;hold_ms=3000;NG=1;PASS=2"
     control.actuator.timeout_ms: 10000
-    control.station_a.position_offset_steps: 15100
-    control.station_b.position_offset_steps: 7700
+    control.station_a.position_offset_steps: 12700
+    control.station_b.position_offset_steps: 5200
 
 /inspection/vision_node:
   ros__parameters:

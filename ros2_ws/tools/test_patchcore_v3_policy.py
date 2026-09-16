@@ -60,7 +60,7 @@ SERIAL_TO_VIEW = {
 
 class PatchCoreV3PolicyTests(unittest.TestCase):
     def test_mb_config_accepts_independent_view_model_settings(self) -> None:
-        config = copy.deepcopy(MB_CONFIGS["MB_v3_resol_180"])
+        config = copy.deepcopy(MB_CONFIGS["MB_v3_FP"])
         config["parameters_by_view"]["CAM_A_1"].update(
             {"feature_layers": [1], "input_resolution": (160, 192)}
         )
@@ -175,7 +175,7 @@ class PatchCoreV3PolicyTests(unittest.TestCase):
             "spatial_scoring_policy": {
                 "normalization": {"method": "std_floor", "std_floor_ratio": 0.1},
                 "aggregation": aggregation,
-                "decision": {"target_product_fpr": 0.01},
+                "decision": {"target_product_fpr": 0.1},
             },
             "view_names": ["CAM_A_1", "CAM_B_1"],
             "patch_grid_shapes": {"CAM_A_1": [20, 20], "CAM_B_1": [28, 28]},

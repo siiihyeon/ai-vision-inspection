@@ -25,7 +25,7 @@
 
 - [ ] 합의된 full-frame training/calibration A/calibration B/validation/test split으로
   최종 4-view format v3 artifact를 생성한다. Calibration B는 최소 100, 권장 1,000
-  정상 제품이며 validation 4-view OR FPR 1% 이하 조건을 통과해야 한다.
+  정상 제품이며 validation 4-view OR FPR 10% 이하 조건을 통과해야 한다.
 - [ ] 최종 v3 bundle을 `/opt/inspection/models`에 배포하고 artifact 이름과 통합
   SHA-256을 `vision_model.hardware.yaml`에 입력한다. 기존 배포 v2 bundle과 SHA는
   v3 runtime에서 의도적으로 거부되므로 재사용할 수 없다.

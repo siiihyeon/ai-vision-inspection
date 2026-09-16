@@ -13,6 +13,7 @@ import unittest
 import zlib
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 WORKSPACE = Path(__file__).parents[1]
 for package_path in (
@@ -1057,6 +1058,36 @@ class VisionContractTests(unittest.TestCase):
             [("job-1", InferenceFailureKind.TIMEOUT, "queue total inference timeout")],
         )
 
+    def test_worker_loads_station_views_in_parallel_and_preserves_order(self) -> None:
+        queue = InferenceQueue(capacity=1)
+        barrier = threading.Barrier(3)
+        completed = threading.Event()
+        loaded_order: list[tuple[str, ...]] = []
+
+        def load(path: Path) -> str:
+            barrier.wait(timeout=1.0)
+            return path.name
+
+        pool: WorkerPool[object, str, str] = WorkerPool(
+            queue=queue,
+            model=object(),
+            worker_count=1,
+            image_load_worker_count=3,
+            load_image=load,
+            infer=lambda _model, images: loaded_order.append(images) or "PASS",
+            on_success=lambda _job, _result: completed.set(),
+            on_failure=lambda _job, _failure: completed.set(),
+        )
+        job = replace(
+            self._job(1),
+            image_paths=("/tmp/A1.png", "/tmp/A2.png", "/tmp/A3.png"),
+        )
+        self.assertTrue(queue.try_enqueue(job))
+        pool.start()
+        self.assertTrue(completed.wait(2.0))
+        pool.stop()
+        self.assertEqual(loaded_order, [("A1.png", "A2.png", "A3.png")])
+
     def test_active_forward_finishes_but_result_is_discarded_after_cancel(self) -> None:
         queue = InferenceQueue(capacity=1)
         forward_started = threading.Event()
@@ -1238,6 +1269,64 @@ class VisionContractTests(unittest.TestCase):
                     batch,
                     images=(replace(artifacts[0], packet_loss_count=1), artifacts[1]),
                 ).validate(("camera-a", "camera-b"), expected_pixel_format=MONO8_PNG)
+
+    def test_capture_batch_validates_station_a_images_in_parallel(self) -> None:
+        png = make_png(MONO8_PNG)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "image.png"
+            path.write_bytes(png)
+            digest = hashlib.sha256(png).hexdigest()
+            artifacts = tuple(
+                ImageArtifact(
+                    camera_id=f"camera-{index}",
+                    file_path=str(path.resolve()),
+                    sha256=digest,
+                    file_size_bytes=len(png),
+                    width=1,
+                    height=1,
+                    pixel_format=MONO8_PNG,
+                    camera_timestamp_raw=index,
+                    camera_timestamp_domain="DEVICE_TICKS_UNSYNCED",
+                    camera_timestamp_ns=index,
+                    camera_timestamp_synchronized=False,
+                    host_arrival_monotonic_ns=1_000_000 + index,
+                    host_arrival_timestamp_ns=1_000_000 + index,
+                    packet_loss_count=0,
+                    packet_resend_count=0,
+                )
+                for index in range(3)
+            )
+            batch = CaptureBatch(
+                product_id="product",
+                station_id=1,
+                capture_id="capture",
+                frame_batch_id="batch",
+                attempt=1,
+                trigger_requested_monotonic_ns=900_000,
+                trigger_returned_monotonic_ns=950_000,
+                trigger_requested_wall_time_ns=900_000,
+                trigger_returned_wall_time_ns=950_000,
+                images=artifacts,
+            )
+            barrier = threading.Barrier(3)
+            validated: list[str] = []
+
+            def validate_image(image: ImageArtifact, **_kwargs) -> None:
+                validated.append(image.camera_id)
+                barrier.wait(timeout=1.0)
+
+            with patch(
+                "inspection_vision.capture_contract._validate_image_artifact",
+                side_effect=validate_image,
+            ):
+                batch.validate(
+                    tuple(image.camera_id for image in artifacts),
+                    expected_pixel_format=MONO8_PNG,
+                )
+            self.assertCountEqual(
+                validated,
+                ["camera-0", "camera-1", "camera-2"],
+            )
 
     def test_capture_batch_rejects_declared_mono_with_rgb_png(self) -> None:
         png = make_png(RGB8_PNG)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -225,6 +226,7 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
         queue: InferenceQueue,
         model: ModelT,
         worker_count: int,
+        image_load_worker_count: int = 1,
         load_image: Callable[[Path], LoadedT],
         infer: Callable[[ModelT, tuple[LoadedT, ...]], ResultT],
         on_success: Callable[[InferenceJob, ResultT], None],
@@ -235,9 +237,12 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
     ) -> None:
         if worker_count < 1:
             raise ValueError("worker_count must be positive")
+        if image_load_worker_count < 1:
+            raise ValueError("image_load_worker_count must be positive")
         self._queue = queue
         self._model = model
         self._worker_count = worker_count
+        self._image_load_worker_count = image_load_worker_count
         self._load_image = load_image
         self._infer = infer
         self._on_success = on_success
@@ -246,6 +251,7 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
         self._on_canceled = on_canceled or (lambda _job, _stage: None)
         self._model_lock = threading.Lock() if serialize_model_access else None
         self._threads: list[threading.Thread] = []
+        self._image_load_executor: ThreadPoolExecutor | None = None
         self._sweeper_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._active_guard = threading.Lock()
@@ -256,6 +262,11 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
         if self._threads:
             raise RuntimeError("worker pool already started")
         self._stop_event.clear()
+        if self._image_load_worker_count > 1:
+            self._image_load_executor = ThreadPoolExecutor(
+                max_workers=self._image_load_worker_count,
+                thread_name_prefix="image-decode",
+            )
         self._threads = [
             threading.Thread(target=self._run, name=f"inference-worker-{index}", daemon=True)
             for index in range(self._worker_count)
@@ -290,6 +301,9 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
         if self._sweeper_thread is not None:
             self._sweeper_thread.join(timeout=5.0)
             self._sweeper_thread = None
+        if self._image_load_executor is not None:
+            self._image_load_executor.shutdown(wait=True, cancel_futures=True)
+            self._image_load_executor = None
 
     def _sweep_expired(self) -> None:
         while not self._stop_event.wait(0.05):
@@ -343,10 +357,7 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
             return
         load_started_ns = time.monotonic_ns()
         try:
-            loaded = tuple(
-                self._load_with_one_retry(job, Path(path))
-                for path in job.image_paths
-            )
+            loaded = self._load_job_images(job)
         except InferenceDeadlineExceeded:
             self._fail(
                 job,
@@ -423,6 +434,23 @@ class WorkerPool(Generic[ModelT, LoadedT, ResultT]):
             )
         else:
             self._on_success(job, result)
+
+    def _load_job_images(self, job: InferenceJob) -> tuple[LoadedT, ...]:
+        paths = tuple(Path(path) for path in job.image_paths)
+        if len(paths) < 2 or self._image_load_executor is None:
+            return tuple(self._load_with_one_retry(job, path) for path in paths)
+
+        futures: list[Future[LoadedT]] = [
+            self._image_load_executor.submit(self._load_with_one_retry, job, path)
+            for path in paths
+        ]
+        try:
+            # 제출 순서대로 result를 모아 artifact의 view 순서를 보존합니다.
+            return tuple(future.result() for future in futures)
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
 
     def _load_with_one_retry(self, job: InferenceJob, path: Path) -> LoadedT:
         try:

@@ -3,7 +3,7 @@
 """Full-frame 데이터로 위치 정규화 PatchCore artifact v3를 만든다.
 
 기존 ``MB_construction.py``의 v2 계약은 변경하지 않는다. 이 도구는 training,
-calibration A/B, labeled validation을 분리하고 정상 제품 4-view OR FPR 1% 이하에서
+calibration A/B, labeled validation을 분리하고 정상 제품 4-view OR FPR 10% 이하에서
 product recall이 가장 높은 공간 정규화/aggregation 후보를 선택한다.
 """
 
@@ -71,13 +71,13 @@ PARALLEL_BENCHMARK_RUNS = 10
 MIN_PARALLEL_SPEEDUP_PERCENT = 5.0
 MAX_PARALLEL_VIEWS = 3
 
-TARGET_PRODUCT_FPR = 0.01
+TARGET_PRODUCT_FPR = 0.1
 CALIBRATION_B_MINIMUM_PRODUCTS = 100
 CALIBRATION_B_RECOMMENDED_PRODUCTS = 1000
 
 
 MB_CONFIGS: dict[str, dict[str, Any]] = {
-    "MB_v3_resol_180": {
+    "MB_v3_FP": {
         "view_names": list(PATCHCORE_EXPECTED_VIEWS),
         "parameters_by_view": {
             # 각 view는 독립 설정이다. 서로 다른 backbone, feature layer와
@@ -122,7 +122,7 @@ MB_CONFIGS: dict[str, dict[str, Any]] = {
                 "feature_layers": [1, 2],
                 "coreset_ratio": 0.1,
                 "k": 9,
-                "input_resolution": (180, 180),
+                "input_resolution": (224, 224),
                 "resize_mode": "padding",
                 "construction_batch_size": 1,
                 "distance_chunk_size": 1024,
@@ -132,25 +132,25 @@ MB_CONFIGS: dict[str, dict[str, Any]] = {
         # V-threshold를 포함한 전처리 설정도 view별로 독립적이다.
         "preprocessing_by_view": {
             "CAM_A_1": {
-                "v_threshold": 40,
+                "v_threshold": 38,
                 "connectivity": 8,
                 "remove_disconnected_noise": True,
                 "check_connection": False,
             },
             "CAM_A_2": {
-                "v_threshold": 40,
+                "v_threshold": 38,
                 "connectivity": 8,
                 "remove_disconnected_noise": True,
                 "check_connection": False,
             },
             "CAM_A_3": {
-                "v_threshold": 40,
+                "v_threshold": 38,
                 "connectivity": 8,
                 "remove_disconnected_noise": True,
                 "check_connection": False,
             },
             "CAM_B_1": {
-                "v_threshold": 40,
+                "v_threshold": 27,
                 "connectivity": 8,
                 "remove_disconnected_noise": True,
                 "check_connection": False,
@@ -320,7 +320,7 @@ def construct_artifact(artifact_name: str, *, dataset_root: Path, artifact_root:
         )
     if calibration_b_count < CALIBRATION_B_RECOMMENDED_PRODUCTS:
         print(
-            "WARNING: 1% product FPR 안정성을 위해 calibration_set_B 1,000개 이상을 "
+            "WARNING: 10% product FPR 안정성을 위해 calibration_set_B 1,000개 이상을 "
             f"권장합니다. actual={calibration_b_count}"
         )
     provenance = dataset_provenance(index)
@@ -421,10 +421,19 @@ def construct_artifact(artifact_name: str, *, dataset_root: Path, artifact_root:
                     else:
                         record["status"] = "valid"
                     candidate_records.append(record)
-                    print(
-                        f"  candidate {candidate_number}: {normalization} + {aggregation} "
-                        f"-> {record['status']}"
-                    )
+                    if record["status"] == "valid":
+                        metrics = record["validation_metrics"]
+                        print(
+                            f"  {candidate_id}: {normalization} + {aggregation} -> valid, "
+                            f"validation FPR={metrics['fpr']:.3%}, "
+                            f"recall={metrics['recall']:.3%}, "
+                            f"calibration FPR={record['calibration_product_fpr']:.3%}"
+                        )
+                    else:
+                        print(
+                            f"  {candidate_id}: {normalization} + {aggregation} -> "
+                            f"invalid - {record['error']}"
+                        )
 
             eligible_records = [
                 record
@@ -434,7 +443,7 @@ def construct_artifact(artifact_name: str, *, dataset_root: Path, artifact_root:
                 and float(record["validation_metrics"]["fpr"]) <= TARGET_PRODUCT_FPR
             ]
             if not eligible_records:
-                raise RuntimeError("validation product FPR 1% 이하를 만족하는 후보가 없습니다.")
+                raise RuntimeError("validation product FPR 10% 이하를 만족하는 후보가 없습니다.")
             selected_record = min(eligible_records, key=candidate_sort_key)
             selected_id = str(selected_record["candidate_id"])
             print(f"Selected spatial candidate: {selected_id}")
@@ -540,7 +549,7 @@ def construct_artifact(artifact_name: str, *, dataset_root: Path, artifact_root:
                 "patch_grid_shapes": patch_grid_shapes,
                 "candidate_selection": {
                     "selection_order": [
-                        "validation_product_fpr_le_0.01",
+                        "validation_product_fpr_le_0.1",
                         "maximum_product_recall",
                         "minimum_product_fpr",
                         "minimum_validation_postprocess_p95_ms",

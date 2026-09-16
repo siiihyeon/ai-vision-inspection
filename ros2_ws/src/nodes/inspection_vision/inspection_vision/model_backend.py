@@ -310,6 +310,22 @@ def _write_png_atomic(path: Path, image: np.ndarray) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _write_json_atomic(path: Path, document: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.part"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as stream:
+            json.dump(document, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 class Mono8PatchCorePreprocessor:
     """HSV-V와 동치인 Mono8 threshold 후 가장 큰 component를 crop합니다."""
 
@@ -429,6 +445,140 @@ class Mono8PatchCorePreprocessor:
             prepared.crop_1,
             prepared.crop_2,
         )
+
+    def save_ng_diagnostic(
+        self,
+        prepared: PreparedView,
+        *,
+        spatial_map: np.ndarray,
+        view_score_raw: float,
+        view_threshold: float,
+        view_score_normalized: float,
+        aggregation: Mapping[str, Any],
+    ) -> tuple[str, ...]:
+        """NG crop과 실제 V3 anomaly map UI 파일을 같은 view 폴더에 저장합니다."""
+
+        crop_paths = self.save_diagnostic(prepared, "ng")
+        output = Path(crop_paths[0]).parent
+        heatmap, overlay, location = self._render_anomaly_ui(
+            prepared,
+            spatial_map=spatial_map,
+            view_threshold=view_threshold,
+        )
+        heatmap_path = output / "anomaly_heatmap.png"
+        overlay_path = output / "anomaly_overlay.png"
+        metadata_path = output / "anomaly_metadata.json"
+        _write_png_atomic(heatmap_path, heatmap)
+        _write_png_atomic(overlay_path, overlay)
+        _write_json_atomic(
+            metadata_path,
+            {
+                "schema_version": 1,
+                "source_path": str(prepared.source_path),
+                "view": prepared.view_name,
+                "coordinate_space": "crop_2_pixels",
+                "spatial_map_grid": [
+                    int(spatial_map.shape[0]),
+                    int(spatial_map.shape[1]),
+                ],
+                "view_score_raw": float(view_score_raw),
+                "view_threshold": float(view_threshold),
+                "view_score_normalized": float(view_score_normalized),
+                "aggregation": dict(aggregation),
+                "heatmap_scale": {
+                    "value": "spatially_normalized_patch_score_divide_by_view_threshold",
+                    "minimum": 0.0,
+                    "threshold": 1.0,
+                    "display_clip_maximum": 2.0,
+                },
+                "anomaly_location": location,
+            },
+        )
+        return (
+            *crop_paths,
+            str(heatmap_path),
+            str(overlay_path),
+            str(metadata_path),
+        )
+
+    def _render_anomaly_ui(
+        self,
+        prepared: PreparedView,
+        *,
+        spatial_map: np.ndarray,
+        view_threshold: float,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        if (
+            not isinstance(spatial_map, np.ndarray)
+            or spatial_map.ndim != 2
+            or spatial_map.size == 0
+            or not np.isfinite(spatial_map).all()
+        ):
+            raise RuntimeError("anomaly heat map must be a finite 2-D array")
+        if not math.isfinite(view_threshold) or view_threshold <= 0:
+            raise RuntimeError("anomaly heat map threshold must be positive")
+
+        target_h, target_w = (int(value) for value in prepared.tensor.shape[-2:])
+        source_h, source_w = prepared.crop_2.shape
+        scale = min(target_w / source_w, target_h / source_h)
+        resized_w = max(1, min(target_w, int(round(source_w * scale))))
+        resized_h = max(1, min(target_h, int(round(source_h * scale))))
+        x0 = (target_w - resized_w) // 2
+        y0 = (target_h - resized_h) // 2
+
+        model_map = cv2.resize(
+            spatial_map.astype(np.float32, copy=False),
+            (target_w, target_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        unpadded = model_map[y0 : y0 + resized_h, x0 : x0 + resized_w]
+        crop_map = cv2.resize(
+            unpadded,
+            (source_w, source_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        score_ratio = crop_map / float(view_threshold)
+        display = np.clip(score_ratio, 0.0, 2.0) / 2.0
+        heatmap = cv2.applyColorMap(
+            np.rint(display * 255.0).astype(np.uint8),
+            getattr(cv2, "COLORMAP_TURBO", cv2.COLORMAP_JET),
+        )
+        foreground = prepared.crop_2 > 0
+        heatmap[~foreground] = 0
+        base = cv2.cvtColor(prepared.crop_2, cv2.COLOR_GRAY2BGR)
+        alpha = (0.20 + 0.45 * np.clip(score_ratio, 0.0, 1.0))[:, :, None]
+        overlay = np.where(
+            foreground[:, :, None],
+            np.rint(base * (1.0 - alpha) + heatmap * alpha),
+            base,
+        ).clip(0, 255).astype(np.uint8)
+
+        peak_source = np.where(foreground, score_ratio, -np.inf)
+        peak_y, peak_x = np.unravel_index(
+            int(np.argmax(peak_source)), score_ratio.shape
+        )
+        threshold_mask = np.logical_and(foreground, score_ratio > 1.0)
+        if threshold_mask.any():
+            ys, xs = np.nonzero(threshold_mask)
+            hotspot_bbox: list[int] | None = [
+                int(xs.min()),
+                int(ys.min()),
+                int(xs.max() - xs.min() + 1),
+                int(ys.max() - ys.min() + 1),
+            ]
+        else:
+            hotspot_bbox = None
+        location = {
+            "peak_xy": [int(peak_x), int(peak_y)],
+            "peak_score_ratio": float(score_ratio[peak_y, peak_x]),
+            "threshold_exceeding_bbox_xywh": hotspot_bbox,
+            "threshold_exceeding_fraction_of_foreground": (
+                float(threshold_mask.sum() / foreground.sum())
+                if foreground.any()
+                else 0.0
+            ),
+        }
+        return heatmap, overlay, location
 
     def _save_arrays(
         self,
@@ -664,7 +814,7 @@ def _validate_spatial_policy_options(
         raise ArtifactContractError("artifact spatial scoring options must be objects")
     method = str(normalization.get("method", ""))
     option_contracts: dict[str, tuple[str, set[float]]] = {
-        "epsilon": ("epsilon_ratio", {0.001, 0.01, 0.1}),
+        "epsilon": ("epsilon_ratio", {0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2}),
         "std_floor": ("std_floor_ratio", {0.05, 0.1, 0.2}),
         "shrinkage": ("shrinkage_lambda", {0.05, 0.1, 0.25, 0.5}),
         "mad": ("mad_epsilon_ratio", {0.001, 0.01, 0.1}),
@@ -678,7 +828,8 @@ def _validate_spatial_policy_options(
     if aggregation_method == "percentile":
         if (
             set(aggregation) != {"method", "percentile"}
-            or float(aggregation["percentile"]) not in {99.0, 99.5, 99.9, 100.0}
+            or float(aggregation["percentile"])
+            not in {95.0, 97.0, 98.0, 98.5, 99.0, 99.25, 99.5, 99.75, 99.9, 100.0}
         ):
             raise ArtifactContractError("artifact map percentile is invalid")
     elif aggregation_method == "top_k_percent_average":
@@ -686,7 +837,8 @@ def _validate_spatial_policy_options(
             set(aggregation)
             != {"method", "top_k_percent", "rounding", "minimum_patch_count"}
             or type(aggregation["top_k_percent"]) not in {int, float}
-            or float(aggregation["top_k_percent"]) not in {1.0, 2.0, 5.0, 10.0}
+            or float(aggregation["top_k_percent"])
+            not in {0.5, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0}
             or aggregation["rounding"] != "ceil"
             or aggregation["minimum_patch_count"] != 1
         ):
@@ -997,8 +1149,10 @@ class PatchCoreArtifactModel:
             not isinstance(decision, dict)
             or decision.get("comparison") != "strict_greater_than"
             or decision.get("view_score_normalization") != "divide_by_threshold"
-            or float(decision.get("target_product_fpr", math.nan)) != 0.01
         ):
+            raise ArtifactContractError("artifact v3 decision policy is invalid")
+        target_product_fpr = float(decision.get("target_product_fpr", math.nan))
+        if not math.isfinite(target_product_fpr) or target_product_fpr not in {0.01, 0.1}:
             raise ArtifactContractError("artifact v3 decision policy is invalid")
 
         keyed_fields = (
@@ -1068,8 +1222,10 @@ class PatchCoreArtifactModel:
             or selected_candidate.get("thresholds") != manifest["thresholds"]
             or float(selected_candidate.get("threshold_percentile", math.nan))
             != float(decision.get("threshold_percentile", math.nan))
-            or float(selected_candidate.get("calibration_product_fpr", math.inf)) > 0.01
-            or float(selected_candidate["validation_metrics"]["fpr"]) > 0.01
+            or float(selected_candidate.get("calibration_product_fpr", math.inf))
+            > target_product_fpr
+            or float(selected_candidate["validation_metrics"]["fpr"])
+            > target_product_fpr
         ):
             raise ArtifactContractError("artifact selected candidate differs from policy")
         provenance = manifest.get("dataset_provenance")
@@ -1193,7 +1349,11 @@ class PatchCoreArtifactModel:
         else:
             raise ArtifactContractError(f"inference view order is invalid: {views}")
         expected = self.station_views[station_id]
-        raw_scores = self._run_view_scores(expected, images)
+        raw_scores, spatial_maps = self._run_view_scores(
+            expected,
+            images,
+            collect_spatial_maps=True,
+        )
         normalized: list[float] = []
         view_verdicts: list[int] = []
         diagnostics: list[str] = []
@@ -1208,7 +1368,16 @@ class PatchCoreArtifactModel:
             normalized.append(score)
             view_verdicts.append(int(Verdict.NG if is_ng else Verdict.PASS))
             if is_ng:
-                diagnostics.extend(self.preprocessor.save_diagnostic(prepared, "ng"))
+                diagnostics.extend(
+                    self.preprocessor.save_ng_diagnostic(
+                        prepared,
+                        spatial_map=spatial_maps[len(normalized) - 1],
+                        view_score_raw=float(raw),
+                        view_threshold=threshold,
+                        view_score_normalized=score,
+                        aggregation=self.aggregation,
+                    )
+                )
         verdict = int(Verdict.NG if int(Verdict.NG) in view_verdicts else Verdict.PASS)
         return StationInferenceResult(
             verdict=verdict,
@@ -1226,13 +1395,16 @@ class PatchCoreArtifactModel:
         self,
         views: Sequence[str],
         images: Sequence[PreparedView],
-    ) -> list[float]:
+        *,
+        collect_spatial_maps: bool = False,
+    ) -> tuple[list[float], list[np.ndarray]]:
         parallel = min(self.parallel_count, len(views))
         raw_scores: list[float] = []
+        collected_maps: list[np.ndarray] = []
         for start in range(0, len(views), parallel):
             wave_views = views[start : start + parallel]
             wave_images = images[start : start + parallel]
-            outputs: list[torch.Tensor] = []
+            outputs: list[tuple[torch.Tensor, torch.Tensor | None]] = []
             for slot, (view, prepared) in enumerate(
                 zip(wave_views, wave_images, strict=True)
             ):
@@ -1240,18 +1412,28 @@ class PatchCoreArtifactModel:
                     tensor = prepared.tensor[None].to(self.device, non_blocking=True)
                     maps = self.models[view].native_patch_maps(tensor)
                     spatial = self.spatial_calibration_by_view[view]
-                    outputs.append(
-                        spatial_view_scores(
-                            maps,
-                            spatial["center"],
-                            spatial["denominator"],
-                            self.aggregation,
-                        )
+                    score = spatial_view_scores(
+                        maps,
+                        spatial["center"],
+                        spatial["denominator"],
+                        self.aggregation,
                     )
+                    normalized_map = (
+                        (maps - spatial["center"][None])
+                        / spatial["denominator"][None]
+                        if collect_spatial_maps
+                        else None
+                    )
+                    outputs.append((score, normalized_map))
             for stream in self._streams[: len(wave_views)]:
                 stream.synchronize()
-            raw_scores.extend(float(output[0].detach().cpu()) for output in outputs)
-        return raw_scores
+            for score, normalized_map in outputs:
+                raw_scores.append(float(score[0].detach().cpu()))
+                if normalized_map is not None:
+                    collected_maps.append(
+                        normalized_map[0].detach().float().cpu().numpy()
+                    )
+        return raw_scores, collected_maps
 
     def _warmup_and_verify_memory(self, *, warmup_runs: int, reserve_mib: int) -> None:
         prepared_by_station: dict[int, tuple[PreparedView, ...]] = {}

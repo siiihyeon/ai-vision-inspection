@@ -29,12 +29,12 @@ data_set/
 
 - `training_set`: 정상 sample로 view별 memory bank 생성
 - `calibration_set_A`: 정상 native patch map의 위치별 center/scale 계산
-- `calibration_set_B`: 정상 제품 4-view OR FPR 1% threshold 계산
-- `validation_set`: FPR 1% 이하에서 product recall 최대 후보 선택
+- `calibration_set_B`: 정상 제품 4-view OR FPR 10% threshold 계산
+- `validation_set`: FPR 10% 이하에서 product recall 최대 후보 선택
 - `test_set`: artifact를 변경하지 않고 정확도와 추론 시간 최종 측정
 
 같은 제품·연속 촬영 sequence·생산 lot가 서로 다른 split에 섞이지 않게 분리합니다.
-Calibration B는 최소 100제품이 필요하고 1% tail 안정성을 위해 1,000제품 이상을
+Calibration B는 최소 100제품이 필요하고 10% tail 안정성을 위해 1,000제품 이상을
 권장합니다.
 
 ## 공간 점수 정책
@@ -42,17 +42,17 @@ Calibration B는 최소 100제품이 필요하고 1% tail 안정성을 위해 1,
 판정은 bilinear 확대 전 native nearest-memory patch distance map에서 수행합니다.
 Calibration A에서 다음 후보를 만들고 네 view에 공통인 한 정책을 선택합니다.
 
-- epsilon z-score: epsilon ratio `0.001, 0.01, 0.1`
+- epsilon z-score: epsilon ratio `0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.2`
 - std floor: floor ratio `0.05, 0.1, 0.2`
 - variance shrinkage: lambda `0.05, 0.1, 0.25, 0.5`
 - median/scaled MAD: epsilon ratio `0.001, 0.01, 0.1`
-- map percentile: `99.0, 99.5, 99.9, 100.0`
-- ratio-based top-k average: 상위 patch 비율 `1%, 2%, 5%, 10%`
+- map percentile: `95.0, 97.0, 98.0, 98.5, 99.0, 99.25, 99.5, 99.75, 99.9, 100.0`
+- ratio-based top-k average: 상위 patch 비율 `0.5%, 1%, 2%, 5%, 10%, 15%, 20%, 25%`
 
 기존 reweighted PatchCore image score와 위치 정규화 없는 aggregation도 baseline으로
 기록하지만 자동 선택 대상은 아닙니다. 후보 선택 순서는 다음과 같습니다.
 
-1. validation 4-view OR product FPR ≤ 1%
+1. validation 4-view OR product FPR ≤ 10%
 2. product anomaly recall 최대
 3. product FPR 최소
 4. validation postprocess p95 최소

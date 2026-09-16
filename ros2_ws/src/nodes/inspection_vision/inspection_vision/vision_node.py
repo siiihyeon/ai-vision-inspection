@@ -223,6 +223,7 @@ class VisionNode(InspectionNodeBase):
         self.declare_parameter("vision.camera.reconnect_max_attempts", 5)
         self.declare_parameter("vision.queue.capacity", 16)
         self.declare_parameter("vision.worker_count", 1)
+        self.declare_parameter("vision.image_load_worker_count", 3)
         self.declare_parameter("vision.model.serialize_access", True)
         self.declare_parameter("vision.inference_queue_total_timeout_ms", 0)
         self.declare_parameter("vision.inference.station_a.total_timeout_ms", 0)
@@ -265,6 +266,8 @@ class VisionNode(InspectionNodeBase):
             raise ValueError("vision.image.canonical_pixel_format must be MONO8_PNG")
 
         capacity = int(self.get_parameter("vision.queue.capacity").value)
+        if int(self.get_parameter("vision.image_load_worker_count").value) < 1:
+            raise ValueError("vision.image_load_worker_count must be positive")
         self.inference_queue = InferenceQueue(max(capacity, 1))
         self.worker_pool: WorkerPool | None = None
         self._model_backend = None
@@ -842,6 +845,9 @@ class VisionNode(InspectionNodeBase):
             model=model,
             worker_count=max(
                 int(self.get_parameter("vision.worker_count").value), 1
+            ),
+            image_load_worker_count=int(
+                self.get_parameter("vision.image_load_worker_count").value
             ),
             load_image=load_image,
             infer=_infer_station,

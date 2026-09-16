@@ -74,7 +74,7 @@ def generate_launch_description() -> LaunchDescription:
         [
             DeclareLaunchArgument(
                 "profile",
-                default_value="sim",
+                default_value="hardware",
                 choices=["sim", "hardware"],
                 description="장비 없는 개발용 sim 또는 실제 장비용 hardware",
             ),

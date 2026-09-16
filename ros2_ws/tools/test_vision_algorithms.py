@@ -157,6 +157,61 @@ class PatchCoreContractTests(unittest.TestCase):
                 all("preprocessing_failure" in path.parts for path in diagnostics)
             )
 
+    def test_ng_diagnostic_saves_heatmap_overlay_and_location_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            batch = root / "product_000001_fixture"
+            batch.mkdir()
+            image = np.zeros((120, 200), dtype=np.uint8)
+            image[20:100, 50:150] = 150
+            source = batch / "DA9880512.png"
+            write_png(source, image)
+            preprocessor = self._preprocessor(root)
+            prepared = preprocessor.load(source)
+            spatial_map = np.zeros((45, 45), dtype=np.float32)
+            spatial_map[12:20, 24:32] = 3.0
+
+            paths = preprocessor.save_ng_diagnostic(
+                prepared,
+                spatial_map=spatial_map,
+                view_score_raw=2.5,
+                view_threshold=2.0,
+                view_score_normalized=1.25,
+                aggregation={"method": "percentile", "percentile": 97.0},
+            )
+
+            self.assertEqual(len(paths), 5)
+            self.assertEqual(
+                {Path(path).name for path in paths},
+                {
+                    "crop_1.png",
+                    "crop_2.png",
+                    "anomaly_heatmap.png",
+                    "anomaly_overlay.png",
+                    "anomaly_metadata.json",
+                },
+            )
+            heatmap = cv2.imread(
+                str(Path(paths[0]).parent / "anomaly_heatmap.png"),
+                cv2.IMREAD_COLOR,
+            )
+            overlay = cv2.imread(
+                str(Path(paths[0]).parent / "anomaly_overlay.png"),
+                cv2.IMREAD_COLOR,
+            )
+            self.assertEqual(heatmap.shape, (80, 100, 3))
+            self.assertEqual(overlay.shape, (80, 100, 3))
+            metadata = json.loads(
+                (Path(paths[0]).parent / "anomaly_metadata.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(metadata["view"], "CAM_A_1")
+            self.assertEqual(metadata["view_score_normalized"], 1.25)
+            self.assertIsNotNone(
+                metadata["anomaly_location"]["threshold_exceeding_bbox_xywh"]
+            )
+
     def _write_manifest_fixture(self, root: Path) -> tuple[dict, str]:
         views = [
             view
@@ -322,10 +377,6 @@ class PatchCoreContractTests(unittest.TestCase):
                 serial_to_view=SERIAL_TO_VIEW,
             )
             self.assertEqual(station_views, dict(EXPECTED_STATION_VIEWS))
-            model_path = root / "CAM_B_1" / "model.pt"
-            model_path.write_bytes(model_path.read_bytes() + b"changed")
-            self.assertNotEqual(first_digest, artifact_directory_sha256(root))
-
             invalid = dict(manifest)
             invalid["view_names"] = list(manifest["view_names"][:-1])
             with self.assertRaises(ArtifactContractError):
@@ -335,7 +386,45 @@ class PatchCoreContractTests(unittest.TestCase):
                     expected_version="fixture-v3",
                     serial_to_view=SERIAL_TO_VIEW,
                 )
+            model_path = root / "CAM_B_1" / "model.pt"
+            model_path.write_bytes(model_path.read_bytes() + b"changed")
+            self.assertNotEqual(first_digest, artifact_directory_sha256(root))
 
+    def test_v3_manifest_accepts_supported_product_fpr_policies(self) -> None:
+        for target_product_fpr in (0.01, 0.1):
+            with self.subTest(target_product_fpr=target_product_fpr):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    manifest, _digest = self._write_manifest_fixture(root)
+                    manifest["spatial_scoring_policy"]["decision"][
+                        "target_product_fpr"
+                    ] = target_product_fpr
+                    selected = manifest["candidate_selection"]["candidates"][0]
+                    selected["calibration_product_fpr"] = target_product_fpr
+                    selected["validation_metrics"]["fpr"] = target_product_fpr
+
+                    PatchCoreArtifactModel._validate_manifest(
+                        root,
+                        manifest,
+                        expected_version="fixture-v3",
+                        serial_to_view=SERIAL_TO_VIEW,
+                    )
+
+    def test_v3_manifest_rejects_unsupported_product_fpr_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, _digest = self._write_manifest_fixture(root)
+            manifest["spatial_scoring_policy"]["decision"][
+                "target_product_fpr"
+            ] = 0.05
+
+            with self.assertRaisesRegex(ArtifactContractError, "decision policy"):
+                PatchCoreArtifactModel._validate_manifest(
+                    root,
+                    manifest,
+                    expected_version="fixture-v3",
+                    serial_to_view=SERIAL_TO_VIEW,
+                )
 
 class _FrameInfo(ctypes.Structure):
     _fields_ = [
