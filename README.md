@@ -16,7 +16,7 @@ Vision Node의 확정값, 미결정 정책, 실험값, 모든 파라미터 수�
 
 기존 `README_비전검수_워크플로우.pdf`도 현재 Action1·Mono8·비동기 추론 정책에 맞춰 갱신되어 있습니다. 세부 파라미터는 PDF 요약이 아니라 위 완성 결정표와 hardware YAML을 기준으로 합니다.
 
-## 확정된 핵심 Workflow
+## 핵심 Workflow
 
 ```text
 Control PositionSettled
